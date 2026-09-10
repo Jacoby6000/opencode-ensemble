@@ -3,7 +3,6 @@ import { validateMemberName } from "../util"
 import { requireLead } from "./shared"
 import { claimTask } from "./team-claim"
 import { notifyLead } from "../notify"
-import { releaseMemberTasks } from "../tasks"
 import { parseModelId } from "../member-model"
 import { log } from "../log"
 import type { EnsembleConfig } from "../config"
@@ -87,7 +86,7 @@ export async function executeTeamSpawn(
     .get(teamInfo.teamId, args.name)
   if (existing) throw new Error(`Teammate "${args.name}" already exists in team "${teamInfo.teamName}"`)
 
-  const isReadOnly = agent === "plan" || agent === "explore"
+  const isReadOnly = agent === "plan" || agent === "explore" || deps.config.readOnlyAgents.includes(agent)
   const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory)
   const usePlanApproval = args.plan_approval === true
 
@@ -106,21 +105,22 @@ export async function executeTeamSpawn(
         deps.client.worktree.create({ worktreeCreateInput: { name: worktreeName } }),
         getSpawnTimeout(), `worktree.create for "${args.name}"`
       )
-      if (result.data) {
-        worktreeDir = result.data.directory
-        worktreeBranch = result.data.branch
-      }
+      if (!result.data) throw new Error("worktree.create returned no worktree")
+      worktreeDir = result.data.directory
+      worktreeBranch = result.data.branch
       log(`spawn:worktree:done name=${args.name} dir=${worktreeDir}`)
     } catch (err) {
-      log(`spawn:worktree:failed name=${args.name} err=${err instanceof Error ? err.message : String(err)}`)
+      const message = err instanceof Error ? err.message : String(err)
+      log(`spawn:worktree:failed name=${args.name} err=${message}`)
       try {
         await deps.client.tui.showToast({
           title: "Team",
-          message: `Worktree creation failed for ${args.name}, using shared directory`,
-          variant: "warning",
+          message: `Worktree creation failed for ${args.name}; spawn cancelled`,
+          variant: "error",
           duration: 4000,
         })
       } catch { /* TUI may not be available */ }
+      throw new Error(`Failed to create isolated worktree for teammate "${args.name}": ${message}`)
     }
   }
 
@@ -170,8 +170,20 @@ export async function executeTeamSpawn(
     ...TEAM_TOOLS.map(t => ({ permission: t, pattern: "*", action: "allow" as const })),
   )
 
-  // Create child session — bind to workspace if available (server-enforced CWD isolation).
-  // Falls back to no workspace binding if workspace.create failed.
+  // Resolve identity before session creation so both SDK calls start with the
+  // same agent and model. Invalid model strings retain the agent and fall back.
+  const memberCount = (deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(teamInfo.teamId) as { c: number }).c
+  const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config)
+  const modelParam = resolvedModel ? parseModelId(resolvedModel) : undefined
+  if (resolvedModel && !modelParam) {
+    log(`spawn:model:invalid name=${args.name} model=${resolvedModel} — expected "provider/model" format, falling back to default`)
+  } else if (resolvedModel) {
+    log(`spawn:model name=${args.name} model=${resolvedModel}`)
+  }
+
+  // Create child session with server-enforced CWD isolation. Prefer a workspace
+  // binding and fall back to the concrete worktree directory if workspace.create
+  // is unavailable; never fall back to the lead's shared directory implicitly.
   let childSessionId: string | undefined
   try {
     log(`spawn:session:start name=${args.name}`)
@@ -179,8 +191,10 @@ export async function executeTeamSpawn(
       deps.client.session.create({
         parentID: sessionId,
         title: `${args.name} (@${agent} teammate)`,
+        agent,
+        ...(modelParam ? { model: { providerID: modelParam.providerID, id: modelParam.modelID } } : {}),
         permission,
-        ...(workspaceId ? { workspaceID: workspaceId } : {}),
+        ...(workspaceId ? { workspaceID: workspaceId } : worktreeDir ? { directory: worktreeDir } : {}),
       }),
       getSpawnTimeout(), `session.create for "${args.name}"`
     )
@@ -215,11 +229,6 @@ export async function executeTeamSpawn(
   // Register in DB
   const planApproval = usePlanApproval ? "pending" : "none"
   const now = Date.now()
-  // Resolve model before DB insert so the stored value matches what promptAsync uses
-  const memberCount = (deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(teamInfo.teamId) as { c: number }).c
-  const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config)
-  if (resolvedModel) log(`spawn:model name=${args.name} model=${resolvedModel}`)
-
   deps.db.run(
     `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, worktree_dir, worktree_branch, workspace_id, plan_approval, time_created, time_updated)
      VALUES (?, ?, ?, ?, 'busy', 'starting', ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -374,12 +383,6 @@ export async function executeTeamSpawn(
   }
 
   const contextStr = context.join("\n")
-
-  // Model was already resolved before DB insert — just parse for promptAsync
-  const modelParam = resolvedModel ? parseModelId(resolvedModel) : undefined
-  if (resolvedModel && !modelParam) {
-    log(`spawn:model:invalid name=${args.name} model=${resolvedModel} — expected "provider/model" format, falling back to default`)
-  }
 
   // Fire-and-forget: send prompt to teammate session.
   log(`spawn:promptAsync:fire name=${args.name} sessionId=${childSessionId}`)

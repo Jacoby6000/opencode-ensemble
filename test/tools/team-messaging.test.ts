@@ -38,6 +38,22 @@ describe("team_message", () => {
     expect(promptCalls).toHaveLength(1)
   })
 
+  test("direct peer delivery preserves the recipient's custom agent and model", async () => {
+    deps.db.run(
+      "UPDATE team_member SET agent = ?, model = ? WHERE team_id = ? AND name = ?",
+      ["review-specialist", "openrouter/anthropic/claude-sonnet", "t1", "bob"],
+    )
+
+    await executeTeamMessage(deps, { to: "bob", text: "review this" }, "sess-alice")
+
+    const options = deps.client.calls.find(c => c.method === "session.promptAsync")!.args[0] as {
+      agent?: string
+      model?: { providerID: string; modelID: string }
+    }
+    expect(options.agent).toBe("review-specialist")
+    expect(options.model).toEqual({ providerID: "openrouter", modelID: "anthropic/claude-sonnet" })
+  })
+
   test("lead sends message to teammate", async () => {
     const result = await executeTeamMessage(deps, { to: "alice", text: "check this" }, "lead-sess")
     expect(result).toContain("alice")
@@ -211,6 +227,29 @@ describe("team_broadcast", () => {
     // Should call promptAsync for alice + bob (not lead)
     const promptCalls = deps.client.calls.filter(c => c.method === "session.promptAsync")
     expect(promptCalls).toHaveLength(2)
+  })
+
+  test("broadcast preserves each teammate identity but does not invent lead identity", async () => {
+    deps.db.run(
+      "UPDATE team_member SET agent = ?, model = ? WHERE team_id = ? AND name = ?",
+      ["review-specialist", "openrouter/anthropic/claude-sonnet", "t1", "bob"],
+    )
+
+    await executeTeamBroadcast(deps, { text: "status update" }, "sess-alice")
+
+    const promptCalls = deps.client.calls.filter(c => c.method === "session.promptAsync")
+    const teammateOptions = promptCalls
+      .map(c => c.args[0] as { sessionID: string; agent?: string; model?: { providerID: string; modelID: string } })
+      .find(options => options.sessionID === "sess-bob")
+    const leadOptions = promptCalls
+      .map(c => c.args[0] as { sessionID: string; agent?: string; model?: unknown })
+      .find(options => options.sessionID === "lead-sess")
+    expect(teammateOptions).toMatchObject({
+      agent: "review-specialist",
+      model: { providerID: "openrouter", modelID: "anthropic/claude-sonnet" },
+    })
+    expect(leadOptions?.agent).toBeUndefined()
+    expect(leadOptions?.model).toBeUndefined()
   })
 
   test("rejects if sender is not in a team", async () => {
@@ -418,4 +457,3 @@ describe("team_message — plan approval", () => {
       .rejects.toThrow("Only the lead can approve or reject")
   })
 })
-

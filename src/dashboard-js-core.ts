@@ -2,6 +2,23 @@
 export const DASHBOARD_JS_CORE = `
 let S=null,selId=null,selProjectId=null,fails=0,pollT=Date.now(),prevMC=0,selCard=-1,navCollapsed=false,verbose=(function(){try{return localStorage.getItem('ensemble-verbose')==='1'}catch(e){return false}})(),drawerActivity=null,drawerSession=null;
 const expCards=new Set(),expMsgs=new Set();
+const dashboardToken=(function(){let t='';try{t=new URLSearchParams(location.hash.slice(1)).get('token')||''}catch(e){}if(t){try{sessionStorage.setItem('ensemble-dashboard-token',t)}catch(e){}try{history.replaceState(null,'',location.pathname+location.search)}catch(e){}return t}try{return sessionStorage.getItem('ensemble-dashboard-token')||''}catch(e){return ''}})();
+function apiFetch(url,options){const o=options||{},h=new Headers(o.headers||{});if(dashboardToken)h.set('Authorization','Bearer '+dashboardToken);return fetch(url,{...o,headers:h}).then(function(r){if(!r.ok)throw new Error('Dashboard API request failed: '+r.status);return r})}
+const fullMessageBodies=new Map(),teamMessageLoads=new Map(),fullMemberPrompts=new Map(),loadedMemberPrompts=new Set(),memberPromptLoads=new Map();
+function messageContent(m){return fullMessageBodies.get(m.id)||m.preview||''}
+function memberPromptKey(teamId,memberName){return teamId+'\\n'+memberName}
+function memberPrompt(teamId,memberName){return fullMemberPrompts.get(memberPromptKey(teamId,memberName))||''}
+async function ensureTeamMessages(teamId){
+  if(teamMessageLoads.has(teamId))return teamMessageLoads.get(teamId);
+  const request=apiFetch('api/teams/'+encodeURIComponent(teamId)+'/messages?limit=50').then(r=>r.json()).then(data=>{(data.messages||[]).forEach(m=>fullMessageBodies.set(m.id,m.content||''))}).finally(()=>teamMessageLoads.delete(teamId));
+  teamMessageLoads.set(teamId,request);return request;
+}
+async function ensureMemberPrompt(teamId,memberName){
+  const key=memberPromptKey(teamId,memberName);if(loadedMemberPrompts.has(key))return;
+  if(memberPromptLoads.has(key))return memberPromptLoads.get(key);
+  const request=apiFetch('api/teams/'+encodeURIComponent(teamId)+'/members/'+encodeURIComponent(memberName)).then(r=>r.json()).then(data=>{fullMemberPrompts.set(key,data.prompt||'');loadedMemberPrompts.add(key)}).finally(()=>memberPromptLoads.delete(key));
+  memberPromptLoads.set(key,request);return request;
+}
 const E=s=>s?String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):'';
 const D=ms=>{const s=Math.floor(Math.abs(ms)/1000);return s<60?s+'s':s<3600?Math.floor(s/60)+'m':Math.floor(s/3600)+'h'};
 const T=e=>new Date(e).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
@@ -126,7 +143,7 @@ function deriveSparkline(name,msgs){
 function deriveTimeline(t){
   const ev=[];
   (t.members||[]).forEach(m=>{ev.push({t:m.timeCreated,type:'spawn',label:E(m.name)+' spawned',c:'bg-blue-400'});if(m.status==='shutdown')ev.push({t:m.timeUpdated,type:'off',label:E(m.name)+' shut down',c:'bg-txt-500'});if(m.status==='error')ev.push({t:m.timeUpdated,type:'err',label:E(m.name)+' error',c:'bg-red-500'})});
-  (t.messages||[]).forEach(m=>{const p=parseR(m.content);ev.push({t:m.timeCreated,type:'msg',label:E(m.fromName)+' \\u2192 '+(E(m.toName)||'all'),c:p?'bg-emerald-500':'bg-blue-400'})});
+  (t.messages||[]).forEach(m=>{const p=parseR(messageContent(m));ev.push({t:m.timeCreated,type:'msg',label:E(m.fromName)+' \\u2192 '+(E(m.toName)||'all'),c:p?'bg-emerald-500':'bg-blue-400'})});
   (t.tasks||[]).filter(x=>x.status==='completed').forEach(x=>{ev.push({t:x.timeUpdated,type:'done',label:'Task done',c:'bg-emerald-500'})});
   return ev.sort((a,b)=>a.t-b.t).slice(-50);
 }

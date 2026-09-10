@@ -39,6 +39,8 @@ export interface PluginClient {
     create(options: {
       parentID?: string
       title?: string
+      agent?: string
+      model?: { providerID: string; id: string; variant?: string }
       permission?: PermissionRule[]
       workspaceID?: string
       directory?: string

@@ -1,3 +1,11 @@
+import { DASHBOARD_CSS } from "./dashboard-css.generated"
+
+/** Dashboard color tokens used by accessibility contract tests. */
+export const DASHBOARD_COLORS = {
+  base: { 950: "0c0e14", 900: "141822" },
+  txt: { 400: "8a96aa", 500: "7b879b" },
+} as const
+
 /** Dashboard HTML head and body structure. JS is appended separately. */
 export const DASHBOARD_HEAD = `<!DOCTYPE html>
 <html lang="en">
@@ -6,11 +14,7 @@ export const DASHBOARD_HEAD = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Ensemble</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%2322c55e'/></svg>">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
-<script src="https://cdn.tailwindcss.com"><\/script>
-<script>tailwind.config={theme:{extend:{colors:{base:{950:'#0c0e14',900:'#141822',850:'#1a1f2e',800:'#1e2433',700:'#2a3144',600:'#3a4358'},txt:{100:'#e2e8f0',200:'#c1c9d9',300:'#aab4c6',400:'#8a96aa',500:'#7b879b'}},fontFamily:{sans:['Inter','system-ui','sans-serif'],mono:['JetBrains Mono','monospace']}}}}<\/script>
+<style>${DASHBOARD_CSS}</style>
 <style>
 @media(prefers-reduced-motion:no-preference){
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}

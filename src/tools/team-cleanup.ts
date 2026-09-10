@@ -3,7 +3,7 @@ import { requireLead, requireCanPurgeArchivedTeams, checkWorktreeDirty } from ".
 import type { IsDirtyFn } from "./shared"
 import { spawnFailures } from "./team-spawn"
 import { getTeamResourceParts, mergeBranch, deleteBranch, preserveBranch, preservedBranchName, getOverlappingFiles, teamResourceSegment } from "./merge-helper"
-import type { MergeBranchFn, DeleteBranchFn, PreserveBranchFn, OverlapCheckFn } from "./merge-helper"
+import type { MergeBranchFn, DeleteBranchFn, OverlapCheckFn } from "./merge-helper"
 import { log } from "../log"
 import { runCommand } from "../process"
 
@@ -94,7 +94,7 @@ function resolvePurgeTargets(deps: ToolDeps, purge: string[]): PurgeTarget[] {
   if (active.length > 0) throw new Error(`Cannot purge active team: ${active.join(", ")}`)
 
   return rows
-    .map(row => row.teams[0]!)
+    .flatMap(row => row.teams.slice(0, 1))
     .sort((a, b) => b.time_updated - a.time_updated || a.name.localeCompare(b.name))
 }
 
@@ -156,7 +156,7 @@ function isPreservedBranch(resource: PurgeMemberResource): boolean {
   )
 }
 
-function isStaleEnsembleBranch(resource: PurgeMemberResource): boolean {
+function isStaleEnsembleBranch(resource: PurgeMemberResource): resource is PurgeMemberResource & { worktree_branch: string } {
   return resource.worktree_branch !== null && staleEnsembleBranchNames(resource).includes(resource.worktree_branch)
 }
 
@@ -201,7 +201,7 @@ function collectStaleEnsembleBranches(deps: ToolDeps, targets: PurgeTarget[]): s
   return [...new Set(
     getPurgeMemberResources(deps, targets)
       .filter(isStaleEnsembleBranch)
-      .map(resource => resource.worktree_branch!)
+      .map(resource => resource.worktree_branch)
   )]
 }
 
@@ -503,14 +503,14 @@ export async function executeTeamCleanup(
   }
 
   // Safety net: merge any remaining unmerged preserved branches
-  const unmerged = members.filter(m => m.worktree_branch !== null)
+  const unmerged = members.filter((m): m is typeof m & { worktree_branch: string } => m.worktree_branch !== null)
   const merged: string[] = []
   const conflicted: string[] = []
   const overlapWarnings: string[] = []
 
   if (unmerged.length > 0 && mergeOnCleanup) {
     for (const member of unmerged) {
-      const branch = member.worktree_branch!
+      const branch = member.worktree_branch
       // Warn (but don't block) if lead has local changes to overlapping files
       try {
         const overlap = await overlapCheck(branch, deps.directory)
@@ -563,6 +563,9 @@ export async function executeTeamCleanup(
   }
   if (overlapWarnings.length > 0) {
     parts.push(`Warning: safety-net merge overwrote local changes to overlapping files:\n${overlapWarnings.map(w => `  - ${w}`).join("\n")}\nReview with: git diff`)
+  }
+  if (!mergeOnCleanup && unmerged.length > 0) {
+    parts.push(`Auto-merge disabled. Merge preserved branches manually:\n${unmerged.map(member => `  git merge ${member.worktree_branch}`).join("\n")}`)
   }
   return parts.join("\n")
 }

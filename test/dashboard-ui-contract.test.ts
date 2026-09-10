@@ -1,13 +1,14 @@
 import { describe, expect, test } from "bun:test"
-import { DASHBOARD_HEAD } from "../src/dashboard-html"
+import { DASHBOARD_COLORS, DASHBOARD_HEAD } from "../src/dashboard-html"
 import { DASHBOARD_JS_CORE } from "../src/dashboard-js-core"
 import { DASHBOARD_JS_EVENTS } from "../src/dashboard-js-events"
 import { DASHBOARD_JS_RENDER } from "../src/dashboard-js-render"
 
 function colorToken(group: string, key: string): string {
-  const match = DASHBOARD_HEAD.match(new RegExp(`${group}:\\{[^}]*${key}:'#([0-9a-f]{6})'`))
-  if (!match?.[1]) throw new Error(`Missing color token ${group}.${key}`)
-  return match[1]
+  const groupColors = DASHBOARD_COLORS[group as keyof typeof DASHBOARD_COLORS] as Record<string, string> | undefined
+  const color = groupColors?.[key]
+  if (!color) throw new Error(`Missing color token ${group}.${key}`)
+  return color
 }
 
 function contrastRatio(foreground: string, background: string): number {
@@ -30,6 +31,13 @@ describe("dashboard UI contract", () => {
     expect(DASHBOARD_HEAD).toContain('aria-label="Event timeline"')
     expect(DASHBOARD_HEAD).toContain('id="drawer-title"')
     expect(DASHBOARD_HEAD).toContain('id="drawer" class="scroll p-4" tabindex="-1" inert')
+  })
+
+  test("dashboard shell has no third-party runtime resources", () => {
+    expect(DASHBOARD_HEAD).not.toContain('src="https://')
+    expect(DASHBOARD_HEAD).not.toContain('href="https://')
+    expect(DASHBOARD_HEAD).not.toContain("cdn.tailwindcss.com")
+    expect(DASHBOARD_HEAD).not.toContain("fonts.googleapis.com")
   })
 
   test("fixed dashboard chrome is constrained on narrow viewports", () => {
@@ -75,8 +83,49 @@ describe("dashboard UI contract", () => {
   })
 
   test("dashboard polls state relative to the served page", () => {
-    expect(DASHBOARD_JS_EVENTS).toContain("fetch('api/state')")
+    expect(DASHBOARD_JS_EVENTS).toContain("apiFetch('api/state')")
     expect(DASHBOARD_JS_EVENTS).not.toContain("fetch('/api/state')")
+  })
+
+  test("dashboard API requests use a fragment-supplied bearer token", () => {
+    expect(DASHBOARD_JS_CORE).toContain("location.hash")
+    expect(DASHBOARD_JS_CORE).toContain("sessionStorage")
+    expect(DASHBOARD_JS_CORE).toContain("history.replaceState")
+    expect(DASHBOARD_JS_CORE).toContain("Authorization")
+    expect(DASHBOARD_JS_CORE).toContain("Bearer ")
+  })
+
+  test("clears a fragment token even when session storage is unavailable", () => {
+    const replacements: string[] = []
+    const evaluate = new Function(
+      "location",
+      "sessionStorage",
+      "history",
+      "localStorage",
+      "Headers",
+      "fetch",
+      `${DASHBOARD_JS_CORE};return dashboardToken`,
+    )
+    const token = evaluate(
+      { hash: "#token=fragment-token", pathname: "/", search: "?view=team" },
+      { setItem() { throw new Error("storage disabled") }, getItem() { return null } },
+      { replaceState(_state: unknown, _title: string, url: string) { replacements.push(url) } },
+      { getItem() { return null } },
+      Headers,
+      () => Promise.reject(new Error("unexpected fetch")),
+    )
+
+    expect(token).toBe("fragment-token")
+    expect(replacements).toEqual(["/?view=team"])
+  })
+
+  test("full prompts and message bodies are fetched only for expanded details", () => {
+    expect(DASHBOARD_JS_CORE).toContain("function ensureTeamMessages")
+    expect(DASHBOARD_JS_CORE).toContain("function ensureMemberPrompt")
+    expect(DASHBOARD_JS_CORE).toContain("api/teams/")
+    expect(DASHBOARD_JS_RENDER).toContain("messageContent(")
+    expect(DASHBOARD_JS_RENDER).toContain("memberPrompt(")
+    expect(DASHBOARD_JS_EVENTS).toContain("ensureTeamMessages(t.id)")
   })
 
   test("agent prioritization helpers are defined", () => {
@@ -160,7 +209,7 @@ describe("dashboard UI contract", () => {
   })
 
   test("activity fetch uses relative path", () => {
-    expect(DASHBOARD_JS_EVENTS).toContain("fetch('api/session/'")
+    expect(DASHBOARD_JS_EVENTS).toContain("apiFetch('api/session/'")
     expect(DASHBOARD_JS_EVENTS).not.toContain("fetch('/api/session/'")
   })
 

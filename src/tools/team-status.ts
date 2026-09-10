@@ -84,8 +84,9 @@ export async function executeTeamStatus(
       // Additive provider-retry annotation (Fix 4) — derived at read time from the
       // retry_until TTL (Fix 3), same annotation pattern as `nudged` above. Generic
       // "retrying" label, no rate-limit-specific wording (Fix 2).
-      const isRetrying = m.retry_until !== null && m.retry_until > now
-      const retrying = isRetrying ? `, retrying (attempt ${m.retry_attempt}, ~${formatDuration(m.retry_until! - now)})` : ""
+      const retryUntil = m.retry_until
+      const isRetrying = retryUntil !== null && retryUntil > now
+      const retrying = isRetrying ? `, retrying (attempt ${m.retry_attempt}, ~${formatDuration(retryUntil - now)})` : ""
 
       // Last message time
       const lastMsg = deps.db.query("SELECT MAX(time_created) as last_msg FROM team_message WHERE team_id = ? AND from_name = ?")

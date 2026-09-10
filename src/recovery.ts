@@ -3,7 +3,7 @@ import type { PluginClient } from "./types"
 import type { MemberRegistry } from "./state"
 import { getUndeliveredMessages, markDelivered, hasReportedCompletion } from "./messaging"
 import { releaseMemberTasks } from "./tasks"
-import { getMemberModel } from "./member-model"
+import { getMemberPromptOptions } from "./member-model"
 import { preserveBranch, preservedBranchName, teamResourceSegment } from "./tools/merge-helper"
 import { log } from "./log"
 import { runCommand } from "./process"
@@ -194,7 +194,8 @@ export async function recoverOrphanedWorktrees(db: Database, client: PluginClien
 /**
  * Redeliver undelivered messages (delivered=0) via promptAsync.
  * Resolves recipient session IDs from the member registry or team lead.
- * Continues on partial failure — logs but doesn't abort.
+ * Schedules every eligible delivery without waiting for transport completion.
+ * The returned count is the number scheduled; failed messages remain pending.
  */
 export async function recoverUndeliveredMessages(
   db: Database,
@@ -228,23 +229,21 @@ export async function recoverUndeliveredMessages(
       if (!recipientSessionId) continue
 
       // Skip delivery to teammates who have already reported completion (issue #3)
-      if (hasReportedCompletion(db, team.id, msg.to_name!)) {
+      if (hasReportedCompletion(db, team.id, msg.to_name)) {
         markDelivered(db, msg.id)
         continue
       }
 
-      try {
-        const recipientModel = getMemberModel(db, team.id, msg.to_name)
-        await client.session.promptAsync({
-          sessionID: recipientSessionId,
-          parts: [{ type: "text", text: `[Recovered team message from ${msg.from_name}]: ${msg.content}` }],
-          ...(recipientModel ? { model: recipientModel } : {}),
-        })
+      redelivered++
+      client.session.promptAsync({
+        sessionID: recipientSessionId,
+        parts: [{ type: "text", text: `[Recovered team message from ${msg.from_name}]: ${msg.content}` }],
+        ...getMemberPromptOptions(db, team.id, msg.to_name),
+      }).then(() => {
         markDelivered(db, msg.id)
-        redelivered++
-      } catch {
+      }).catch(() => {
         // Continue on failure — message stays undelivered for next recovery
-      }
+      })
     }
   }
 

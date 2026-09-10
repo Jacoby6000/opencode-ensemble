@@ -84,6 +84,23 @@ describe("team_shutdown", () => {
     expect(row.status).toBe("shutdown_requested")
   })
 
+  test("graceful shutdown preserves the teammate's custom agent and model", async () => {
+    deps.db.run(
+      "UPDATE team_member SET agent = ?, model = ? WHERE team_id = ? AND name = ?",
+      ["cleanup-specialist", "openrouter/anthropic/claude-sonnet", "t1", "alice"],
+    )
+    deps.client.session.status = async () => ({ data: { "sess-alice": { type: "busy" } } })
+
+    await executeTeamShutdown(deps, { member: "alice" }, "lead-sess", undefined, noopPreserve)
+
+    const options = deps.client.calls.find(c => c.method === "session.promptAsync")!.args[0] as {
+      agent?: string
+      model?: { providerID: string; modelID: string }
+    }
+    expect(options.agent).toBe("cleanup-specialist")
+    expect(options.model).toEqual({ providerID: "openrouter", modelID: "anthropic/claude-sonnet" })
+  })
+
   test("idle member is aborted immediately, no promptAsync", async () => {
     deps.client.session.status = async () => {
       deps.client.calls.push({ method: "session.status", args: [] })

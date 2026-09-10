@@ -29,7 +29,8 @@ describe("config", () => {
   })
 
   test("DEFAULT_CONFIG has correct values", () => {
-    expect(DEFAULT_CONFIG.mergeOnCleanup).toBe(true)
+    expect(DEFAULT_CONFIG.mergeOnCleanup).toBe(false)
+    expect(DEFAULT_CONFIG.readOnlyAgents).toEqual([])
     expect(DEFAULT_CONFIG.stallThresholdMs).toBe(300_000)
     expect(DEFAULT_CONFIG.stallMinSteps).toBe(5)
     expect(DEFAULT_CONFIG.stallTokenThreshold).toBe(200)
@@ -49,7 +50,7 @@ describe("config", () => {
 
     const config = loadConfig(tmpDir)
     expect(config.stallThresholdMs).toBe(60_000)
-    expect(config.mergeOnCleanup).toBe(true) // other defaults preserved
+    expect(config.mergeOnCleanup).toBe(false) // other defaults preserved
   })
 
   test("partial config merges correctly", () => {
@@ -61,6 +62,24 @@ describe("config", () => {
     expect(config.mergeOnCleanup).toBe(false)
     expect(config.rateLimitCapacity).toBe(5)
     expect(config.stallThresholdMs).toBe(300_000) // default preserved
+  })
+
+  test("loads configured custom read-only agents", () => {
+    const configDir = path.join(tmpDir, ".opencode")
+    mkdirSync(configDir, { recursive: true })
+    writeFileSync(path.join(configDir, "ensemble.json"), JSON.stringify({ readOnlyAgents: ["Shit Tester", "Security Reviewer"] }))
+
+    const config = loadConfig(tmpDir)
+    expect(config.readOnlyAgents).toEqual(["Shit Tester", "Security Reviewer"])
+  })
+
+  test("ignores readOnlyAgents when any entry is not a string", () => {
+    const configDir = path.join(tmpDir, ".opencode")
+    mkdirSync(configDir, { recursive: true })
+    writeFileSync(path.join(configDir, "ensemble.json"), JSON.stringify({ readOnlyAgents: ["Shit Tester", 42] }))
+
+    const config = loadConfig(tmpDir)
+    expect(config.readOnlyAgents).toEqual([])
   })
 
   test("invalid JSON logs warning and returns defaults", () => {

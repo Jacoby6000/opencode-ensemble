@@ -166,6 +166,8 @@ describe("stress: auto-merge on cleanup", () => {
     deps.db.run("UPDATE team_member SET status = 'shutdown' WHERE team_id = ?", [teamId])
 
     const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, noopMerge, noopDelete, false)
+    expect(result).toContain("Auto-merge disabled")
+    expect(result).toContain("git merge")
   })
 })
 

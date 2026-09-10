@@ -11,7 +11,7 @@ import { isWorktreeInstance } from "./util"
 import { handleSessionStatusEvent, handleSessionCreatedEvent, checkToolIsolation, shouldNudgeIdleMember, handleSessionErrorEvent } from "./hooks"
 import { notifyTeamEvent, notifyWorkingProgress, notifyLead } from "./notify"
 import { hasReportedCompletion } from "./messaging"
-import { getMemberModel } from "./member-model"
+import { sendIdleWithoutReportNudge, sendPeerMessageFlush } from "./idle-continuations"
 import { buildLeadSystemPrompt, buildTeammateSystemPrompt, buildTeamCompactionContext } from "./system-prompt"
 import { log, initLog } from "./log"
 import { findTeamBySession } from "./types"
@@ -19,6 +19,7 @@ import { loadConfig } from "./config"
 import { ProgressTracker } from "./progress"
 import { ActivityBuffer, recordFromV2Event, recordFromToolBefore, recordFromToolAfter } from "./activity"
 import { startDashboard } from "./dashboard"
+import { getDashboardTokenPath, loadOrCreateDashboardToken } from "./dashboard-auth"
 import { executeTeamCreate } from "./tools/team-create"
 import { executeTeamSpawn } from "./tools/team-spawn"
 import { executeTeamMessage } from "./tools/team-message"
@@ -129,9 +130,16 @@ const plugin: Plugin = async (input) => {
 
     // Start dashboard server (main instance only, not worktree instances)
     if (config.dashboardPort !== 0) {
-      startDashboard(db, config.dashboardPort, { activityBuffer, client }).catch((err) => {
+      try {
+        const dashboardTokenPath = getDashboardTokenPath()
+        const dashboardToken = loadOrCreateDashboardToken(dashboardTokenPath)
+        log(`init:dashboard:token-file path=${dashboardTokenPath}`)
+        startDashboard(db, config.dashboardPort, { activityBuffer, client, token: dashboardToken }).catch((err) => {
+          log(`init:dashboard:failed err=${err instanceof Error ? err.message : String(err)}`)
+        })
+      } catch (err) {
         log(`init:dashboard:failed err=${err instanceof Error ? err.message : String(err)}`)
-      })
+      }
     }
   } else {
     log(`init:skip-recovery (worktree instance: ${input.directory})`)
@@ -215,14 +223,7 @@ const plugin: Plugin = async (input) => {
             if (!nudgedMembers.has(nudgeKey) && shouldNudgeIdleMember(db, transition.teamId, transition.memberName) && !hasReportedCompletion(db, transition.teamId, transition.memberName)) {
               nudgedMembers.add(nudgeKey)
               log(`nudge:idle-without-report name=${transition.memberName}`)
-              const nudgeModel = getMemberModel(db, transition.teamId, transition.memberName)
-              client.session.promptAsync({
-                sessionID,
-                parts: [{ type: "text", text: "[System]: You completed your work but did not report results. Send your findings to the lead via team_message now." }],
-                ...(nudgeModel ? { model: nudgeModel } : {}),
-              }).catch((err) => {
-                log(`nudge:idle-without-report:failed name=${transition.memberName} team=${transition.teamId} err=${err instanceof Error ? err.message : String(err)}`)
-              })
+              sendIdleWithoutReportNudge(client, db, transition.teamId, transition.memberName, sessionID)
             }
           } else if (transition.to === "error") {
             notifyTeamEvent(client, "error", { memberName: transition.memberName })
@@ -306,14 +307,7 @@ const plugin: Plugin = async (input) => {
             ).get(member.team_id, member.name, staleThreshold) as { c: number }
             if (peerMsgs.c > 0) {
               log(`wake-peer: ${member.name} has ${peerMsgs.c} pending peer messages`)
-              const peerModel = getMemberModel(db, member.team_id, member.name)
-              client.session.promptAsync({
-                sessionID,
-                parts: [{ type: "text", text: `[System: ${peerMsgs.c} new message(s) from teammates]` }],
-                ...(peerModel ? { model: peerModel } : {}),
-              }).catch((err) => {
-                log(`wake-peer:failed err=${err instanceof Error ? err.message : String(err)}`)
-              })
+              sendPeerMessageFlush(client, db, member.team_id, member.name, sessionID, peerMsgs.c)
             }
           }
         }

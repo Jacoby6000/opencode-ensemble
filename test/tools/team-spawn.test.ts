@@ -70,6 +70,71 @@ describe("team_spawn", () => {
     expect(row.agent).toBe("build")
   })
 
+  test("passes a custom agent and resolved model to session.create and the initial prompt", async () => {
+    await executeTeamSpawn(deps, {
+      name: "alice",
+      agent: "qa-specialist",
+      model: "openrouter/anthropic/claude-sonnet",
+      prompt: "Validate the change",
+      worktree: false,
+    }, "lead-sess")
+
+    const createCall = deps.client.calls.find(c => c.method === "session.create")
+    const createOptions = createCall!.args[0] as {
+      agent?: string
+      model?: { providerID: string; id: string }
+    }
+    expect(createOptions.agent).toBe("qa-specialist")
+    expect(createOptions.model).toEqual({
+      providerID: "openrouter",
+      id: "anthropic/claude-sonnet",
+    })
+
+    const promptCall = deps.client.calls.find(c => c.method === "session.promptAsync")
+    const promptOptions = promptCall!.args[0] as {
+      agent?: string
+      model?: { providerID: string; modelID: string }
+    }
+    expect(promptOptions.agent).toBe("qa-specialist")
+    expect(promptOptions.model).toEqual({
+      providerID: "openrouter",
+      modelID: "anthropic/claude-sonnet",
+    })
+  })
+
+  test("passes the custom agent and omits malformed model options on spawn", async () => {
+    await executeTeamSpawn(deps, {
+      name: "alice",
+      agent: "qa-specialist",
+      model: "malformed",
+      prompt: "Validate the change",
+      worktree: false,
+    }, "lead-sess")
+
+    const createOptions = deps.client.calls.find(c => c.method === "session.create")!.args[0] as { agent?: string; model?: unknown }
+    const promptOptions = deps.client.calls.find(c => c.method === "session.promptAsync")!.args[0] as { agent?: string; model?: unknown }
+    expect(createOptions).toMatchObject({ agent: "qa-specialist" })
+    expect(createOptions.model).toBeUndefined()
+    expect(promptOptions).toMatchObject({ agent: "qa-specialist" })
+    expect(promptOptions.model).toBeUndefined()
+  })
+
+  test("passes the custom agent and omits model options when no model resolves", async () => {
+    await executeTeamSpawn(deps, {
+      name: "alice",
+      agent: "qa-specialist",
+      prompt: "Validate the change",
+      worktree: false,
+    }, "lead-sess")
+
+    const createOptions = deps.client.calls.find(c => c.method === "session.create")!.args[0] as { agent?: string; model?: unknown }
+    const promptOptions = deps.client.calls.find(c => c.method === "session.promptAsync")!.args[0] as { agent?: string; model?: unknown }
+    expect(createOptions).toMatchObject({ agent: "qa-specialist" })
+    expect(createOptions.model).toBeUndefined()
+    expect(promptOptions).toMatchObject({ agent: "qa-specialist" })
+    expect(promptOptions.model).toBeUndefined()
+  })
+
   test("records a busy-start baseline on spawn (regression: fresh member inserted directly as busy, never fires a ready->busy transition event)", async () => {
     const result = await executeTeamSpawn(deps, {
       name: "alice",
@@ -473,27 +538,32 @@ describe("team_spawn", () => {
     expect(result).not.toContain("branch:")
   })
 
-  test("falls back to shared directory if worktree creation fails", async () => {
+  test("fails closed if writable-agent worktree creation fails", async () => {
     deps.client.worktree.create = async () => { throw new Error("worktree failed") }
 
-    const result = await executeTeamSpawn(deps, {
+    await expect(executeTeamSpawn(deps, {
       name: "alice",
       agent: "build",
       prompt: "Fix the tests",
-    }, "lead-sess")
+    }, "lead-sess")).rejects.toThrow(/worktree failed/i)
 
-    // Should still succeed — just without worktree
-    expect(result).toContain("alice")
-    expect(result).toContain("spawned")
+    expect(deps.db.query("SELECT name FROM team_member WHERE name = ?").get("alice")).toBeNull()
+    expect(deps.client.calls.filter(c => c.method === "session.create")).toHaveLength(0)
 
-    // DB should have null worktree columns
-    const row = deps.db.query("SELECT worktree_dir, worktree_branch FROM team_member WHERE name = ?").get("alice") as Record<string, string | null>
-    expect(row.worktree_dir).toBeNull()
-    expect(row.worktree_branch).toBeNull()
-
-    // Toast warning should have been fired
     const toasts = deps.client.calls.filter(c => c.method === "tui.showToast")
     expect(toasts.length).toBeGreaterThan(0)
+  })
+
+  test("fails closed if worktree creation returns no data", async () => {
+    deps.client.worktree.create = async () => ({})
+
+    await expect(executeTeamSpawn(deps, {
+      name: "alice",
+      agent: "build",
+      prompt: "Fix the tests",
+    }, "lead-sess")).rejects.toThrow(/worktree/i)
+
+    expect(deps.client.calls.filter(c => c.method === "session.create")).toHaveLength(0)
   })
 
   test("rolls back member asynchronously if promptAsync fails (fire-and-forget)", async () => {
@@ -630,7 +700,7 @@ describe("team_spawn", () => {
     expect(row.workspace_id).toBeTruthy()
   })
 
-  test("workspace.create failure is non-fatal — spawn still succeeds", async () => {
+  test("workspace.create failure binds session directly to the worktree directory", async () => {
     deps.client.workspace.create = async () => { throw new Error("workspace failed") }
 
     const result = await executeTeamSpawn(deps, {
@@ -642,10 +712,11 @@ describe("team_spawn", () => {
     expect(result).toContain("alice")
     expect(result).toContain("spawned")
 
-    // session.create should NOT have workspaceID (fallback)
+    // session.create should use directory binding when workspace binding is unavailable
     const createCall = deps.client.calls.find(c => c.method === "session.create")
-    const createArgs = createCall!.args[0] as { workspaceID?: string }
+    const createArgs = createCall!.args[0] as { workspaceID?: string; directory?: string }
     expect(createArgs.workspaceID).toBeUndefined()
+    expect(createArgs.directory).toContain("/tmp/worktree-")
   })
 
   test("skips workspace.create when worktree: false", async () => {
@@ -794,6 +865,21 @@ describe("team_spawn — agent mode enforcement", () => {
   test("explore agent gets deny rules + team tool allow (no worktree) on session.create", async () => {
     await executeTeamSpawn(deps, { name: "explorer", agent: "explore", prompt: "Explore it" }, "lead-sess")
 
+    const createCall = deps.client.calls.find(c => c.method === "session.create")
+    const opts = createCall!.args[0] as { permission?: Array<{ permission: string; pattern: string; action: string }> }
+    expect(opts.permission).toEqual([
+      { permission: "edit", pattern: "*", action: "deny" },
+      { permission: "bash", pattern: "*", action: "deny" },
+      ...TEAM_TOOL_PERMISSIONS,
+    ])
+  })
+
+  test("configured custom read-only agent gets hard denials and no worktree", async () => {
+    deps.config.readOnlyAgents = ["Shit Tester"]
+
+    await executeTeamSpawn(deps, { name: "reviewer", agent: "Shit Tester", prompt: "Review it" }, "lead-sess")
+
+    expect(deps.client.calls.filter(c => c.method === "worktree.create")).toHaveLength(0)
     const createCall = deps.client.calls.find(c => c.method === "session.create")
     const opts = createCall!.args[0] as { permission?: Array<{ permission: string; pattern: string; action: string }> }
     expect(opts.permission).toEqual([
@@ -977,20 +1063,17 @@ describe("team_spawn — timeout on session.create / worktree.create", () => {
     }, "lead-sess")).rejects.toThrow(/timed out/i)
   }, 10000)
 
-  test("falls back to shared directory if worktree.create hangs beyond SPAWN_TIMEOUT_MS", async () => {
+  test("fails closed if worktree.create hangs beyond SPAWN_TIMEOUT_MS", async () => {
     // Mock worktree.create to never resolve
     deps.client.worktree.create = () => new Promise(() => { /* never resolves */ })
 
-    const result = await executeTeamSpawn(deps, {
+    await expect(executeTeamSpawn(deps, {
       name: "bob",
       agent: "build",
       prompt: "Fix tests",
       worktree: true,
-    }, "lead-sess")
+    }, "lead-sess")).rejects.toThrow(/timed out/i)
 
-    // Should succeed with fallback — no worktree branch in output
-    expect(result).toContain("bob")
-    expect(result).toContain("spawned")
-    expect(result).not.toContain("branch:")
+    expect(deps.client.calls.filter(c => c.method === "session.create")).toHaveLength(0)
   }, 10000)
 })

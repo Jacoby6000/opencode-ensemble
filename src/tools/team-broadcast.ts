@@ -1,6 +1,7 @@
 import type { ToolDeps } from "../types"
 import { requireTeamMember } from "./shared"
 import { broadcastMessage, markDelivered, hasReportedCompletion } from "../messaging"
+import { getMemberPromptOptions } from "../member-model"
 import { log } from "../log"
 
 /**
@@ -51,6 +52,7 @@ export async function executeTeamBroadcast(
     deps.client.session.promptAsync({
       sessionID: recipient.sessionId,
       parts: [{ type: "text", text: `[Team broadcast from ${senderName}]: ${args.text}` }],
+      ...(recipient.name === "lead" ? {} : getMemberPromptOptions(deps.db, teamInfo.teamId, recipient.name)),
     }).then(() => {
       delivered++
       if (delivered === 1) markDelivered(deps.db, msgId)

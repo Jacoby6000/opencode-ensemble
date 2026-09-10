@@ -300,6 +300,54 @@ describe("Watchdog.checkStalled — last_nudged_at, deferred markReported, compl
     expect(row.last_nudged_at!).toBeGreaterThanOrEqual(before)
   })
 
+  test("stall nudge preserves the teammate's custom agent and model", async () => {
+    insertStalledMember("alice", "sess-a")
+    deps.db.run(
+      "UPDATE team_member SET agent = ?, model = ? WHERE team_id = ? AND name = ?",
+      ["debug-specialist", "openrouter/anthropic/claude-sonnet", "t1", "alice"],
+    )
+    const watchdog = new Watchdog({
+      db: deps.db, client: deps.client, registry: deps.registry,
+      ttlMs: 0, progressTracker: pt, stallThresholdMs: 5_000,
+    })
+
+    await watchdog.checkStalled()
+
+    const nudge = deps.client.calls
+      .filter(c => c.method === "session.promptAsync")
+      .map(c => c.args[0] as { sessionID: string; agent?: string; model?: { providerID: string; modelID: string } })
+      .find(options => options.sessionID === "sess-a")
+    expect(nudge).toMatchObject({
+      agent: "debug-specialist",
+      model: { providerID: "openrouter", modelID: "anthropic/claude-sonnet" },
+    })
+  })
+
+  test("chatty nudge preserves the teammate's custom agent and model", async () => {
+    insertMember(deps.db, "t1", "alice", "sess-a", "busy", "running")
+    deps.db.run(
+      "UPDATE team_member SET agent = ?, model = ? WHERE team_id = ? AND name = ?",
+      ["coordination-specialist", "openrouter/anthropic/claude-sonnet", "t1", "alice"],
+    )
+    pt.recordPeerMessage("sess-a")
+    pt.recordPeerMessage("sess-a")
+    const watchdog = new Watchdog({
+      db: deps.db, client: deps.client, registry: deps.registry,
+      ttlMs: 0, progressTracker: pt, peerMessageLimit: 2, peerMessageWindowMs: 300_000,
+    })
+
+    await watchdog.checkChatty()
+
+    const nudge = deps.client.calls
+      .filter(c => c.method === "session.promptAsync")
+      .map(c => c.args[0] as { sessionID: string; agent?: string; model?: { providerID: string; modelID: string } })
+      .find(options => options.sessionID === "sess-a")
+    expect(nudge).toMatchObject({
+      agent: "coordination-specialist",
+      model: { providerID: "openrouter", modelID: "anthropic/claude-sonnet" },
+    })
+  })
+
   test("Fix 4: markReported is deferred until promptAsync delivery succeeds — a failed delivery does not orphan the stall state permanently", async () => {
     insertStalledMember("alice", "sess-a")
     let attempt = 0

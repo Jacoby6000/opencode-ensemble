@@ -423,15 +423,19 @@ describe("recoverUndeliveredMessages", () => {
     expect(promptCalls).toHaveLength(0)
   })
 
-  test("redelivers on the recipient's configured model when set", async () => {
-    db.run("UPDATE team_member SET model = 'anthropic/claude-sonnet' WHERE team_id = 't1' AND name = 'bob'")
+  test("redelivery preserves the recipient's custom agent and configured model", async () => {
+    db.run(
+      "UPDATE team_member SET agent = ?, model = ? WHERE team_id = ? AND name = ?",
+      ["recovery-specialist", "openrouter/anthropic/claude-sonnet", "t1", "bob"],
+    )
     sendMessage(db, { teamId: "t1", from: "alice", to: "bob", content: "hello" })
 
     await recoverUndeliveredMessages(db, client, registry)
 
     const promptCall = client.calls.find(c => c.method === "session.promptAsync")
-    const opts = promptCall!.args[0] as { model?: { providerID: string; modelID: string } }
-    expect(opts.model).toEqual({ providerID: "anthropic", modelID: "claude-sonnet" })
+    const opts = promptCall!.args[0] as { agent?: string; model?: { providerID: string; modelID: string } }
+    expect(opts.agent).toBe("recovery-specialist")
+    expect(opts.model).toEqual({ providerID: "openrouter", modelID: "anthropic/claude-sonnet" })
   })
 
   test("redelivers without a model when the recipient has none set", async () => {
@@ -482,8 +486,26 @@ describe("recoverUndeliveredMessages", () => {
     }
 
     const result = await recoverUndeliveredMessages(db, client, registry)
-    // One succeeded, one failed
-    expect(result.redelivered).toBe(1)
+    // Both were scheduled without blocking; only the successful delivery is marked.
+    expect(result.redelivered).toBe(2)
+    await Promise.resolve()
+    await Promise.resolve()
+    const delivered = db.query("SELECT delivered FROM team_message WHERE team_id = 't1' ORDER BY time_created, id").all() as Array<{ delivered: number }>
+    expect(delivered.filter(message => message.delivered === 1)).toHaveLength(1)
+  })
+
+  test("returns without waiting when promptAsync never settles", async () => {
+    sendMessage(db, { teamId: "t1", from: "alice", to: "bob", content: "hello" })
+    client.session.promptAsync = () => new Promise(() => { /* never settles */ })
+
+    const outcome = await Promise.race([
+      recoverUndeliveredMessages(db, client, registry),
+      new Promise<"timeout">(resolve => setTimeout(() => resolve("timeout"), 100)),
+    ])
+
+    expect(outcome).toEqual({ redelivered: 1 })
+    const message = db.query("SELECT delivered FROM team_message WHERE team_id = 't1'").get() as { delivered: number }
+    expect(message.delivered).toBe(0)
   })
 
   test("skips broadcast messages (to_name is NULL)", async () => {

@@ -1,6 +1,6 @@
 /** Dashboard JS — interaction handlers, keyboard, polling. */
 export const DASHBOARD_JS_EVENTS = `
-function toggleMsg(id){if(expMsgs.has(id))expMsgs.delete(id);else expMsgs.add(id);render()}
+function toggleMsg(id){if(expMsgs.has(id)){expMsgs.delete(id);render();return}expMsgs.add(id);const t=cur();render();if(t&&!fullMessageBodies.has(id))ensureTeamMessages(t.id).then(render).catch(()=>{})}
 
 function toggleVerbose(){
   verbose=!verbose;
@@ -18,7 +18,7 @@ var fetchActivityGen=0;
 async function fetchActivity(sessionId){
   var gen=++fetchActivityGen;
   try{
-    var res=await fetch('api/session/'+encodeURIComponent(sessionId)+'/activity');
+    var res=await apiFetch('api/session/'+encodeURIComponent(sessionId)+'/activity');
     var data=await res.json();
     if(gen!==fetchActivityGen)return;
     drawerActivity=data.activity||[];
@@ -57,7 +57,7 @@ function conn(ok){
   document.getElementById('ct').textContent=ok?D(Date.now()-pollT)+' ago':'reconnecting to dashboard state';
 }
 
-async function poll(){try{S=await(await fetch('api/state')).json();fails=0;pollT=Date.now();conn(true);render()}catch{if(++fails>=3)conn(false)}}
+async function poll(){try{S=await(await apiFetch('api/state')).json();fails=0;pollT=Date.now();conn(true);render()}catch{if(++fails>=3)conn(false)}}
 
 function setBackgroundInert(locked){
   document.querySelectorAll('header,main,#sum,#tl').forEach(function(el){

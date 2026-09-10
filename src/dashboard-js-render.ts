@@ -74,7 +74,7 @@ function rAgents(t){
     const s=si(m.status),task=activeTaskFor(m.name,t.tasks||[]),msg=lastMessageFor(m.name,msgs),blocked=blockedTaskFor(m.name,t.tasks||[]);
     const d=D(n-m.timeUpdated),mi=msg?relT(msg.timeCreated):'\\u2014';
     const tt=task?.content,tr=tt&&tt.length>90?tt.slice(0,90)+'\\u2026':tt;
-    const mp=msg?(msg.content.length>90?msg.content.slice(0,90)+'\\u2026':msg.content):'';
+    const mc=msg?messageContent(msg):'',mp=mc?(mc.length>90?mc.slice(0,90)+'\\u2026':mc):'';
     const spark=deriveSparkline(m.name,msgs);
     const isSel=selCard===idx;
     return '<button type="button" class="text-left rounded-lg border '+s.c+' p-3 transition-all duration-300 cursor-pointer hover:border-base-600 focus-visible:border-blue-400'+(isSel?' card-sel':'')+'" data-card="'+E(m.name)+'" onclick="openDrawer(this.dataset.card)" onkeydown="if(event.key===\\'Enter\\'||event.key===\\' \\'){event.preventDefault();openDrawer(this.dataset.card)}">'+
@@ -100,7 +100,9 @@ function rAgents(t){
 function openDrawer(name){
   var t=cur();if(!t)return;
   var m=(t.members||[]).find(x=>x.name===name);if(!m)return;
-  var s=si(m.status),msgs=(t.messages||[]).filter(x=>x.fromName===name);
+  var s=si(m.status),msgs=(t.messages||[]).filter(x=>x.fromName===name),prompt=memberPrompt(t.id,m.name);
+  var needsMessages=(t.messages||[]).some(x=>!fullMessageBodies.has(x.id));
+  var needsPrompt=m.hasPrompt&&!loadedMemberPrompts.has(memberPromptKey(t.id,m.name));
   var h='';
   // Header
   h+='<div class="flex items-center justify-between mb-4">';
@@ -119,9 +121,11 @@ function openDrawer(name){
   if(m.worktreeBranch)meta.push(chip(E(m.worktreeBranch),'muted'));
   h+='<div class="flex flex-wrap gap-1.5 mb-4 pb-4 border-b border-base-800/50">'+meta.join('')+'</div>';
   // Prompt
-  if(m.prompt){
+  if(prompt){
     h+='<div class="mb-4"><div class="text-txt-400 text-[10px] uppercase tracking-wider mb-2">Original Prompt</div>';
-    h+='<div class="text-[13px] text-txt-200 md bg-base-800/20 rounded-lg p-3 border border-base-800/30">'+md(m.prompt)+'</div></div>';
+    h+='<div class="text-[13px] text-txt-200 md bg-base-800/20 rounded-lg p-3 border border-base-800/30">'+md(prompt)+'</div></div>';
+  }else if(needsPrompt){
+    h+='<div class="mb-4 text-[12px] text-txt-500">Loading original prompt...</div>';
   }
   // Chat log
   h+='<div class="text-txt-400 text-[10px] uppercase tracking-wider mb-3">Conversation</div>';
@@ -132,7 +136,7 @@ function openDrawer(name){
     allMsgs.sort(function(a,b){return a.timeCreated-b.timeCreated});
     allMsgs.forEach(function(am){
       var isAgent=am.fromName===name;
-      var p=parseR(am.content);
+      var content=messageContent(am),p=parseR(content);
       var deliv=am.delivered?(am.read?'\\u2713\\u2713':'\\u2713'):'';
       var align=isAgent?'mr-8':'ml-8';
       var bubbleBg=isAgent?'bg-blue-500/[0.07] border-blue-500/20':'bg-base-800/40 border-base-700/30';
@@ -149,7 +153,7 @@ function openDrawer(name){
         h+='<div class="mb-1">'+chip(E(p.status),p.status==='completed'?'green':'red')+' <span class="text-[13px] text-txt-200 font-medium">'+E(p.summary)+'</span></div>';
         if(p.details)h+='<div class="text-[12px] text-txt-300 md mt-2">'+md(p.details)+'</div>';
       }else{
-        h+='<div class="text-[12px] text-txt-300 md">'+md(am.content)+'</div>';
+        h+='<div class="text-[12px] text-txt-300 md">'+md(content)+'</div>';
       }
       h+='</div></div>';
     });
@@ -164,6 +168,7 @@ function openDrawer(name){
   h+='</div>';
   var drawer=document.getElementById('drawer');
   drawer.innerHTML=h;
+  drawer.dataset.member=name;
   drawer.classList.add('open');
   drawer.setAttribute('aria-hidden','false');
   drawer.inert=false;
@@ -174,6 +179,10 @@ function openDrawer(name){
   drawerActivity=null;drawerSession=null;
   if(m.sessionId)fetchActivity(m.sessionId);
   else rDrawerActivityUpdate();
+  if(needsMessages||needsPrompt){
+    const loads=[];if(needsMessages)loads.push(ensureTeamMessages(t.id));if(needsPrompt)loads.push(ensureMemberPrompt(t.id,m.name));
+    Promise.all(loads).then(function(){if(drawer.classList.contains('open')&&drawer.dataset.member===name)openDrawer(name)}).catch(()=>{});
+  }
 }
 
 function rDrawerActivityUpdate(){
@@ -315,7 +324,7 @@ function rActivity(t){
   msgs.slice(0,30).forEach(function(m,mi){
     const isNew=hasNew&&mi<(newCount-prevMC);
     const isExp=expMsgs.has(m.id);
-    const p=parseR(m.content);
+    const content=messageContent(m),p=parseR(content);
     const deliv=m.delivered?(m.read?'\\u2713\\u2713':'\\u2713'):'';
     const isFromAgent=m.fromName!=='lead'&&m.fromName!=='system';
     const isPeer=isFromAgent&&m.toName&&m.toName!=='lead'&&m.toName!=='all';
@@ -338,8 +347,8 @@ function rActivity(t){
       if(isExp&&p.details)html+='<div class="mt-2 text-[12px] text-txt-300 md">'+md(p.details)+'</div>';
       if(!isExp&&p.details)html+='<div class="mt-1 text-[10px] text-txt-500">Click to expand details</div>';
     }else{
-      if(isExp){html+='<div class="text-[12px] text-txt-300 md">'+md(m.content)+'</div>'}
-      else{const preview=m.content.length>120?m.content.slice(0,120)+'\\u2026':m.content;html+='<div class="text-[13px] text-txt-300 truncate">'+E(preview)+'</div>'}
+      if(isExp){html+='<div class="text-[12px] text-txt-300 md">'+md(content)+'</div>'}
+      else{const preview=content.length>120?content.slice(0,120)+'\\u2026':content;html+='<div class="text-[13px] text-txt-300 truncate">'+E(preview)+'</div>'}
     }
     html+='</div></div></div>';
   });

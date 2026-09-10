@@ -8,9 +8,22 @@ import { DASHBOARD_JS_RENDER } from "./dashboard-js-render"
 import { log } from "./log"
 import type { ActivityBuffer, ActivityEntry } from "./activity"
 import type { PluginClient } from "./types"
+import { isDashboardAuthorized } from "./dashboard-auth"
+
+/** Loopback address used by the dashboard listener and singleton probe. */
+export const DASHBOARD_HOST = "127.0.0.1"
+
+const SECURITY_HEADERS = {
+  "Cache-Control": "no-store",
+  "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+  "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+} as const
 
 /** Assemble the full dashboard HTML from parts. */
-const DASHBOARD_HTML = DASHBOARD_HEAD + "\n<script>" + DASHBOARD_JS_CORE + DASHBOARD_JS_RENDER + DASHBOARD_JS_EVENTS + "<\/script>\n</body></html>"
+const DASHBOARD_HTML = `${DASHBOARD_HEAD}\n<script>${DASHBOARD_JS_CORE}${DASHBOARD_JS_RENDER}${DASHBOARD_JS_EVENTS}</script>\n</body></html>`
 
 interface TeamRow {
   id: string
@@ -39,7 +52,7 @@ interface MemberRow {
   execution_status: string
   session_id: string
   worktree_branch: string | null
-  prompt: string | null
+  has_prompt: number
   model: string | null
   plan_approval: string
   time_created: number
@@ -72,6 +85,17 @@ interface MessageRow {
   time_created: number
 }
 
+interface MessageSummaryRow {
+  id: string
+  from_name: string
+  to_name: string | null
+  content_preview: string
+  content_length: number
+  delivered: number
+  read: number
+  time_created: number
+}
+
 function parseDependsOn(value: string | null): string[] {
   if (!value) return []
 
@@ -94,7 +118,7 @@ function parseDependsOn(value: string | null): string[] {
  * strict equality — no semver ranges. Currently consumed externally by the
  * OpenCode sidebar TUI plugin that renders Team status from this endpoint.
  */
-export const ENSEMBLE_STATE_VERSION = 1
+export const ENSEMBLE_STATE_VERSION = 2
 
 /**
  * `/api/state` response shape. Exported and versioned because at least one
@@ -111,9 +135,9 @@ export interface EnsembleDashboardState {
 function buildState(db: Database): EnsembleDashboardState {
   const projects = db.query("SELECT id, name, path, status, time_created, time_updated FROM project ORDER BY time_updated DESC").all() as ProjectRow[]
   const teams = db.query("SELECT id, name, project_id, lead_session_id, status, lead_agent, time_created, time_updated FROM team ORDER BY time_created DESC").all() as TeamRow[]
-  const memberStmt = db.query("SELECT name, agent, status, execution_status, session_id, worktree_branch, prompt, model, plan_approval, time_created, time_updated, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message FROM team_member WHERE team_id = ?")
+  const memberStmt = db.query("SELECT name, agent, status, execution_status, session_id, worktree_branch, CASE WHEN prompt IS NOT NULL AND prompt <> '' THEN 1 ELSE 0 END AS has_prompt, model, plan_approval, time_created, time_updated, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message FROM team_member WHERE team_id = ?")
   const taskStmt = db.query("SELECT id, content, status, priority, assignee, depends_on, time_created, time_updated FROM team_task WHERE team_id = ?")
-  const msgStmt = db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? ORDER BY time_created DESC LIMIT 50")
+  const msgStmt = db.query("SELECT id, from_name, to_name, substr(content, 1, 160) AS content_preview, length(content) AS content_length, delivered, read, time_created FROM team_message WHERE team_id = ? ORDER BY time_created DESC, id DESC LIMIT 50")
 
   const mappedTeams = teams.map((t) => {
     const members = (memberStmt.all(t.id) as MemberRow[]).map((m) => ({
@@ -123,7 +147,7 @@ function buildState(db: Database): EnsembleDashboardState {
       executionStatus: m.execution_status,
       sessionId: m.session_id,
       worktreeBranch: m.worktree_branch,
-      prompt: m.prompt,
+      hasPrompt: m.has_prompt === 1,
       model: m.model,
       planApproval: m.plan_approval,
       timeCreated: m.time_created,
@@ -158,11 +182,12 @@ function buildState(db: Database): EnsembleDashboardState {
         timeCreated: tk.time_created,
         timeUpdated: tk.time_updated,
       })),
-      messages: (msgStmt.all(t.id) as MessageRow[]).map((msg) => ({
+      messages: (msgStmt.all(t.id) as MessageSummaryRow[]).map((msg) => ({
         id: msg.id,
         fromName: msg.from_name,
         toName: msg.to_name,
-        content: msg.content,
+        preview: msg.content_preview,
+        contentLength: msg.content_length,
         delivered: msg.delivered === 1,
         read: msg.read === 1,
         timeCreated: msg.time_created,
@@ -200,25 +225,118 @@ function buildState(db: Database): EnsembleDashboardState {
   }
 }
 
+interface MessageCursor {
+  timeCreated: number
+  id: string
+}
+
+function encodeMessageCursor(cursor: MessageCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url")
+}
+
+function decodeMessageCursor(value: string): MessageCursor | null {
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(value, "base64url").toString("utf8"))
+    if (typeof parsed !== "object" || parsed === null) return null
+    const cursor = parsed as { timeCreated?: unknown; id?: unknown }
+    if (typeof cursor.timeCreated !== "number" || !Number.isFinite(cursor.timeCreated) || typeof cursor.id !== "string" || !cursor.id) return null
+    return { timeCreated: cursor.timeCreated, id: cursor.id }
+  } catch {
+    return null
+  }
+}
+
+function mapMessage(row: MessageRow) {
+  return {
+    id: row.id,
+    fromName: row.from_name,
+    toName: row.to_name,
+    content: row.content,
+    delivered: row.delivered === 1,
+    read: row.read === 1,
+    timeCreated: row.time_created,
+  }
+}
+
+function handleMessagesRoute(db: Database, teamId: string, url: URL, res: ServerResponse): void {
+  const limitValue = url.searchParams.get("limit")
+  const limit = limitValue === null ? 20 : Number(limitValue)
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50 || (limitValue !== null && !/^\d+$/.test(limitValue))) {
+    sendJson(res, { error: "limit must be an integer from 1 to 50" }, 400)
+    return
+  }
+
+  const team = db.query("SELECT id FROM team WHERE id = ?").get(teamId)
+  if (!team) {
+    sendJson(res, { error: "Team not found" }, 404)
+    return
+  }
+
+  const cursorValue = url.searchParams.get("cursor")
+  const cursor = cursorValue === null ? null : decodeMessageCursor(cursorValue)
+  if (cursorValue !== null && !cursor) {
+    sendJson(res, { error: "Invalid message cursor" }, 400)
+    return
+  }
+
+  const rows = (cursor
+    ? db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? AND (time_created < ? OR (time_created = ? AND id < ?)) ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, cursor.timeCreated, cursor.timeCreated, cursor.id, limit + 1)
+    : db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, limit + 1)) as MessageRow[]
+
+  const hasNextPage = rows.length > limit
+  const page = hasNextPage ? rows.slice(0, limit) : rows
+  const last = page.at(-1)
+  sendJson(res, {
+    messages: page.map(mapMessage),
+    nextCursor: hasNextPage && last ? encodeMessageCursor({ timeCreated: last.time_created, id: last.id }) : null,
+  })
+}
+
 /** Dashboard server handle returned by startDashboard. */
 export interface DashboardServer {
+  readonly host: string
   stop(force?: boolean): void
 }
 
 /** Optional dependencies for the dashboard server. */
 export interface DashboardOptions {
+  /** Bearer token required for dashboard API requests. */
+  token: string
   /** In-memory activity buffer for real-time per-session events. */
   activityBuffer?: ActivityBuffer
   /** SDK client for on-demand session message retrieval. */
   client?: PluginClient
 }
 
-function sendJson(res: ServerResponse, data: unknown): void {
-  res.writeHead(200, {
-    "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
-  })
+function sendJson(res: ServerResponse, data: unknown, status = 200, headers?: Record<string, string>): void {
+  res.writeHead(status, { ...SECURITY_HEADERS, "Content-Type": "application/json; charset=utf-8", ...headers })
   res.end(JSON.stringify(data))
+}
+
+function sendText(res: ServerResponse, text: string, status = 200, contentType = "text/plain; charset=utf-8", headers?: Record<string, string>): void {
+  res.writeHead(status, { ...SECURITY_HEADERS, "Content-Type": contentType, ...headers })
+  res.end(text)
+}
+
+function sanitizeActivityEntry(entry: ActivityEntry): ActivityEntry | null {
+  if (entry.type === "reasoning" || entry.type === "text") return null
+  if (entry.type === "tool_call" || entry.type === "tool_result") {
+    return { type: entry.type, tool: entry.tool, title: entry.title, timestamp: entry.timestamp }
+  }
+  if (entry.type === "shell_command") {
+    return { type: entry.type, exitCode: entry.exitCode, timestamp: entry.timestamp }
+  }
+  if (entry.type === "file") {
+    return { type: entry.type, filePath: entry.filePath, timestamp: entry.timestamp }
+  }
+  return {
+    type: entry.type,
+    title: entry.title,
+    tokensIn: entry.tokensIn,
+    tokensOut: entry.tokensOut,
+    cost: entry.cost,
+    timestamp: entry.timestamp,
+  }
 }
 
 /**
@@ -305,27 +423,25 @@ async function handleActivityRoute(
 
   const buffered = buffer?.getActivity(sessionId) ?? []
 
-  let sessionData: unknown = null
-  let fallbackActivity: ActivityEntry[] = []
+  const fallbackActivity: ActivityEntry[] = []
 
   if (client) {
     try {
-      const [msgResult, getResult] = await Promise.all([
-        client.session.messages({ sessionID: sessionId, limit: 100 }),
-        client.session.get({ sessionID: sessionId }),
-      ])
+      const msgResult = await client.session.messages({ sessionID: sessionId, limit: 100 })
       const messages = msgResult.data ?? []
       for (const msg of messages) {
         const parts = msg.parts ?? []
         fallbackActivity.push(...parseMessageParts(parts, msg.info))
       }
-      sessionData = getResult.data ?? null
     } catch { /* best effort — return what we have */ }
   }
 
-  const combined = [...buffered, ...fallbackActivity].sort((a, b) => a.timestamp - b.timestamp)
+  const combined = [...buffered, ...fallbackActivity]
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .map(sanitizeActivityEntry)
+    .filter((entry): entry is ActivityEntry => entry !== null)
 
-  sendJson(res, { activity: combined, session: sessionData })
+  sendJson(res, { activity: combined })
 }
 
 function handleDashboardRequest(
@@ -333,9 +449,25 @@ function handleDashboardRequest(
   port: number,
   req: IncomingMessage,
   res: ServerResponse,
-  options?: DashboardOptions,
+  options: DashboardOptions,
 ): void {
-  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? `localhost:${port}`}`)
+  if (req.method !== "GET") {
+    sendText(res, "Method Not Allowed", 405, "text/plain; charset=utf-8", { Allow: "GET" })
+    return
+  }
+
+  let url: URL
+  try {
+    url = new URL(req.url ?? "/", `http://${DASHBOARD_HOST}:${port}`)
+  } catch {
+    sendJson(res, { error: "Malformed request URL" }, 400)
+    return
+  }
+
+  if ((url.pathname === "/api" || url.pathname.startsWith("/api/")) && !isDashboardAuthorized(req.headers.authorization, options.token)) {
+    sendJson(res, { error: "Unauthorized" }, 401, { "WWW-Authenticate": "Bearer" })
+    return
+  }
 
   if (url.pathname === "/api/health") {
     sendJson(res, { ensemble: true, pid: process.pid })
@@ -347,30 +479,77 @@ function handleDashboardRequest(
     return
   }
 
+  const messagesMatch = url.pathname.match(/^\/api\/teams\/([^/]+)\/messages$/)
+  if (messagesMatch) {
+    const encodedTeamId = messagesMatch[1]
+    if (!encodedTeamId) {
+      sendJson(res, { error: "Malformed team ID" }, 400)
+      return
+    }
+    try {
+      handleMessagesRoute(db, decodeURIComponent(encodedTeamId), url, res)
+    } catch {
+      sendJson(res, { error: "Malformed team ID" }, 400)
+    }
+    return
+  }
+
+  const memberMatch = url.pathname.match(/^\/api\/teams\/([^/]+)\/members\/([^/]+)$/)
+  if (memberMatch) {
+    const encodedTeamId = memberMatch[1]
+    const encodedMemberName = memberMatch[2]
+    if (!encodedTeamId || !encodedMemberName) {
+      sendJson(res, { error: "Malformed team member path" }, 400)
+      return
+    }
+    try {
+      const teamId = decodeURIComponent(encodedTeamId)
+      const memberName = decodeURIComponent(encodedMemberName)
+      const member = db.query("SELECT prompt FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName) as { prompt: string | null } | undefined
+      if (!member) {
+        sendJson(res, { error: "Team member not found" }, 404)
+        return
+      }
+      sendJson(res, { prompt: member.prompt })
+    } catch {
+      sendJson(res, { error: "Malformed team member path" }, 400)
+    }
+    return
+  }
+
   const activityMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/activity$/)
   if (activityMatch) {
-    const sessionId = decodeURIComponent(activityMatch[1]!)
+    const encodedSessionId = activityMatch[1]
+    if (!encodedSessionId) {
+      sendJson(res, { error: "Malformed session ID" }, 400)
+      return
+    }
+    let sessionId: string
+    try {
+      sessionId = decodeURIComponent(encodedSessionId)
+    } catch {
+      sendJson(res, { error: "Malformed session ID" }, 400)
+      return
+    }
     handleActivityRoute(sessionId, options, res).catch(() => {
       if (!res.headersSent) {
-        res.writeHead(500, { "Content-Type": "application/json" })
-        res.end(JSON.stringify({ error: "Failed to fetch activity" }))
+        sendJson(res, { error: "Failed to fetch activity" }, 500)
       }
     })
     return
   }
 
   if (url.pathname === "/") {
-    res.writeHead(200, { "Content-Type": "text/html" })
-    res.end(DASHBOARD_HTML)
+    sendText(res, DASHBOARD_HTML, 200, "text/html; charset=utf-8")
     return
   }
 
-  res.writeHead(404, { "Content-Type": "text/plain" })
-  res.end("Not Found")
+  sendText(res, "Not Found", 404)
 }
 
 function toDashboardServer(server: Server): DashboardServer {
   return {
+    host: DASHBOARD_HOST,
     stop(force?: boolean) {
       server.close()
       // server.close() only stops accepting new connections — under Node's
@@ -391,14 +570,17 @@ function toDashboardServer(server: Server): DashboardServer {
  * Singleton: if the port is already in use by another ensemble instance, skips silently.
  * Returns the server instance, or null if skipped.
  */
-export async function startDashboard(db: Database, port: number, options?: DashboardOptions): Promise<DashboardServer | null> {
+export async function startDashboard(db: Database, port: number, options: DashboardOptions): Promise<DashboardServer | null> {
   return new Promise((resolve) => {
     const server = createServer((req, res) => handleDashboardRequest(db, port, req, res, options))
 
     server.once("error", async (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {
         try {
-          const res = await fetch(`http://localhost:${port}/api/health`)
+          const res = await fetch(`http://${DASHBOARD_HOST}:${port}/api/health`, {
+            headers: { Authorization: `Bearer ${options.token}` },
+            signal: AbortSignal.timeout(2000),
+          })
           const data = await res.json() as { ensemble?: boolean; pid?: number }
           if (data.ensemble && data.pid) {
             // Check if the other process is still alive
@@ -424,8 +606,8 @@ export async function startDashboard(db: Database, port: number, options?: Dashb
       resolve(null)
     })
 
-    server.listen(port, () => {
-      log(`dashboard:started port=${port} url=http://localhost:${port}`)
+    server.listen(port, DASHBOARD_HOST, () => {
+      log(`dashboard:started port=${port} url=http://${DASHBOARD_HOST}:${port}`)
       resolve(toDashboardServer(server))
     })
   })

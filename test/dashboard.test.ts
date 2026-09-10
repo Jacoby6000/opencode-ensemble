@@ -1,12 +1,26 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test"
 import type { Database } from "../src/db"
 import { setupDb, insertTeam, insertMember, mockClient } from "./helpers"
-import { startDashboard, parseMessageParts } from "../src/dashboard"
+import { DASHBOARD_HOST, startDashboard as startDashboardServer, parseMessageParts } from "../src/dashboard"
+import type { DashboardOptions } from "../src/dashboard"
 import { ActivityBuffer } from "../src/activity"
 import type { PluginClient } from "../src/types"
 
 function randomPort(): number {
   return 19000 + Math.floor(Math.random() * 10000)
+}
+
+const TEST_TOKEN = "dashboard-test-token"
+const nativeFetch = globalThis.fetch
+
+function startDashboard(db: Database, port: number, options: Omit<DashboardOptions, "token"> = {}) {
+  return startDashboardServer(db, port, { ...options, token: TEST_TOKEN })
+}
+
+function withDashboardAuth(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers)
+  headers.set("Authorization", `Bearer ${TEST_TOKEN}`)
+  return nativeFetch(input, { ...init, headers })
 }
 
 function insertTask(db: Database, teamId: string, id: string, content: string, status = "pending", priority = "medium", assignee: string | null = null, dependsOn: string | null = null) {
@@ -36,20 +50,51 @@ describe("dashboard", () => {
   beforeEach(() => {
     db = setupDb()
     port = randomPort()
+    globalThis.fetch = withDashboardAuth as typeof fetch
   })
 
   afterEach(() => {
     server?.stop(true)
     db.close()
+    globalThis.fetch = nativeFetch
   })
 
   describe("GET /api/health", () => {
+    test("rejects requests without the bearer token", async () => {
+      server = await startDashboard(db, port)
+      const res = await nativeFetch(`http://localhost:${port}/api/health`)
+      expect(res.status).toBe(401)
+      expect(res.headers.get("www-authenticate")).toBe("Bearer")
+    })
+
+    test("rejects an incorrect bearer token across every API family", async () => {
+      server = await startDashboard(db, port)
+      const paths = [
+        "/api/state",
+        "/api/teams/team/messages",
+        "/api/teams/team/members/member",
+        "/api/session/session/activity",
+      ]
+
+      for (const path of paths) {
+        const res = await nativeFetch(`http://localhost:${port}${path}`, {
+          headers: { Authorization: "Bearer wrong-token" },
+        })
+        expect(res.status).toBe(401)
+      }
+    })
+
     test("returns correct shape with ensemble: true", async () => {
       server = await startDashboard(db, port)
       const res = await fetch(`http://localhost:${port}/api/health`)
       expect(res.status).toBe(200)
       expect(res.headers.get("content-type")).toContain("application/json")
-      expect(res.headers.get("access-control-allow-origin")).toBe("*")
+      expect(res.headers.get("access-control-allow-origin")).toBeNull()
+      expect(res.headers.get("cache-control")).toBe("no-store")
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff")
+      expect(res.headers.get("x-frame-options")).toBe("DENY")
+      expect(res.headers.get("content-security-policy")).toContain("default-src 'none'")
+      expect(server?.host).toBe(DASHBOARD_HOST)
       const body = (await res.json()) as HealthResponse
       expect(body.ensemble).toBe(true)
       expect(typeof body.pid).toBe("number")
@@ -61,9 +106,9 @@ describe("dashboard", () => {
       server = await startDashboard(db, port)
       const res = await fetch(`http://localhost:${port}/api/state`)
       expect(res.status).toBe(200)
-      expect(res.headers.get("access-control-allow-origin")).toBe("*")
+      expect(res.headers.get("access-control-allow-origin")).toBeNull()
       const body = (await res.json()) as StateResponse
-      expect(body).toEqual({ version: 1, projects: [], teams: [] })
+      expect(body).toEqual({ version: 2, projects: [], teams: [] })
     })
 
     test("returns team with members, tasks, messages", async () => {
@@ -103,7 +148,10 @@ describe("dashboard", () => {
       expect(team.messages[0]!.id).toBe("msg-1")
       expect(team.messages[0]!.fromName).toBe("alice")
       expect(team.messages[0]!.toName).toBe("lead")
-      expect(team.messages[0]!.content).toBe("Done with auth fix")
+      expect(team.messages[0]!.preview).toBe("Done with auth fix")
+      expect(team.messages[0]!.contentLength).toBe("Done with auth fix".length)
+      expect(team.messages[0]!).not.toHaveProperty("content")
+      expect(team.members[0]!).not.toHaveProperty("prompt")
       expect(body.projects).toHaveLength(1)
       expect(body.projects[0]!.id).toBe("/tmp/test-project")
       expect(body.projects[0]!.path).toBe("/tmp/test-project")
@@ -256,6 +304,52 @@ describe("dashboard", () => {
     })
   })
 
+  describe("GET /api/teams/:teamId/messages", () => {
+    test("returns full message bodies in bounded cursor pages", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMessage(db, "t1", "msg-1", "alice", "lead", "First body")
+      insertMessage(db, "t1", "msg-2", "alice", "lead", "Second body")
+      insertMessage(db, "t1", "msg-3", "alice", "lead", "Third body")
+      db.run("UPDATE team_message SET time_created = ? WHERE id = ?", [1, "msg-1"])
+      db.run("UPDATE team_message SET time_created = ? WHERE id = ?", [2, "msg-2"])
+      db.run("UPDATE team_message SET time_created = ? WHERE id = ?", [3, "msg-3"])
+
+      server = await startDashboard(db, port)
+      const firstRes = await fetch(`http://localhost:${port}/api/teams/t1/messages?limit=2`)
+      expect(firstRes.status).toBe(200)
+      const first = (await firstRes.json()) as { messages: Array<Record<string, unknown>>; nextCursor: string | null }
+      expect(first.messages.map(message => message.id)).toEqual(["msg-3", "msg-2"])
+      expect(first.messages.map(message => message.content)).toEqual(["Third body", "Second body"])
+      expect(typeof first.nextCursor).toBe("string")
+
+      const secondRes = await fetch(`http://localhost:${port}/api/teams/t1/messages?limit=2&cursor=${encodeURIComponent(first.nextCursor!)}`)
+      const second = (await secondRes.json()) as { messages: Array<Record<string, unknown>>; nextCursor: string | null }
+      expect(second.messages.map(message => message.id)).toEqual(["msg-1"])
+      expect(second.nextCursor).toBeNull()
+    })
+
+    test("rejects invalid pagination limits", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      server = await startDashboard(db, port)
+
+      const res = await fetch(`http://localhost:${port}/api/teams/t1/messages?limit=51`)
+      expect(res.status).toBe(400)
+    })
+  })
+
+  describe("GET /api/teams/:teamId/members/:memberName", () => {
+    test("returns the full prompt only through the authenticated detail route", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      db.run("UPDATE team_member SET prompt = ? WHERE team_id = ? AND name = ?", ["Sensitive implementation prompt", "t1", "alice"])
+
+      server = await startDashboard(db, port)
+      const res = await fetch(`http://localhost:${port}/api/teams/t1/members/alice`)
+      expect(res.status).toBe(200)
+      expect(await res.json()).toEqual({ prompt: "Sensitive implementation prompt" })
+    })
+  })
+
   describe("GET /", () => {
     test("returns HTML content-type", async () => {
       server = await startDashboard(db, port)
@@ -264,6 +358,8 @@ describe("dashboard", () => {
       expect(res.headers.get("content-type")).toContain("text/html")
       const text = await res.text()
       expect(text).toContain("<html")
+      expect(text).not.toContain('src="https://')
+      expect(text).not.toContain('href="https://')
       expect(text).toContain('id="attention"')
       expect(text).toContain('aria-label="Team attention"')
       expect(text).toContain('aria-label="Agent roster"')
@@ -280,6 +376,14 @@ describe("dashboard", () => {
       const res = await fetch(`http://localhost:${port}/nope`)
       expect(res.status).toBe(404)
     })
+
+    test("rejects non-GET methods", async () => {
+      server = await startDashboard(db, port)
+      const res = await fetch(`http://localhost:${port}/api/state`, { method: "POST" })
+      expect(res.status).toBe(405)
+      expect(res.headers.get("allow")).toBe("GET")
+      expect(res.headers.get("cache-control")).toBe("no-store")
+    })
   })
 
   describe("stop(force)", () => {
@@ -294,7 +398,7 @@ describe("dashboard", () => {
       const net = await import("node:net")
       const dangling = await new Promise<import("node:net").Socket>((resolve, reject) => {
         const sock = net.createConnection({ port, host: "127.0.0.1" }, () => {
-          sock.write("GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+          sock.write(`GET /api/health HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer ${TEST_TOKEN}\r\nConnection: keep-alive\r\n\r\n`)
         })
         sock.on("error", reject)
         sock.once("data", () => resolve(sock))
@@ -386,10 +490,9 @@ describe("dashboard", () => {
       server = await startDashboard(db, port, { client: mockPluginClient })
       const res = await fetch(`http://localhost:${port}/api/session/sess-x/activity`)
       expect(res.status).toBe(200)
-      const body = await res.json() as { activity: Array<Record<string, unknown>>; session: Record<string, unknown> | null }
+      const body = await res.json() as { activity: Array<Record<string, unknown>>; session?: unknown }
       expect(body.activity.length).toBeGreaterThan(0)
-      expect(body.session).toBeTruthy()
-      expect(body.session!.cost).toBe(0.05)
+      expect(body.session).toBeUndefined()
     })
 
     test("combines buffer entries with session.messages fallback", async () => {
@@ -417,7 +520,7 @@ describe("dashboard", () => {
       expect(body.activity[0]!.type).toBe("shell_command")
     })
 
-    test("parses reasoning parts from session messages", async () => {
+    test("does not expose reasoning or transcript text from session messages", async () => {
       const mockPluginClient: PluginClient = {
         ...mockClient(),
         session: {
@@ -442,13 +545,9 @@ describe("dashboard", () => {
       server = await startDashboard(db, port, { client: mockPluginClient })
       const res = await fetch(`http://localhost:${port}/api/session/sess-r/activity`)
       const body = await res.json() as { activity: Array<Record<string, unknown>> }
-      const reasoning = body.activity.find(a => a.type === "reasoning")
-      expect(reasoning).toBeTruthy()
-      expect(reasoning!.reasoning).toBe("I should check the file first.")
-      const text = body.activity.find(a => a.type === "text")
-      expect(text).toBeTruthy()
-      expect(text!.text).toBe("Let me look at the handler.")
-      expect(text!.role).toBe("assistant")
+      expect(body.activity).toEqual([])
+      expect(JSON.stringify(body)).not.toContain("I should check the file first.")
+      expect(JSON.stringify(body)).not.toContain("Let me look at the handler.")
     })
 
     test("parses file parts from session messages", async () => {
@@ -478,7 +577,7 @@ describe("dashboard", () => {
       const file = body.activity.find(a => a.type === "file")
       expect(file).toBeTruthy()
       expect(file!.filePath).toBe("src/handler.ts")
-      expect(file!.fileContent).toBe("export function handle() {}")
+      expect(file!.fileContent).toBeUndefined()
     })
 
     test("parses structured tool input/output from session messages", async () => {
@@ -508,8 +607,8 @@ describe("dashboard", () => {
       const tool = body.activity.find(a => a.type === "tool_result")
       expect(tool).toBeTruthy()
       expect(tool!.tool).toBe("bash")
-      expect(tool!.input).toBe(JSON.stringify({ command: "ls" }, null, 2))
-      expect(tool!.output).toBe(JSON.stringify({ stdout: "file.ts" }, null, 2))
+      expect(tool!.input).toBeUndefined()
+      expect(tool!.output).toBeUndefined()
     })
   })
 
@@ -550,7 +649,7 @@ describe("dashboard", () => {
 
       expect(typeof body.version).toBe("number")
       expect(Number.isInteger(body.version)).toBe(true)
-      expect(body.version).toBe(1)
+      expect(body.version).toBe(2)
     })
   })
 
@@ -634,7 +733,7 @@ describe("dashboard", () => {
             return {
               data: [{
                 info: { role: "assistant", time: new Date(1000).toISOString() },
-                parts: [{ type: "text", text: "hello" }],
+                parts: [{ type: "step-start", label: "Earlier step" }],
               }],
             }
           },
@@ -682,9 +781,9 @@ describe("dashboard", () => {
       const res = await fetch(`http://localhost:${port}/api/session/sess-err/activity`)
       // The error is caught — returns what we have (empty activity)
       expect(res.status).toBe(200)
-      const body = await res.json() as { activity: unknown[]; session: unknown }
+      const body = await res.json() as { activity: unknown[]; session?: unknown }
       expect(body.activity).toEqual([])
-      expect(body.session).toBeNull()
+      expect(body.session).toBeUndefined()
     })
   })
 })

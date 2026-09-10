@@ -2,7 +2,7 @@ import type { ToolDeps } from "../types"
 import { resolveRecipientSession } from "../types"
 import { requireTeamMember } from "./shared"
 import { sendMessage, markDelivered, hasReportedCompletion } from "../messaging"
-import { parseModelId, getMemberModel } from "../member-model"
+import { parseModelId, getMemberPromptOptions } from "../member-model"
 import { log } from "../log"
 
 /**
@@ -141,13 +141,13 @@ export async function executeTeamMessage(
   }
 
   // For member-to-member messages, fire-and-forget delivery is safe.
-  // Deliver on the recipient's configured model, if any (#26).
+  // Deliver with the recipient's stored identity, including configured model (#26).
   const deliveryText = `[Team message from ${senderName}]: ${messageText}`
-  const recipientModel = getMemberModel(deps.db, teamInfo.teamId, args.to)
+  const promptOptions = getMemberPromptOptions(deps.db, teamInfo.teamId, args.to)
   deps.client.session.promptAsync({
     sessionID: recipientSessionId,
     parts: [{ type: "text", text: deliveryText }],
-    ...(recipientModel ? { model: recipientModel } : {}),
+    ...promptOptions,
   }).then(() => {
     markDelivered(deps.db, msgId)
   }).catch((err) => {

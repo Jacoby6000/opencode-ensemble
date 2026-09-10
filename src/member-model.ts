@@ -6,6 +6,12 @@ export interface ParsedModel {
   modelID: string
 }
 
+/** Stored teammate identity fields accepted by session.promptAsync. */
+export interface MemberPromptOptions {
+  agent?: string
+  model?: ParsedModel
+}
+
 /**
  * Parse a "provider/model" string into { providerID, modelID } for the SDK.
  * Returns undefined if the string is not in "provider/model" form (empty
@@ -23,8 +29,21 @@ export function parseModelId(model: string): ParsedModel | undefined {
  * stored value is malformed. Never throws — safe to call from delivery paths.
  */
 export function getMemberModel(db: Database, teamId: string, memberName: string): ParsedModel | undefined {
-  const row = db.query("SELECT model FROM team_member WHERE team_id = ? AND name = ?")
-    .get(teamId, memberName) as { model: string | null } | null
-  if (!row?.model) return undefined
-  return parseModelId(row.model)
+  return getMemberPromptOptions(db, teamId, memberName).model
+}
+
+/**
+ * Read a teammate's stored agent and model as session.promptAsync options.
+ * Unknown members return empty options. A missing or malformed model is
+ * omitted without dropping the stored agent.
+ */
+export function getMemberPromptOptions(db: Database, teamId: string, memberName: string): MemberPromptOptions {
+  const row = db.query("SELECT agent, model FROM team_member WHERE team_id = ? AND name = ?")
+    .get(teamId, memberName) as { agent: string; model: string | null } | null
+  if (!row) return {}
+  const model = row.model ? parseModelId(row.model) : undefined
+  return {
+    agent: row.agent,
+    ...(model ? { model } : {}),
+  }
 }

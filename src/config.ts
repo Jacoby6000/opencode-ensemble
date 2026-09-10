@@ -3,8 +3,10 @@ import path from "node:path"
 
 /** Plugin configuration shape. All fields optional — defaults applied. */
 export interface EnsembleConfig {
-  /** Auto-merge worktree branches on cleanup (default: true) */
+  /** Auto-merge worktree branches on cleanup (default: false) */
   mergeOnCleanup?: boolean
+  /** Custom agent names that must run without write or shell permissions. */
+  readOnlyAgents?: string[]
   /** Stall detection threshold in ms (default: 180000 = 3 min, 0 to disable) */
   stallThresholdMs?: number
   /** Min steps before token-based stall check (default: 3) */
@@ -35,7 +37,8 @@ export interface EnsembleConfig {
 
 /** Default configuration values. */
 export const DEFAULT_CONFIG: Required<EnsembleConfig> = {
-  mergeOnCleanup: true,
+  mergeOnCleanup: false,
+  readOnlyAgents: [],
   stallThresholdMs: 300_000,
   stallMinSteps: 5,
   stallTokenThreshold: 200,
@@ -59,6 +62,9 @@ function readConfigFile(filePath: string): Partial<EnsembleConfig> {
     // Validate types — only accept numbers for numeric fields, booleans for boolean fields
     const result: Partial<EnsembleConfig> = {}
     if (typeof raw.mergeOnCleanup === "boolean") result.mergeOnCleanup = raw.mergeOnCleanup
+    if (Array.isArray(raw.readOnlyAgents) && raw.readOnlyAgents.every((agent: unknown) => typeof agent === "string")) {
+      result.readOnlyAgents = raw.readOnlyAgents as string[]
+    }
     if (typeof raw.stallThresholdMs === "number") result.stallThresholdMs = raw.stallThresholdMs
     if (typeof raw.stallMinSteps === "number") result.stallMinSteps = raw.stallMinSteps
     if (typeof raw.stallTokenThreshold === "number") result.stallTokenThreshold = raw.stallTokenThreshold

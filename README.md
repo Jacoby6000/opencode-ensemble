@@ -6,7 +6,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@hueyexe/opencode-ensemble.svg)](https://www.npmjs.com/package/@hueyexe/opencode-ensemble)
 [![npm downloads](https://img.shields.io/npm/dm/@hueyexe/opencode-ensemble.svg)](https://www.npmjs.com/package/@hueyexe/opencode-ensemble)
-[![tests](https://img.shields.io/badge/tests-666%20passing-brightgreen.svg)]()
+[![tests](https://img.shields.io/badge/tests-820%20passing-brightgreen.svg)]()
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue.svg)]()
 [![OpenCode SDK](https://img.shields.io/badge/deps-OpenCode%20SDK%20only-blue.svg)]()
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -140,7 +140,7 @@ Good team shapes:
 
 ## Dashboard
 
-A real-time mission control dashboard runs at `http://localhost:4747` while OpenCode is active.
+A real-time mission control dashboard runs at `http://127.0.0.1:4747` while OpenCode is active. Open it initially as `http://127.0.0.1:4747/#token=TOKEN`, using the token described below.
 
 ![Ensemble Dashboard](docs/dashboard.png)
 
@@ -163,6 +163,8 @@ Configure the port in `.opencode/ensemble.json`:
 ```
 
 Set to `0` to disable. The dashboard starts automatically when OpenCode loads the plugin.
+
+Dashboard APIs require the bearer token stored in `~/.config/opencode/ensemble-dashboard.token` with owner-only permissions. Supply it in the URL fragment as `http://127.0.0.1:4747/#token=TOKEN`; the dashboard moves it to browser session storage and removes the fragment before making API requests.
 
 ## Install
 
@@ -274,7 +276,7 @@ Archived-team purge is intentionally two-step. First call `team_cleanup` with `p
 
 ## What you see in the TUI
 
-The plugin works within OpenCode's existing TUI. For deeper visibility, open the [dashboard](#dashboard) at `http://localhost:4747`.
+The plugin works within OpenCode's existing TUI. For deeper visibility, open the authenticated [dashboard](#dashboard) at `http://127.0.0.1:4747/#token=TOKEN`.
 
 What you get:
 
@@ -366,7 +368,8 @@ Configure via JSON files, environment variables, or both. Project config overrid
 
 ```json
 {
-  "mergeOnCleanup": true,
+  "mergeOnCleanup": false,
+  "readOnlyAgents": ["Shit Tester"],
   "stallThresholdMs": 300000,
   "stallMinSteps": 5,
   "stallTokenThreshold": 200,
@@ -387,7 +390,8 @@ All fields are optional. Missing fields use defaults.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `mergeOnCleanup` | `true` | Auto-merge worktree branches on cleanup (squash + unstage) |
+| `mergeOnCleanup` | `false` | Auto-merge worktree branches on cleanup (squash + unstage) |
+| `readOnlyAgents` | `[]` | Custom agent names that run without edit, shell, or worktree access. `plan` and `explore` are always read-only. |
 | `stallThresholdMs` | `300000` (5 min) | Time without communication before stall escalation. `0` disables. |
 | `stallMinSteps` | `5` | Min model steps before token-based stall check kicks in |
 | `stallTokenThreshold` | `200` | Output tokens per step below which the agent is considered stalled |
@@ -455,7 +459,7 @@ Same coordination model (shared tasks, peer messaging, lead coordination) with s
 ```bash
 bun install
 bun run typecheck
-bun test             # 623 tests
+bun test             # 820 tests
 bun run build
 ```
 
