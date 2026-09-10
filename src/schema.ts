@@ -204,6 +204,98 @@ export const MIGRATIONS: string[] = [
    ALTER TABLE team_member ADD COLUMN retry_attempt INTEGER;
    ALTER TABLE team_member ADD COLUMN retry_provider TEXT;
    ALTER TABLE team_member ADD COLUMN retry_message TEXT;`,
+  // Migration 11: Persist mailbox lifecycle, queued wakes, active run leases,
+  // message/wake links, and append-only scheduler lifecycle events.
+  `ALTER TABLE team_message ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'queued'
+     CHECK(delivery_state IN ('queued', 'wake_queued', 'injected', 'processed', 'failed'));
+   UPDATE team_message SET delivery_state = CASE
+     WHEN read = 1 THEN 'processed'
+     WHEN delivered = 1 THEN 'injected'
+     ELSE 'queued'
+   END;
+   UPDATE team_message SET delivered = 1 WHERE read = 1;
+
+   CREATE TABLE scheduler_identity (
+     id             TEXT PRIMARY KEY,
+     team_id        TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     member_name    TEXT NOT NULL,
+     agent          TEXT NOT NULL,
+     state          TEXT NOT NULL DEFAULT 'reserved'
+                      CHECK(state IN ('reserved', 'active', 'released', 'expired')),
+     reserved_at    INTEGER NOT NULL,
+     expires_at     INTEGER,
+     activated_at   INTEGER,
+     released_at    INTEGER
+   );
+   CREATE UNIQUE INDEX scheduler_identity_live_member_idx ON scheduler_identity(team_id, member_name) WHERE state IN ('reserved', 'active');
+   CREATE INDEX scheduler_identity_capacity_idx ON scheduler_identity(state, agent, expires_at);
+   INSERT INTO scheduler_identity (id, team_id, member_name, agent, state, reserved_at, activated_at)
+     SELECT 'identity_m11_' || lower(hex(randomblob(16))), tm.team_id, tm.name, tm.agent, 'active', tm.time_created, tm.time_created
+     FROM team_member tm
+     JOIN team t ON t.id = tm.team_id
+     WHERE t.status = 'active' AND tm.status IN ('ready', 'busy', 'shutdown_requested');
+
+   CREATE TABLE scheduler_wake (
+     id             TEXT PRIMARY KEY,
+     team_id        TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     member_name    TEXT NOT NULL,
+     session_id     TEXT NOT NULL,
+     agent          TEXT NOT NULL,
+     reason         TEXT NOT NULL,
+     coalesce_key   TEXT NOT NULL,
+     state          TEXT NOT NULL DEFAULT 'queued'
+                      CHECK(state IN ('queued', 'leased', 'completed', 'failed', 'cancelled')),
+     not_before     INTEGER NOT NULL,
+     attempt_count  INTEGER NOT NULL DEFAULT 0,
+     last_error     TEXT,
+     time_created   INTEGER NOT NULL,
+     time_updated   INTEGER NOT NULL,
+     FOREIGN KEY (team_id, member_name) REFERENCES team_member(team_id, name) ON DELETE CASCADE
+   );
+   CREATE UNIQUE INDEX scheduler_wake_queued_key_idx ON scheduler_wake(team_id, member_name, coalesce_key) WHERE state = 'queued';
+   CREATE INDEX scheduler_wake_ready_idx ON scheduler_wake(state, not_before, time_created);
+   CREATE INDEX scheduler_wake_member_idx ON scheduler_wake(team_id, member_name, state);
+
+   CREATE TABLE scheduler_run_lease (
+     id             TEXT PRIMARY KEY,
+     wake_id        TEXT NOT NULL REFERENCES scheduler_wake(id) ON DELETE CASCADE,
+     team_id        TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     member_name    TEXT NOT NULL,
+     session_id     TEXT NOT NULL,
+     agent          TEXT NOT NULL,
+     state          TEXT NOT NULL DEFAULT 'active'
+                      CHECK(state IN ('active', 'released', 'expired', 'failed')),
+     acquired_at    INTEGER NOT NULL,
+     expires_at     INTEGER NOT NULL,
+     released_at    INTEGER,
+     FOREIGN KEY (team_id, member_name) REFERENCES team_member(team_id, name) ON DELETE CASCADE
+   );
+   CREATE UNIQUE INDEX scheduler_run_lease_active_member_idx ON scheduler_run_lease(team_id, member_name) WHERE state = 'active';
+   CREATE UNIQUE INDEX scheduler_run_lease_active_wake_idx ON scheduler_run_lease(wake_id) WHERE state = 'active';
+   CREATE INDEX scheduler_run_lease_capacity_idx ON scheduler_run_lease(state, agent, expires_at);
+
+   CREATE TABLE scheduler_message_wake (
+     message_id     TEXT NOT NULL REFERENCES team_message(id) ON DELETE CASCADE,
+     wake_id        TEXT NOT NULL REFERENCES scheduler_wake(id) ON DELETE CASCADE,
+     delivery_state TEXT NOT NULL DEFAULT 'wake_queued'
+                      CHECK(delivery_state IN ('wake_queued', 'injected', 'processed', 'failed')),
+     time_created   INTEGER NOT NULL,
+     PRIMARY KEY (message_id, wake_id)
+   );
+   CREATE INDEX scheduler_message_wake_wake_idx ON scheduler_message_wake(wake_id);
+
+   CREATE TABLE scheduler_event (
+     id             TEXT PRIMARY KEY,
+     team_id        TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     member_name    TEXT,
+     wake_id        TEXT REFERENCES scheduler_wake(id) ON DELETE SET NULL,
+     lease_id       TEXT REFERENCES scheduler_run_lease(id) ON DELETE SET NULL,
+     type           TEXT NOT NULL,
+     detail         TEXT,
+     time_created   INTEGER NOT NULL
+   );
+   CREATE INDEX scheduler_event_team_idx ON scheduler_event(team_id, time_created);
+   CREATE INDEX scheduler_event_wake_idx ON scheduler_event(wake_id, time_created);`,
 ]
 
 /**
@@ -211,21 +303,28 @@ export const MIGRATIONS: string[] = [
  * Uses PRAGMA user_version to track which migrations have been applied.
  */
 export function applyMigrations(db: Database): void {
-  const { user_version: current } = db.query("PRAGMA user_version").get() as { user_version: number }
-
-  if (current > MIGRATIONS.length) {
-    throw new Error(`Database schema version ${current} is newer than this plugin supports (${MIGRATIONS.length}). Upgrade opencode-ensemble before continuing.`)
-  }
-
-  for (let i = current; i < MIGRATIONS.length; i++) {
-    const migration = MIGRATIONS[i]
+  while (true) {
+    const { user_version: observedVersion } = db.query("PRAGMA user_version").get() as { user_version: number }
+    if (observedVersion > MIGRATIONS.length) {
+      throw new Error(`Database schema version ${observedVersion} is newer than this plugin supports (${MIGRATIONS.length}). Upgrade opencode-ensemble before continuing.`)
+    }
+    if (observedVersion === MIGRATIONS.length) return
     const { foreign_keys: foreignKeys } = db.query("PRAGMA foreign_keys").get() as { foreign_keys: number }
 
     db.exec("PRAGMA foreign_keys = OFF")
     db.exec("BEGIN IMMEDIATE")
     try {
+      const { user_version: lockedVersion } = db.query("PRAGMA user_version").get() as { user_version: number }
+      if (lockedVersion > MIGRATIONS.length) {
+        throw new Error(`Database schema version ${lockedVersion} is newer than this plugin supports (${MIGRATIONS.length}). Upgrade opencode-ensemble before continuing.`)
+      }
+      if (lockedVersion === MIGRATIONS.length) {
+        db.exec("COMMIT")
+        return
+      }
+      const migration = MIGRATIONS[lockedVersion]
       if (migration) db.exec(migration)
-      db.exec(`PRAGMA user_version = ${i + 1}`)
+      db.exec(`PRAGMA user_version = ${lockedVersion + 1}`)
       db.exec("COMMIT")
     } catch (err) {
       db.exec("ROLLBACK")

@@ -6,7 +6,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@hueyexe/opencode-ensemble.svg)](https://www.npmjs.com/package/@hueyexe/opencode-ensemble)
 [![npm downloads](https://img.shields.io/npm/dm/@hueyexe/opencode-ensemble.svg)](https://www.npmjs.com/package/@hueyexe/opencode-ensemble)
-[![tests](https://img.shields.io/badge/tests-820%20passing-brightgreen.svg)]()
+[![tests](https://img.shields.io/badge/tests-851%20passing-brightgreen.svg)]()
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue.svg)]()
 [![OpenCode SDK](https://img.shields.io/badge/deps-OpenCode%20SDK%20only-blue.svg)]()
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -459,7 +459,7 @@ Same coordination model (shared tasks, peer messaging, lead coordination) with s
 ```bash
 bun install
 bun run typecheck
-bun test             # 820 tests
+bun test             # 851 tests
 bun run build
 ```
 

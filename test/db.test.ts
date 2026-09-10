@@ -100,6 +100,47 @@ describe("schema migrations", () => {
     expect(row).toBeTruthy()
   })
 
+  test("creates scheduler persistence tables and mailbox lifecycle state", () => {
+    applyMigrations(db)
+    const tables = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'scheduler_%' ORDER BY name").all()
+    expect(tables).toEqual([
+      { name: "scheduler_event" },
+      { name: "scheduler_identity" },
+      { name: "scheduler_message_wake" },
+      { name: "scheduler_run_lease" },
+      { name: "scheduler_wake" },
+    ])
+    const messageColumns = db.query("PRAGMA table_info(team_message)").all() as Array<{ name: string }>
+    expect(messageColumns.some(column => column.name === "delivery_state")).toBe(true)
+    const linkColumns = db.query("PRAGMA table_info(scheduler_message_wake)").all() as Array<{ name: string }>
+    expect(linkColumns.some(column => column.name === "delivery_state")).toBe(true)
+  })
+
+  test("migration 11 maps legacy delivered and read flags into mailbox lifecycle state", () => {
+    for (let i = 0; i < 10; i++) {
+      const migration = MIGRATIONS[i]
+      if (migration) db.exec(migration)
+      db.exec(`PRAGMA user_version = ${i + 1}`)
+    }
+    db.run("INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated) VALUES ('t1', 'team', 'default', 'lead', 'active', 0, 0, 0)")
+    db.run("INSERT INTO team_message (id, team_id, from_name, content, delivered, read, time_created) VALUES ('queued', 't1', 'alice', 'q', 0, 0, 1)")
+    db.run("INSERT INTO team_message (id, team_id, from_name, content, delivered, read, time_created) VALUES ('injected', 't1', 'alice', 'i', 1, 0, 2)")
+    db.run("INSERT INTO team_message (id, team_id, from_name, content, delivered, read, time_created) VALUES ('processed', 't1', 'alice', 'p', 0, 1, 3)")
+    db.run("INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, time_created, time_updated) VALUES ('t1', 'alice', 's1', 'build', 'ready', 'idle', 1, 1)")
+    db.run("INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, time_created, time_updated) VALUES ('t1', 'done', 's2', 'build', 'shutdown', 'completed', 1, 1)")
+
+    applyMigrations(db)
+
+    expect(db.query("SELECT id, delivered, delivery_state FROM team_message ORDER BY time_created").all()).toEqual([
+      { id: "queued", delivered: 0, delivery_state: "queued" },
+      { id: "injected", delivered: 1, delivery_state: "injected" },
+      { id: "processed", delivered: 1, delivery_state: "processed" },
+    ])
+    expect(db.query("SELECT team_id, member_name, agent, state FROM scheduler_identity").all()).toEqual([
+      { team_id: "t1", member_name: "alice", agent: "build", state: "active" },
+    ])
+  })
+
   test("is idempotent — running twice does not error", () => {
     applyMigrations(db)
     applyMigrations(db)
@@ -150,6 +191,38 @@ describe("schema migrations", () => {
 
     const foreignKeys = db.query("PRAGMA foreign_keys").get() as { foreign_keys: number }
     expect(foreignKeys.foreign_keys).toBe(0)
+  })
+
+  test("rechecks schema version after acquiring the migration write lock", () => {
+    for (let i = 0; i < 10; i++) {
+      const migration = MIGRATIONS[i]
+      if (migration) db.exec(migration)
+      db.exec(`PRAGMA user_version = ${i + 1}`)
+    }
+    let firstVersionRead = true
+    let competingMigrationApplied = false
+    const racingDb = {
+      exec(sql: string) {
+        if (sql === "BEGIN IMMEDIATE" && !competingMigrationApplied) {
+          competingMigrationApplied = true
+          applyMigrations(db)
+        }
+        db.exec(sql)
+      },
+      query(sql: string) {
+        if (sql === "PRAGMA user_version" && firstVersionRead) {
+          firstVersionRead = false
+          return { get: () => ({ user_version: 10 }), all: () => [], run: () => ({ changes: 0 }) }
+        }
+        return db.query(sql)
+      },
+      run: db.run.bind(db),
+      transaction: db.transaction.bind(db),
+      close: db.close.bind(db),
+    }
+
+    expect(() => applyMigrations(racingDb)).not.toThrow()
+    expect((db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(MIGRATIONS.length)
   })
 
   test("upgrades a version 7 database to the current project schema", () => {
@@ -302,6 +375,13 @@ describe("createDb", () => {
     try { require("fs").unlinkSync(tmpPath) } catch {}
     try { require("fs").unlinkSync(tmpPath + "-wal") } catch {}
     try { require("fs").unlinkSync(tmpPath + "-shm") } catch {}
+  })
+
+  test("waits briefly for concurrent writers", () => {
+    const db = createDb(":memory:")
+    const timeout = db.query("PRAGMA busy_timeout").get() as { timeout: number }
+    expect(timeout.timeout).toBe(5_000)
+    db.close()
   })
 })
 
