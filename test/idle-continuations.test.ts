@@ -15,8 +15,9 @@ describe("idle teammate continuations", () => {
     )
   })
 
-  test("idle-without-report nudge preserves the teammate's custom agent and model", () => {
-    sendIdleWithoutReportNudge(deps.client, deps.db, "t1", "alice", "sess-alice")
+  test("idle-without-report nudge preserves the teammate's custom agent and model", async () => {
+    sendIdleWithoutReportNudge(deps.scheduler, deps.db, "t1", "alice", "sess-alice")
+    await Bun.sleep(0)
 
     const options = deps.client.calls.find(c => c.method === "session.promptAsync")!.args[0] as {
       agent?: string
@@ -40,7 +41,7 @@ describe("idle teammate continuations", () => {
   test("both idle continuations remain fire-and-forget", () => {
     deps.client.session.promptAsync = () => new Promise(() => { /* never settles */ })
 
-    expect(() => sendIdleWithoutReportNudge(deps.client, deps.db, "t1", "alice", "sess-alice")).not.toThrow()
+    expect(() => sendIdleWithoutReportNudge(deps.scheduler, deps.db, "t1", "alice", "sess-alice")).not.toThrow()
     expect(() => sendPeerMessageFlush(deps.client, deps.db, "t1", "alice", "sess-alice", 2)).not.toThrow()
   })
 })

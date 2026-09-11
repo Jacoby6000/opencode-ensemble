@@ -296,6 +296,11 @@ export const MIGRATIONS: string[] = [
    );
    CREATE INDEX scheduler_event_team_idx ON scheduler_event(team_id, time_created);
    CREATE INDEX scheduler_event_wake_idx ON scheduler_event(wake_id, time_created);`,
+  // Migration 12: Persist restart-safe wake prompts and injection evidence.
+  `ALTER TABLE scheduler_wake ADD COLUMN prompt TEXT;
+   ALTER TABLE scheduler_run_lease ADD COLUMN injected_at INTEGER;`,
+  // Migration 13: Preserve the lead's selected model on asynchronous wake-ups.
+  `ALTER TABLE team ADD COLUMN lead_model TEXT;`,
 ]
 
 /**

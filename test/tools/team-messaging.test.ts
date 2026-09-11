@@ -30,6 +30,18 @@ describe("team_message", () => {
     expect(promptCalls).toHaveLength(1)
   })
 
+  test("lead-bound delivery preserves the stored lead agent and model", async () => {
+    deps.db.run("UPDATE team SET lead_agent = ?, lead_model = ? WHERE id = ?", ["solutions-architect", "openrouter/anthropic/claude-sonnet", "t1"])
+
+    await executeTeamMessage(deps, { to: "lead", text: "done" }, "sess-alice")
+
+    const options = deps.client.calls.find(c => c.method === "session.promptAsync")?.args[0]
+    expect(options).toMatchObject({
+      agent: "solutions-architect",
+      model: { providerID: "openrouter", modelID: "anthropic/claude-sonnet" },
+    })
+  })
+
   test("teammate sends message to another teammate", async () => {
     const result = await executeTeamMessage(deps, { to: "bob", text: "need help" }, "sess-alice")
     expect(result).toContain("bob")
@@ -229,11 +241,12 @@ describe("team_broadcast", () => {
     expect(promptCalls).toHaveLength(2)
   })
 
-  test("broadcast preserves each teammate identity but does not invent lead identity", async () => {
+  test("broadcast preserves teammate and stored lead identities", async () => {
     deps.db.run(
       "UPDATE team_member SET agent = ?, model = ? WHERE team_id = ? AND name = ?",
       ["review-specialist", "openrouter/anthropic/claude-sonnet", "t1", "bob"],
     )
+    deps.db.run("UPDATE team SET lead_agent = ?, lead_model = ? WHERE id = ?", ["solutions-architect", "openrouter/openai/gpt-5", "t1"])
 
     await executeTeamBroadcast(deps, { text: "status update" }, "sess-alice")
 
@@ -248,8 +261,8 @@ describe("team_broadcast", () => {
       agent: "review-specialist",
       model: { providerID: "openrouter", modelID: "anthropic/claude-sonnet" },
     })
-    expect(leadOptions?.agent).toBeUndefined()
-    expect(leadOptions?.model).toBeUndefined()
+    expect(leadOptions?.agent).toBe("solutions-architect")
+    expect(leadOptions?.model).toEqual({ providerID: "openrouter", modelID: "openai/gpt-5" })
   })
 
   test("rejects if sender is not in a team", async () => {
@@ -279,6 +292,7 @@ describe("team_broadcast", () => {
     }
 
     await executeTeamBroadcast(deps, { text: "status update" }, "sess-alice")
+    await Bun.sleep(0)
 
     const rows = deps.db.query("SELECT delivered FROM team_message WHERE team_id = ?").all("t1") as Array<{ delivered: number }>
     expect(rows).toHaveLength(1)

@@ -6,7 +6,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@hueyexe/opencode-ensemble.svg)](https://www.npmjs.com/package/@hueyexe/opencode-ensemble)
 [![npm downloads](https://img.shields.io/npm/dm/@hueyexe/opencode-ensemble.svg)](https://www.npmjs.com/package/@hueyexe/opencode-ensemble)
-[![tests](https://img.shields.io/badge/tests-851%20passing-brightgreen.svg)]()
+[![tests](https://img.shields.io/badge/tests-878%20passing-brightgreen.svg)]()
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue.svg)]()
 [![OpenCode SDK](https://img.shields.io/badge/deps-OpenCode%20SDK%20only-blue.svg)]()
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -153,12 +153,15 @@ A real-time mission control dashboard runs at `http://127.0.0.1:4747` while Open
 - **Keyboard shortcuts** — `j/k` navigate agents, `Enter` opens drawer, `Esc` closes, `?` shows help
 - **Live clock** — current time + team session duration
 - **Project outline** — collapsible per-project grouping when teams span multiple working directories
+- **Scheduler pressure** — queued wakes, active runs, and fenced leases surfaced without prompt or tool payloads
 
 Configure the port in `.opencode/ensemble.json`:
 
 ```json
 {
-  "dashboardPort": 4747
+  "dashboard": {
+    "port": 4747
+  }
 }
 ```
 
@@ -375,7 +378,22 @@ Configure via JSON files, environment variables, or both. Project config overrid
   "stallTokenThreshold": 200,
   "timeoutMs": 1800000,
   "rateLimitCapacity": 10,
-  "dashboardPort": 4747,
+  "dashboard": {
+    "port": 4747
+  },
+  "scheduler": {
+    "identityLimits": {
+      "global": 32,
+      "perAgent": {}
+    },
+    "runLimits": {
+      "global": 4,
+      "perAgent": {}
+    },
+    "reservationTtlMs": 600000,
+    "leaseTtlMs": 60000,
+    "pumpIntervalMs": 1000
+  },
   "defaultModel": "anthropic/claude-sonnet-4-6",
   "modelPool": ["anthropic/claude-opus-4-7", "anthropic/claude-sonnet-4-6", "openai/gpt-5.4"],
   "modelsByAgent": {},
@@ -397,7 +415,14 @@ All fields are optional. Missing fields use defaults.
 | `stallTokenThreshold` | `200` | Output tokens per step below which the agent is considered stalled |
 | `timeoutMs` | `1800000` (30 min) | Hard timeout for busy teammates. `0` disables. |
 | `rateLimitCapacity` | `10` | Token bucket capacity for team tool calls. `0` disables. |
-| `dashboardPort` | `4747` | Dashboard server port. `0` disables. |
+| `dashboard.port` | `4747` | Dashboard server port. `0` disables. The legacy `dashboardPort` alias remains accepted. |
+| `scheduler.identityLimits.global` | `32` | Maximum reserved or active teammate identities across teams. Lead sessions are not counted. |
+| `scheduler.identityLimits.perAgent` | `{}` | Optional per-agent identity limits, for example `{"build": 8}`. |
+| `scheduler.runLimits.global` | `4` | Maximum concurrent teammate runs across teams. |
+| `scheduler.runLimits.perAgent` | `{}` | Optional per-agent concurrent run limits. |
+| `scheduler.reservationTtlMs` | `600000` (10 min) | How long an unactivated spawn reservation holds identity capacity. |
+| `scheduler.leaseTtlMs` | `60000` (1 min) | Run lease duration. Expired leases remain capacity-fencing until session reconciliation. |
+| `scheduler.pumpIntervalMs` | `1000` (1 sec) | Durable queue maintenance and retry interval. |
 | `defaultModel` | `""` | Default model for all agents (e.g. `"anthropic/claude-sonnet-4-6"`). Empty = OpenCode's default. |
 | `modelPool` | `[]` | List of models for rotation/random assignment. |
 | `modelsByAgent` | `{}` | Map agent type to model (e.g. `{"build": "anthropic/claude-opus-4-7"}`). |
@@ -459,7 +484,7 @@ Same coordination model (shared tasks, peer messaging, lead coordination) with s
 ```bash
 bun install
 bun run typecheck
-bun test             # 851 tests
+bun test             # 878 tests
 bun run build
 ```
 

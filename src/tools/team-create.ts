@@ -2,6 +2,7 @@ import type { ToolDeps } from "../types"
 import { generateId, generateProjectName, validateProjectName, validateTeamName } from "../util"
 import { findTeamBySession } from "../types"
 import { isSessionAlive } from "../recovery"
+import type { MemberPromptOptions } from "../member-model"
 
 /**
  * Execute the team_create tool. Creates a new team with the caller as lead.
@@ -10,6 +11,7 @@ export async function executeTeamCreate(
   deps: ToolDeps,
   args: { name: string; project_name?: string },
   sessionId: string,
+  leadIdentity: MemberPromptOptions = {},
 ): Promise<string> {
   const nameError = validateTeamName(args.name)
   if (nameError) throw new Error(nameError)
@@ -49,8 +51,8 @@ export async function executeTeamCreate(
     [projectId, projectName, projectId, now, now]
   )
   deps.db.run(
-    "INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)",
-    [id, args.name, projectId, sessionId, now, now]
+    "INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, lead_agent, lead_model, time_created, time_updated) VALUES (?, ?, ?, ?, 'active', 0, ?, ?, ?, ?)",
+    [id, args.name, projectId, sessionId, leadIdentity.agent ?? null, leadIdentity.model ? `${leadIdentity.model.providerID}/${leadIdentity.model.modelID}` : null, now, now]
   )
 
   return `Team "${args.name}" created. You are the lead. Use team_spawn to add teammates.`

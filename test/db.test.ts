@@ -24,6 +24,12 @@ describe("schema migrations", () => {
     expect(row).toBeTruthy()
   })
 
+  test("stores the lead model for identity-preserving wake-ups", () => {
+    applyMigrations(db)
+    const cols = db.query("PRAGMA table_info(team)").all() as Array<{ name: string }>
+    expect(cols.some(column => column.name === "lead_model")).toBe(true)
+  })
+
   test("creates project table", () => {
     applyMigrations(db)
     const row = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='project'").get()
@@ -114,6 +120,10 @@ describe("schema migrations", () => {
     expect(messageColumns.some(column => column.name === "delivery_state")).toBe(true)
     const linkColumns = db.query("PRAGMA table_info(scheduler_message_wake)").all() as Array<{ name: string }>
     expect(linkColumns.some(column => column.name === "delivery_state")).toBe(true)
+    const wakeColumns = db.query("PRAGMA table_info(scheduler_wake)").all() as Array<{ name: string }>
+    expect(wakeColumns.some(column => column.name === "prompt")).toBe(true)
+    const leaseColumns = db.query("PRAGMA table_info(scheduler_run_lease)").all() as Array<{ name: string }>
+    expect(leaseColumns.some(column => column.name === "injected_at")).toBe(true)
   })
 
   test("migration 11 maps legacy delivered and read flags into mailbox lifecycle state", () => {

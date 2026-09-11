@@ -2,6 +2,7 @@ import type { Database } from "./db"
 import type { PluginClient } from "./types"
 import { sendMessage } from "./messaging"
 import { log } from "./log"
+import { getLeadPromptOptions } from "./member-model"
 
 type TeamEventType = "spawn" | "message" | "completed" | "error" | "shutdown"
 
@@ -120,6 +121,7 @@ export function notifyLead(
   client.session.promptAsync({
     sessionID: team.lead_session_id,
     parts: [{ type: "text", text: "[System: New team message from system]" }],
+    ...getLeadPromptOptions(db, teamId),
   }).catch((err) => {
     log(`notifyLead:wake:failed team=${teamId} err=${err instanceof Error ? err.message : String(err)}`)
   })

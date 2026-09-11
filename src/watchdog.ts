@@ -8,6 +8,7 @@ import { hasReportedCompletion } from "./messaging"
 import { getMemberPromptOptions } from "./member-model"
 import { notifyLead } from "./notify"
 import { log } from "./log"
+import type { SchedulerController } from "./scheduler-runtime"
 
 interface WatchdogOpts {
   db: Database
@@ -31,6 +32,7 @@ interface WatchdogOpts {
   peerMessageLimit?: number
   /** Time window for peer message rate limiting in ms. */
   peerMessageWindowMs?: number
+  scheduler?: SchedulerController
 }
 
 /**
@@ -50,6 +52,7 @@ export class Watchdog {
   private readonly cwd?: string
   private readonly peerMessageLimit: number
   private readonly peerMessageWindowMs: number
+  private readonly scheduler?: SchedulerController
   private timer: ReturnType<typeof setInterval> | undefined
 
   constructor(opts: WatchdogOpts) {
@@ -65,6 +68,7 @@ export class Watchdog {
     this.cwd = opts.cwd
     this.peerMessageLimit = opts.peerMessageLimit ?? 0
     this.peerMessageWindowMs = opts.peerMessageWindowMs ?? 300_000
+    this.scheduler = opts.scheduler
   }
 
   private static STALE_THRESHOLD_MS = Number(process.env.STALE_WORKTREE_THRESHOLD_MS) || 300_000
@@ -285,6 +289,7 @@ export class Watchdog {
       )
 
       // Abort session (best effort)
+      this.scheduler?.terminateMember(member.team_id, member.name, "watchdog timeout")
       try {
         await this.client.session.abort({ sessionID: member.session_id })
       } catch { /* best effort */ }

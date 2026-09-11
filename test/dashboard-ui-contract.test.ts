@@ -138,6 +138,13 @@ describe("dashboard UI contract", () => {
     expect(DASHBOARD_JS_RENDER).toContain("Needs attention")
   })
 
+  test("attention renderer exposes durable scheduler pressure", () => {
+    expect(DASHBOARD_JS_RENDER).toContain("queuedWakes")
+    expect(DASHBOARD_JS_RENDER).toContain("activeRuns")
+    expect(DASHBOARD_JS_RENDER).toContain("expiredRuns")
+    expect(DASHBOARD_JS_RENDER).toContain("scheduler queued")
+  })
+
   test("keyboard and accessibility hooks are present", () => {
     expect(DASHBOARD_JS_RENDER).toContain("onkeydown")
     expect(DASHBOARD_JS_RENDER).toContain("aria-expanded")

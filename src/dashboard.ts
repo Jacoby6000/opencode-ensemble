@@ -96,6 +96,21 @@ interface MessageSummaryRow {
   time_created: number
 }
 
+interface SchedulerCountsRow {
+  active_identities: number
+  reserved_identities: number
+  queued_wakes: number
+  leased_wakes: number
+  active_runs: number
+  expired_runs: number
+}
+
+interface SchedulerEventRow {
+  member_name: string | null
+  event_type: string
+  time_created: number
+}
+
 function parseDependsOn(value: string | null): string[] {
   if (!value) return []
 
@@ -138,8 +153,17 @@ function buildState(db: Database): EnsembleDashboardState {
   const memberStmt = db.query("SELECT name, agent, status, execution_status, session_id, worktree_branch, CASE WHEN prompt IS NOT NULL AND prompt <> '' THEN 1 ELSE 0 END AS has_prompt, model, plan_approval, time_created, time_updated, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message FROM team_member WHERE team_id = ?")
   const taskStmt = db.query("SELECT id, content, status, priority, assignee, depends_on, time_created, time_updated FROM team_task WHERE team_id = ?")
   const msgStmt = db.query("SELECT id, from_name, to_name, substr(content, 1, 160) AS content_preview, length(content) AS content_length, delivered, read, time_created FROM team_message WHERE team_id = ? ORDER BY time_created DESC, id DESC LIMIT 50")
+  const schedulerCountsStmt = db.query(`SELECT
+    (SELECT COUNT(*) FROM scheduler_identity WHERE team_id = ? AND state = 'active') AS active_identities,
+    (SELECT COUNT(*) FROM scheduler_identity WHERE team_id = ? AND state = 'reserved') AS reserved_identities,
+    (SELECT COUNT(*) FROM scheduler_wake WHERE team_id = ? AND state = 'queued') AS queued_wakes,
+    (SELECT COUNT(*) FROM scheduler_wake WHERE team_id = ? AND state = 'leased') AS leased_wakes,
+    (SELECT COUNT(*) FROM scheduler_run_lease WHERE team_id = ? AND state = 'active') AS active_runs,
+    (SELECT COUNT(*) FROM scheduler_run_lease WHERE team_id = ? AND state = 'expired') AS expired_runs`)
+  const schedulerEventsStmt = db.query("SELECT member_name, type AS event_type, time_created FROM scheduler_event WHERE team_id = ? ORDER BY time_created DESC, id DESC LIMIT 20")
 
   const mappedTeams = teams.map((t) => {
+    const scheduler = schedulerCountsStmt.get(t.id, t.id, t.id, t.id, t.id, t.id) as SchedulerCountsRow
     const members = (memberStmt.all(t.id) as MemberRow[]).map((m) => ({
       name: m.name,
       agent: m.agent,
@@ -192,6 +216,19 @@ function buildState(db: Database): EnsembleDashboardState {
         read: msg.read === 1,
         timeCreated: msg.time_created,
       })),
+      scheduler: {
+        activeIdentities: scheduler.active_identities,
+        reservedIdentities: scheduler.reserved_identities,
+        queuedWakes: scheduler.queued_wakes,
+        leasedWakes: scheduler.leased_wakes,
+        activeRuns: scheduler.active_runs,
+        expiredRuns: scheduler.expired_runs,
+        recentEvents: (schedulerEventsStmt.all(t.id) as SchedulerEventRow[]).map(event => ({
+          memberName: event.member_name,
+          type: event.event_type,
+          timeCreated: event.time_created,
+        })),
+      },
     }
   })
 

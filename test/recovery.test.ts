@@ -8,6 +8,7 @@ import { recoverStaleMembers, recoverUndeliveredMessages, rehydrateRegistry, rec
 import type { PluginClient } from "../src/types"
 import { MemberRegistry } from "../src/state"
 import { sendMessage, broadcastMessage } from "../src/messaging"
+import { queueWake, tryAcquireRun } from "../src/scheduler"
 
 async function git(cwd: string, args: string[]): Promise<string> {
   const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" })
@@ -299,6 +300,20 @@ describe("recoverStaleMembers", () => {
     expect(abortCalls).toHaveLength(0)
   })
 
+  test("does not abort a busy member protected by a scheduler lease", async () => {
+    insertTeam(db, "t1", "my-team", "lead-sess")
+    insertMember(db, "t1", "alice", "sess-1", "busy", "running")
+    const wake = queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "sess-1", agent: "build",
+      reason: "message", coalesceKey: "member:alice",
+    })
+    expect(tryAcquireRun(db, wake.wakeId, { global: 1, perAgent: {} }, 60_000).acquired).toBe(true)
+
+    expect(await recoverStaleMembers(db, client)).toEqual({ interrupted: 0 })
+    expect(db.query("SELECT status FROM team_member WHERE name = 'alice'").get()).toEqual({ status: "busy" })
+    expect(client.calls.filter(call => call.method === "session.abort")).toHaveLength(0)
+  })
+
   test("returns zero when no stale state exists", async () => {
     const result = await recoverStaleMembers(db, client)
     expect(result.interrupted).toBe(0)
@@ -398,18 +413,15 @@ describe("recoverUndeliveredMessages", () => {
     )
   }
 
-  test("redelivers undelivered direct messages via promptAsync", async () => {
+  test("queues undelivered direct messages for durable delivery", async () => {
     sendMessage(db, { teamId: "t1", from: "alice", to: "bob", content: "hello" })
 
     const result = await recoverUndeliveredMessages(db, client, registry)
     expect(result.redelivered).toBe(1)
 
-    const promptCalls = client.calls.filter(c => c.method === "session.promptAsync")
-    expect(promptCalls).toHaveLength(1)
-
-    // Message should now be marked delivered
-    const msgs = db.query("SELECT delivered FROM team_message WHERE team_id = ?").all("t1") as Array<{ delivered: number }>
-    expect(msgs[0]!.delivered).toBe(1)
+    expect(client.calls.filter(c => c.method === "session.promptAsync")).toHaveLength(0)
+    expect(db.query("SELECT COUNT(*) AS count FROM scheduler_wake").get()).toEqual({ count: 1 })
+    expect(db.query("SELECT delivery_state FROM team_message").get()).toEqual({ delivery_state: "wake_queued" })
   })
 
   test("skips lead-bound messages (delivered via system prompt transform instead)", async () => {
@@ -423,7 +435,7 @@ describe("recoverUndeliveredMessages", () => {
     expect(promptCalls).toHaveLength(0)
   })
 
-  test("redelivery preserves the recipient's custom agent and configured model", async () => {
+  test("recovery preserves the recipient's custom agent for dispatch-time model resolution", async () => {
     db.run(
       "UPDATE team_member SET agent = ?, model = ? WHERE team_id = ? AND name = ?",
       ["recovery-specialist", "openrouter/anthropic/claude-sonnet", "t1", "bob"],
@@ -432,20 +444,15 @@ describe("recoverUndeliveredMessages", () => {
 
     await recoverUndeliveredMessages(db, client, registry)
 
-    const promptCall = client.calls.find(c => c.method === "session.promptAsync")
-    const opts = promptCall!.args[0] as { agent?: string; model?: { providerID: string; modelID: string } }
-    expect(opts.agent).toBe("recovery-specialist")
-    expect(opts.model).toEqual({ providerID: "openrouter", modelID: "anthropic/claude-sonnet" })
+    expect(db.query("SELECT agent FROM scheduler_wake").get()).toEqual({ agent: "recovery-specialist" })
   })
 
-  test("redelivers without a model when the recipient has none set", async () => {
+  test("queues recovery without requiring a configured model", async () => {
     sendMessage(db, { teamId: "t1", from: "alice", to: "bob", content: "hello" })
 
     await recoverUndeliveredMessages(db, client, registry)
 
-    const promptCall = client.calls.find(c => c.method === "session.promptAsync")
-    const opts = promptCall!.args[0] as { model?: unknown }
-    expect(opts.model).toBeUndefined()
+    expect(db.query("SELECT COUNT(*) AS count FROM scheduler_wake").get()).toEqual({ count: 1 })
   })
 
   test("skips already-delivered messages", async () => {
@@ -469,29 +476,17 @@ describe("recoverUndeliveredMessages", () => {
     const result = await recoverUndeliveredMessages(db, client, registry)
     expect(result.redelivered).toBe(2) // only member-to-member, not lead
 
-    const promptCalls = client.calls.filter(c => c.method === "session.promptAsync")
-    expect(promptCalls).toHaveLength(2)
+    expect(db.query("SELECT COUNT(*) AS count FROM scheduler_wake").get()).toEqual({ count: 2 })
   })
 
-  test("continues on partial failure", async () => {
+  test("coalesces multiple recovered messages for one recipient", async () => {
     sendMessage(db, { teamId: "t1", from: "alice", to: "bob", content: "msg1" })
     sendMessage(db, { teamId: "t1", from: "alice", to: "bob", content: "msg2" })
 
-    // Make first promptAsync fail
-    let callCount = 0
-    client.session.promptAsync = async (options) => {
-      callCount++
-      if (callCount === 1) throw new Error("network error")
-      return {}
-    }
-
     const result = await recoverUndeliveredMessages(db, client, registry)
-    // Both were scheduled without blocking; only the successful delivery is marked.
     expect(result.redelivered).toBe(2)
-    await Promise.resolve()
-    await Promise.resolve()
-    const delivered = db.query("SELECT delivered FROM team_message WHERE team_id = 't1' ORDER BY time_created, id").all() as Array<{ delivered: number }>
-    expect(delivered.filter(message => message.delivered === 1)).toHaveLength(1)
+    expect(db.query("SELECT COUNT(*) AS count FROM scheduler_wake").get()).toEqual({ count: 1 })
+    expect(db.query("SELECT COUNT(*) AS count FROM scheduler_message_wake").get()).toEqual({ count: 2 })
   })
 
   test("returns without waiting when promptAsync never settles", async () => {
@@ -559,8 +554,7 @@ describe("recoverUndeliveredMessages", () => {
     const result = await recoverUndeliveredMessages(db, client, registry)
     expect(result.redelivered).toBe(1) // only member-to-member, lead-bound skipped
 
-    const promptCalls = client.calls.filter(c => c.method === "session.promptAsync")
-    expect(promptCalls).toHaveLength(1)
+    expect(db.query("SELECT COUNT(*) AS count FROM scheduler_wake").get()).toEqual({ count: 1 })
   })
 })
 

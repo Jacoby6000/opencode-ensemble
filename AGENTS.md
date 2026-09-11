@@ -67,19 +67,27 @@ Key SDK primitives:
 ### Storage
 
 SQLite via the internal database adapter (zero external dependencies): `bun:sqlite`
-when running on Bun, `node:sqlite` when running on Node/Electron. Four tables:
+when running on Bun, `node:sqlite` when running on Node/Electron. Core tables:
 - team — team config (name, lead session, status, delegate mode)
 - team_member — member registry (name, session ID, agent, status)
 - team_task — shared task board (content, status, priority, assignee, deps)
 - team_message — message log (from, to, content, delivered flag)
+- scheduler_identity — reserved and active teammate identity capacity
+- scheduler_wake — durable, coalesced work awaiting dispatch
+- scheduler_run_lease — active and reconciliation-fenced run capacity
+- scheduler_message_wake — per-recipient message delivery state
+- scheduler_event — payload-free scheduler lifecycle audit events
 
 WAL mode. Migrations via PRAGMA user_version.
 
 ### Message Delivery
 
-All messages delivered via client.session.promptAsync(). Single atomic
-operation: injects user message + starts prompt loop if idle. No polling,
-no file watching, no custom pub/sub.
+Peer messages and teammate broadcasts are committed to SQLite with their
+durable wakes before the scheduler calls `client.session.promptAsync()`.
+The runtime scheduler applies independent identity/run limits, retries rejected
+dispatches, and reconciles leased work after restart. Lead-bound messages remain
+direct because the lead is outside teammate capacity. No file watching or
+custom pub/sub.
 
 ### State Machines
 
@@ -145,9 +153,9 @@ Three hooks wired in index.ts:
    gating.
 9. Graceful shutdown with manual force — team_shutdown requests graceful stop
    by default. Pass force: true to abort immediately.
-10. Never await promptAsync — all promptAsync calls are fire-and-forget.
-    Awaiting blocks the caller if the transport is slow or broken. Messages
-    are persisted in the DB first; the idle-flush backstop handles delivery.
+10. Never await promptAsync in an interactive tool call. The durable scheduler
+    observes the promise asynchronously to record injection or requeue a
+    rejected dispatch without blocking the caller.
 11. v1→v2 SDK transport extraction uses `._client` (underscore) — see
     "SDK Transport" section below. Do NOT change this property name.
 12. Branch preservation before session.abort() is MANDATORY — see
@@ -236,10 +244,11 @@ constructor parameter. Biome's `noExplicitAny` rule is satisfied.
 If `session.create()` returns "Unable to connect", the transport
 extraction is broken. Check that `._client` is being read, not `.client`.
 
-## promptAsync Is Fire-and-Forget (Critical — Do Not Await)
+## promptAsync Is Non-Blocking (Critical — Do Not Await In Tools)
 
-All `promptAsync` calls MUST be fire-and-forget (no `await`). This
-applies to `team_spawn`, `team_message`, and `team_broadcast`.
+Tool calls MUST not await `promptAsync`. Teammate-bound spawn and messaging work
+must be queued durably; only the scheduler invokes `promptAsync` and attaches
+asynchronous acceptance/rejection handling.
 
 ### Why
 
@@ -252,8 +261,9 @@ indefinitely — even though the child session IS running.
 ### The pattern
 
 ```typescript
-// CORRECT — fire-and-forget with async error handling
-deps.client.session.promptAsync({ ... }).catch(() => { /* rollback */ })
+// CORRECT — persist and schedule without waiting on transport
+queueMessageWake(deps.db, { ... })
+deps.scheduler.kick()
 
 // WRONG — blocks the caller
 await deps.client.session.promptAsync({ ... })
@@ -261,11 +271,9 @@ await deps.client.session.promptAsync({ ... })
 
 ### Safety net
 
-Messages are persisted in the DB with `delivered=0` BEFORE the
-`promptAsync` call. If delivery fails:
-- team_spawn: async `.catch()` rolls back the member + notifies lead
-- team_message: idle-flush backstop redelivers when recipient goes idle
-- team_broadcast: partial delivery is expected and handled
+Messages and wakes are persisted atomically before dispatch. If delivery fails,
+the scheduler releases the run lease and requeues the wake with backoff.
+Broadcast delivery is tracked independently per recipient.
 
 ## Lessons from Anthropic (Applied)
 

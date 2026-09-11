@@ -5,6 +5,7 @@ import { DASHBOARD_HOST, startDashboard as startDashboardServer, parseMessagePar
 import type { DashboardOptions } from "../src/dashboard"
 import { ActivityBuffer } from "../src/activity"
 import type { PluginClient } from "../src/types"
+import { activateIdentity, markRunInjected, queueWake, tryAcquireRun, tryReserveIdentity } from "../src/scheduler"
 
 function randomPort(): number {
   return 19000 + Math.floor(Math.random() * 10000)
@@ -39,7 +40,7 @@ function insertMessage(db: Database, teamId: string, id: string, fromName: strin
 
 // biome-lint: use Record for JSON response shape
 interface HealthResponse { ensemble: boolean; pid: number }
-interface DashboardTeam { id: string; name: string; projectId: string; leadSessionId?: string; status: string; timeCreated: number; timeUpdated: number; members: Array<{ sessionId?: string } & Record<string, unknown>>; tasks: Array<Record<string, unknown>>; messages: Array<Record<string, unknown>> }
+interface DashboardTeam { id: string; name: string; projectId: string; leadSessionId?: string; status: string; timeCreated: number; timeUpdated: number; members: Array<{ sessionId?: string } & Record<string, unknown>>; tasks: Array<Record<string, unknown>>; messages: Array<Record<string, unknown>>; scheduler?: Record<string, unknown> }
 interface StateResponse { version: number; projects: Array<{ id: string; name: string; path: string; activeTeams: number; workingAgents: number; teams: DashboardTeam[] }>; teams: DashboardTeam[] }
 
 describe("dashboard", () => {
@@ -158,6 +159,37 @@ describe("dashboard", () => {
       expect(body.projects[0]!.activeTeams).toBe(1)
       expect(body.projects[0]!.workingAgents).toBe(1)
       expect(body.projects[0]!.teams[0]!.id).toBe("t1")
+    })
+
+    test("exposes payload-free scheduler pressure and recent events", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      const reservation = tryReserveIdentity(db, {
+        teamId: "t1", memberName: "alice", agent: "build",
+        limits: { global: 2, perAgent: {} }, reservationTtlMs: 60_000,
+      })
+      if (!reservation.reserved) throw new Error("expected reservation")
+      insertMember(db, "t1", "alice", "sess-a")
+      activateIdentity(db, reservation.reservationId)
+      const wake = queueWake(db, {
+        teamId: "t1", memberName: "alice", sessionId: "sess-a", agent: "build",
+        reason: "message", coalesceKey: "alice", prompt: "secret scheduler prompt",
+      })
+      const acquired = tryAcquireRun(db, wake.wakeId, { global: 1, perAgent: {} }, 60_000)
+      if (!acquired.acquired) throw new Error("expected lease")
+      markRunInjected(db, acquired.leaseId)
+
+      server = await startDashboard(db, port)
+      const res = await fetch(`http://localhost:${port}/api/state`)
+      const body = (await res.json()) as StateResponse
+      const scheduler = body.teams[0]!.scheduler as {
+        activeIdentities: number; reservedIdentities: number; queuedWakes: number; leasedWakes: number
+        activeRuns: number; expiredRuns: number; recentEvents: Array<Record<string, unknown>>
+      }
+
+      expect(scheduler).toMatchObject({ activeIdentities: 1, reservedIdentities: 0, queuedWakes: 0, leasedWakes: 1, activeRuns: 1, expiredRuns: 0 })
+      expect(scheduler.recentEvents.length).toBeGreaterThan(0)
+      expect(JSON.stringify(scheduler)).not.toContain("secret scheduler prompt")
+      expect(scheduler.recentEvents[0]).not.toHaveProperty("detail")
     })
 
     test("Fix 1: exposes last_nudged_at as an additive lastNudgedAt field", async () => {

@@ -5,6 +5,7 @@ import { MemberRegistry, DescendantTracker, PendingPurgeApprovals } from "../src
 import type { ToolDeps, PluginClient } from "../src/types"
 import { DEFAULT_CONFIG } from "../src/config"
 import { ProgressTracker } from "../src/progress"
+import { DurableScheduler } from "../src/scheduler-runtime"
 
 /** Create a fresh in-memory DB with migrations applied. */
 export function setupDb(): EnsembleDatabase {
@@ -95,15 +96,26 @@ export function mockClient(): PluginClient & { calls: Array<{ method: string; ar
 /** Create full ToolDeps for testing. */
 export function setupDeps(db?: EnsembleDatabase): ToolDeps & { client: ReturnType<typeof mockClient> } {
   const d = db ?? setupDb()
+  const client = mockClient()
+  const config = {
+    ...DEFAULT_CONFIG,
+    dashboard: { ...DEFAULT_CONFIG.dashboard },
+    scheduler: {
+      ...DEFAULT_CONFIG.scheduler,
+      identityLimits: { ...DEFAULT_CONFIG.scheduler.identityLimits, perAgent: { ...DEFAULT_CONFIG.scheduler.identityLimits.perAgent } },
+      runLimits: { ...DEFAULT_CONFIG.scheduler.runLimits, perAgent: { ...DEFAULT_CONFIG.scheduler.runLimits.perAgent } },
+    },
+  }
   return {
     db: d,
     registry: new MemberRegistry(),
     tracker: new DescendantTracker(),
     purgeApprovals: new PendingPurgeApprovals(),
-    client: mockClient(),
+    client,
     directory: "/tmp/test-project",
-    config: { ...DEFAULT_CONFIG },
+    config,
     progressTracker: new ProgressTracker(),
+    scheduler: new DurableScheduler(d, client, config.scheduler),
   }
 }
 

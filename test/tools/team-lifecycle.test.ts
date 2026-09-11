@@ -357,15 +357,11 @@ describe("team_cleanup", () => {
     expect(team.status).toBe("archived")
   })
 
-  test("treats shutdown_requested members as inactive (cleanup succeeds without force)", async () => {
+  test("treats shutdown_requested members as active until they stop", async () => {
     insertMember(deps.db, "t1", "alice", "sess-alice", "shutdown_requested", "idle")
     deps.registry.register("t1", "alice", "sess-alice")
 
-    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false)
-    expect(result).toContain("cleaned up")
-
-    const team = deps.db.query("SELECT status FROM team WHERE id = ?").get("t1") as Record<string, string>
-    expect(team.status).toBe("archived")
+    await expect(executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false)).rejects.toThrow(/still active/)
   })
 
   test("treats error members as inactive (cleanup succeeds without force)", async () => {

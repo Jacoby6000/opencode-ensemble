@@ -53,10 +53,13 @@ function rSum(t){
 }
 
 function rAttention(t){
-  const el=document.getElementById('attention'),a=deriveAttention(t),h=deriveHealth(t),tk=t.tasks||[];
+  const el=document.getElementById('attention'),a=deriveAttention(t),h=deriveHealth(t),tk=t.tasks||[],sch=t.scheduler||{};
   const tone=a.items.length?'border-amber-500/30 bg-amber-500/[0.05]':'border-emerald-500/20 bg-emerald-500/[0.035]';
   const lead=a.items.length?'Needs attention':'No blockers detected';
   const chips=[chip(h.w+' working','blue'),chip(a.running.length+' active tasks','green'),chip(a.blocked.length+' blocked',a.blocked.length?'amber':'muted'),chip(tk.filter(x=>x.status==='pending').length+' pending','muted')];
+  if(sch.queuedWakes)chips.push(chip(sch.queuedWakes+' scheduler queued','amber'));
+  if(sch.activeRuns)chips.push(chip(sch.activeRuns+' scheduler active','blue'));
+  if(sch.expiredRuns)chips.push(chip(sch.expiredRuns+' scheduler fenced','red'));
   let html='<div class="rounded-lg border '+tone+' px-3 py-2 flex flex-col md:flex-row md:items-center gap-2 md:gap-4">';
   html+='<div class="min-w-[180px]"><div class="text-[10px] uppercase tracking-[.16em] text-txt-500">Team attention</div><div class="text-[14px] font-semibold text-txt-100">'+lead+'</div></div>';
   html+='<div class="flex flex-wrap gap-1.5">'+chips.join('')+'</div>';

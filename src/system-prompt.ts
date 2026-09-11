@@ -1,7 +1,7 @@
 import type { Database } from "./db"
 import { markDelivered } from "./messaging"
 import { parseTaskResult, formatTaskResult } from "./result-parser"
-import type { EnsembleConfig } from "./config"
+import type { ResolvedEnsembleConfig } from "./config"
 
 /** Truncate a string to maxLen chars, appending "..." if truncated. */
 function truncate(s: string, maxLen: number): string {
@@ -21,7 +21,7 @@ const STATUS_DISPLAY: Record<string, string> = {
  * Build the system prompt injected into the lead's session.
  * Includes team name, member statuses, task counts, and anti-polling guidance.
  */
-export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Required<EnsembleConfig>): string {
+export function buildLeadSystemPrompt(db: Database, teamId: string, config?: ResolvedEnsembleConfig): string {
   const team = db.query("SELECT name FROM team WHERE id = ?").get(teamId) as { name: string } | null
   if (!team) return ""
 
@@ -176,7 +176,10 @@ export function buildTeammateSystemPrompt(db: Database, teamId: string, memberNa
 
   // Deliver pending peer messages addressed to this teammate
   const pendingMessages = db.query(
-    "SELECT id, from_name, content FROM team_message WHERE team_id = ? AND to_name = ? AND delivered = 0 ORDER BY time_created ASC"
+    `SELECT m.id, m.from_name, m.content FROM team_message m
+     WHERE m.team_id = ? AND m.to_name = ? AND m.delivered = 0
+       AND NOT EXISTS (SELECT 1 FROM scheduler_message_wake mw WHERE mw.message_id = m.id)
+     ORDER BY m.time_created ASC`
   ).all(teamId, memberName) as Array<{ id: string; from_name: string; content: string }>
 
   if (pendingMessages.length > 0) {

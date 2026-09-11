@@ -1,12 +1,12 @@
 import type { Database } from "./db"
 import type { PluginClient } from "./types"
 import type { MemberRegistry } from "./state"
-import { getUndeliveredMessages, markDelivered, hasReportedCompletion } from "./messaging"
 import { releaseMemberTasks } from "./tasks"
-import { getMemberPromptOptions } from "./member-model"
 import { preserveBranch, preservedBranchName, teamResourceSegment } from "./tools/merge-helper"
 import { log } from "./log"
 import { runCommand } from "./process"
+import { queueWake, terminateMemberScheduling } from "./scheduler"
+import type { SchedulerController } from "./scheduler-runtime"
 
 /**
  * Whether a session still exists in OpenCode. `client.session.get` throws for a
@@ -72,6 +72,10 @@ export async function recoverOrphanedTeams(
   for (const team of active) {
     if (await isSessionAlive(client, team.lead_session_id)) continue
 
+    const members = db.query("SELECT name FROM team_member WHERE team_id = ?").all(team.id) as Array<{ name: string }>
+    members.forEach(member => {
+      terminateMemberScheduling(db, team.id, member.name, "orphaned team")
+    })
     db.run("UPDATE team SET status = 'archived', time_updated = ? WHERE id = ?", [Date.now(), team.id])
     registry?.unregisterTeam(team.id)
     archived++
@@ -107,12 +111,20 @@ export async function recoverStaleMembers(db: Database, client?: PluginClient, c
       JOIN team t ON tm.team_id = t.id
       JOIN project p ON t.project_id = p.id
       WHERE tm.status = 'busy' AND t.status = 'active'
+        AND NOT EXISTS (
+          SELECT 1 FROM scheduler_run_lease l
+          WHERE l.team_id = tm.team_id AND l.member_name = tm.name AND l.state IN ('active', 'expired')
+        )
         AND (? IS NULL OR t.project_id = ? OR t.project_id = 'default')`
   ).all(cwd ?? null, cwd ?? null) as Array<{ session_id: string; worktree_branch: string | null; name: string; team_id: string; team_name: string; project_name: string }>
 
   const result = db.run(
     `UPDATE team_member SET status = 'error', execution_status = 'idle', time_updated = ?
       WHERE status = 'busy'
+        AND NOT EXISTS (
+          SELECT 1 FROM scheduler_run_lease l
+          WHERE l.team_id = team_member.team_id AND l.member_name = team_member.name AND l.state IN ('active', 'expired')
+        )
         AND team_id IN (SELECT id FROM team WHERE status = 'active' AND (? IS NULL OR project_id = ? OR project_id = 'default'))`,
     [Date.now(), cwd ?? null, cwd ?? null]
   )
@@ -120,6 +132,7 @@ export async function recoverStaleMembers(db: Database, client?: PluginClient, c
   // Release each stale member's in_progress tasks back to the pool so their
   // unfinished work is reclaimable after a crash (issue #27).
   for (const member of stale) {
+    terminateMemberScheduling(db, member.team_id, member.name, "stale member recovery")
     const released = releaseMemberTasks(db, member.team_id, member.name)
     if (released > 0) log(`recovery:tasks:released name=${member.name} count=${released}`)
   }
@@ -199,55 +212,33 @@ export async function recoverOrphanedWorktrees(db: Database, client: PluginClien
  */
 export async function recoverUndeliveredMessages(
   db: Database,
-  client: PluginClient,
-  registry: MemberRegistry,
+  _client: PluginClient,
+  _registry: MemberRegistry,
+  scheduler?: SchedulerController,
 ): Promise<{ redelivered: number }> {
-  // Get all active teams
-  const teams = db.query("SELECT id, lead_session_id FROM team WHERE status = 'active'")
-    .all() as Array<{ id: string; lead_session_id: string }>
-
-  let redelivered = 0
-
-  for (const team of teams) {
-    const messages = getUndeliveredMessages(db, team.id)
-
-    for (const msg of messages) {
-      // Resolve recipient session ID
-      let recipientSessionId: string | undefined
-
-      if (msg.to_name === "lead") {
-        // Skip lead-bound messages — the system prompt transform delivers them
-        continue
-      } else if (msg.to_name) {
-        const entry = registry.getByName(team.id, msg.to_name)
-        recipientSessionId = entry?.sessionId
-      } else {
-        // Broadcast — skip for now, broadcasts are best-effort
-        continue
-      }
-
-      if (!recipientSessionId) continue
-
-      // Skip delivery to teammates who have already reported completion (issue #3)
-      if (hasReportedCompletion(db, team.id, msg.to_name)) {
-        markDelivered(db, msg.id)
-        continue
-      }
-
-      redelivered++
-      client.session.promptAsync({
-        sessionID: recipientSessionId,
-        parts: [{ type: "text", text: `[Recovered team message from ${msg.from_name}]: ${msg.content}` }],
-        ...getMemberPromptOptions(db, team.id, msg.to_name),
-      }).then(() => {
-        markDelivered(db, msg.id)
-      }).catch(() => {
-        // Continue on failure — message stays undelivered for next recovery
-      })
-    }
-  }
-
-  return { redelivered }
+  const messages = db.query(
+    `SELECT m.id, m.team_id, m.to_name, tm.session_id, tm.agent
+     FROM team_message m
+     JOIN team t ON t.id = m.team_id
+     JOIN team_member tm ON tm.team_id = m.team_id AND tm.name = m.to_name
+     WHERE t.status = 'active' AND tm.status IN ('ready', 'busy') AND tm.reported_to_lead = 0
+       AND m.delivery_state = 'queued' AND m.delivered = 0 AND m.to_name IS NOT NULL AND m.to_name <> 'lead'
+       AND NOT EXISTS (SELECT 1 FROM scheduler_message_wake mw WHERE mw.message_id = m.id)
+     ORDER BY m.time_created ASC`,
+  ).all() as Array<{ id: string; team_id: string; to_name: string; session_id: string; agent: string }>
+  messages.forEach(message => {
+    queueWake(db, {
+      teamId: message.team_id,
+      memberName: message.to_name,
+      sessionId: message.session_id,
+      agent: message.agent,
+      reason: "legacy_recovery",
+      coalesceKey: `member:${message.to_name}`,
+      messageId: message.id,
+    })
+  })
+  if (messages.length > 0) scheduler?.kick()
+  return { redelivered: messages.length }
 }
 
 /**

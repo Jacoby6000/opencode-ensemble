@@ -12,6 +12,18 @@ export interface MemberPromptOptions {
   model?: ParsedModel
 }
 
+/** Read the stored lead agent and model as session.promptAsync options. */
+export function getLeadPromptOptions(db: Database, teamId: string): MemberPromptOptions {
+  const row = db.query("SELECT lead_agent, lead_model FROM team WHERE id = ?")
+    .get(teamId) as { lead_agent: string | null; lead_model: string | null } | null
+  if (!row) return {}
+  const model = row.lead_model ? parseModelId(row.lead_model) : undefined
+  return {
+    ...(row.lead_agent ? { agent: row.lead_agent } : {}),
+    ...(model ? { model } : {}),
+  }
+}
+
 /**
  * Parse a "provider/model" string into { providerID, modelID } for the SDK.
  * Returns undefined if the string is not in "provider/model" form (empty

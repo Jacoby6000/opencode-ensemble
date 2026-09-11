@@ -455,7 +455,7 @@ export async function executeTeamCleanup(
   const members = deps.db.query("SELECT name, session_id, status, worktree_dir, worktree_branch, workspace_id FROM team_member WHERE team_id = ?")
     .all(teamInfo.teamId) as Array<{ name: string; session_id: string; status: string; worktree_dir: string | null; worktree_branch: string | null; workspace_id: string | null }>
 
-  const active = members.filter(m => m.status !== "shutdown" && m.status !== "shutdown_requested" && m.status !== "error")
+  const active = members.filter(m => m.status !== "shutdown" && m.status !== "error")
 
   if (active.length > 0 && !args.force) {
     const names = active.map(m => m.name).join(", ")
@@ -496,11 +496,16 @@ export async function executeTeamCleanup(
           member.worktree_branch = safeBranch
         }
       }
+      deps.scheduler.terminateMember(teamInfo.teamId, member.name, "team cleanup")
       try {
         await deps.client.session.abort({ sessionID: member.session_id })
       } catch { /* best effort */ }
     }
   }
+
+  members.forEach(member => {
+    deps.scheduler.terminateMember(teamInfo.teamId, member.name, "team archived")
+  })
 
   // Safety net: merge any remaining unmerged preserved branches
   const unmerged = members.filter((m): m is typeof m & { worktree_branch: string } => m.worktree_branch !== null)

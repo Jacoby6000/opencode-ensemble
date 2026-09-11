@@ -37,6 +37,9 @@ import { executeTeamView } from "./tools/team-view"
 import type { ToolDeps, } from "./types"
 import { TokenBucket } from "./rate-limit"
 import { Watchdog } from "./watchdog"
+import { DurableScheduler } from "./scheduler-runtime"
+import { getLeadPromptOptions } from "./member-model"
+import type { MemberPromptOptions } from "./member-model"
 
 const DEFAULT_RATE_LIMIT_REFILL = 2
 const DEFAULT_RATE_LIMIT_INTERVAL_MS = 1000
@@ -64,6 +67,7 @@ const plugin: Plugin = async (input) => {
   const progressTracker = new ProgressTracker()
   const activityBuffer = new ActivityBuffer()
   const wakeLeadTimestamps = new Map<string, number>()
+  const sessionPromptOptions = new Map<string, MemberPromptOptions>()
   const WAKE_LEAD_COOLDOWN_MS = 5000
 
   // Extract the working HeyAPI transport from the plugin-provided v1 client and pass it
@@ -74,12 +78,19 @@ const plugin: Plugin = async (input) => {
   const rawClient = new OpencodeClient({ client: pluginTransport })
   initLog(rawClient)
   const client = wrapThrowingClient(rawClient)
-  const deps: ToolDeps = { db, registry, tracker, purgeApprovals, client, directory: input.directory, config, progressTracker }
+  const mainInstance = !isWorktreeInstance(input.directory)
+  const scheduler = new DurableScheduler(db, client, config.scheduler, mainInstance)
+  const deps: ToolDeps = { db, registry, tracker, purgeApprovals, client, directory: input.directory, config, progressTracker, scheduler }
+
+  // Every plugin instance needs local session identity for status/tool hooks.
+  // Only network recovery and dispatch remain restricted to the main instance.
+  const rehydrated = rehydrateRegistry(db, registry)
+  if (rehydrated > 0) log(`init:registry:rehydrated members=${rehydrated}`)
 
   // Recovery only runs for the main project instance — NOT for teammate worktree instances.
   // Worktree instances are created during session.create. Running recovery there makes HTTP
   // calls back to the server, which deadlocks because the server is still handling session.create.
-  if (!isWorktreeInstance(input.directory)) {
+  if (mainInstance) {
     log("init:recovery:start (main instance)")
 
     // Reconciles teams whose lead session was deleted externally (not via
@@ -103,22 +114,13 @@ const plugin: Plugin = async (input) => {
       log(`init:recover-orphaned-teams:failed err=${err instanceof Error ? err.message : String(err)}`)
     })
 
-    const recovery = await recoverStaleMembers(db, client, input.directory)
-    if (recovery.interrupted > 0) {
-      log(`init:recovery:interrupted=${recovery.interrupted}`)
-    }
-
-    // Always rehydrate the in-memory registry from SQLite. The registry is
-    // in-memory only and is wiped on every plugin restart. Without this,
-    // teammates from a previous lifetime become invisible — every team_*
-    // tool call from them throws "This session is not in a team." This is
-    // the bug that surfaced on Desktop, where the Electron sidecar restarts
-    // far more often than the CLI.
-    const rehydrated = rehydrateRegistry(db, registry)
-    if (rehydrated > 0) log(`init:registry:rehydrated members=${rehydrated}`)
-
-    recoverUndeliveredMessages(db, client, registry).catch((err) => {
-      log(`init:recover-messages:failed err=${err instanceof Error ? err.message : String(err)}`)
+    scheduler.recover().then(() => recoverStaleMembers(db, client, input.directory)).then((recovery) => {
+      if (recovery.interrupted > 0) log(`init:recovery:interrupted=${recovery.interrupted}`)
+      return recoverUndeliveredMessages(db, client, registry, scheduler)
+    }).then(() => {
+      scheduler.kick()
+    }).catch((err) => {
+      log(`init:scheduler-recovery:failed err=${err instanceof Error ? err.message : String(err)}`)
     })
     recoverOrphanedWorktrees(db, client).catch((err) => {
       log(`init:recover-worktrees:failed err=${err instanceof Error ? err.message : String(err)}`)
@@ -127,14 +129,15 @@ const plugin: Plugin = async (input) => {
       log(`init:recover-branches:failed err=${err instanceof Error ? err.message : String(err)}`)
     })
     log("init:recovery:done")
+    scheduler.start()
 
     // Start dashboard server (main instance only, not worktree instances)
-    if (config.dashboardPort !== 0) {
+    if (config.dashboard.port !== 0) {
       try {
         const dashboardTokenPath = getDashboardTokenPath()
         const dashboardToken = loadOrCreateDashboardToken(dashboardTokenPath)
         log(`init:dashboard:token-file path=${dashboardTokenPath}`)
-        startDashboard(db, config.dashboardPort, { activityBuffer, client, token: dashboardToken }).catch((err) => {
+        startDashboard(db, config.dashboard.port, { activityBuffer, client, token: dashboardToken }).catch((err) => {
           log(`init:dashboard:failed err=${err instanceof Error ? err.message : String(err)}`)
         })
       } catch (err) {
@@ -164,12 +167,25 @@ const plugin: Plugin = async (input) => {
     cwd: input.directory,
     peerMessageLimit: config.peerMessageLimit,
     peerMessageWindowMs: config.peerMessageWindowMs,
+    scheduler,
   })
   watchdog.start()
 
   return {
     // Event hook — drives state machine transitions + descendant tracking + toasts
     async event({ event }) {
+      if (event.type === "message.updated") {
+        const info = event.properties.info
+        if (info.role === "user") {
+          const options = { agent: info.agent, model: info.model }
+          sessionPromptOptions.set(info.sessionID, options)
+          db.run(
+            "UPDATE team SET lead_agent = ?, lead_model = ?, time_updated = ? WHERE lead_session_id = ? AND status = 'active'",
+            [options.agent, `${options.model.providerID}/${options.model.modelID}`, Date.now(), info.sessionID],
+          )
+        }
+      }
+
       if (event.type === "session.status") {
         const { sessionID, status } = event.properties
         const statusType = status.type as "idle" | "busy" | "retry"
@@ -177,11 +193,13 @@ const plugin: Plugin = async (input) => {
           ? (status as { attempt: number; message: string; action?: { reason: string; provider: string; title: string; message: string; label: string; link?: string }; next: number })
           : undefined
         const transition = handleSessionStatusEvent(db, registry, sessionID, statusType, retryPayload)
+        scheduler.onSessionStatus(sessionID, statusType, retryPayload?.next)
 
         // Fire toast notifications for meaningful transitions
-        if (transition) {
-          if (transition.to === "shutdown") {
-            notifyTeamEvent(client, "shutdown", { memberName: transition.memberName })
+          if (transition) {
+            if (transition.to === "shutdown") {
+              scheduler.terminateMember(transition.teamId, transition.memberName, "graceful shutdown completed")
+              notifyTeamEvent(client, "shutdown", { memberName: transition.memberName })
           } else if (transition.to === "ready" && transition.from === "busy") {
             notifyTeamEvent(client, "completed", { memberName: transition.memberName })
 
@@ -223,7 +241,7 @@ const plugin: Plugin = async (input) => {
             if (!nudgedMembers.has(nudgeKey) && shouldNudgeIdleMember(db, transition.teamId, transition.memberName) && !hasReportedCompletion(db, transition.teamId, transition.memberName)) {
               nudgedMembers.add(nudgeKey)
               log(`nudge:idle-without-report name=${transition.memberName}`)
-              sendIdleWithoutReportNudge(client, db, transition.teamId, transition.memberName, sessionID)
+              sendIdleWithoutReportNudge(scheduler, db, transition.teamId, transition.memberName, sessionID)
             }
           } else if (transition.to === "error") {
             notifyTeamEvent(client, "error", { memberName: transition.memberName })
@@ -262,6 +280,7 @@ const plugin: Plugin = async (input) => {
               }
             }
             try {
+              scheduler.terminateMember(member?.team_id ?? transition.teamId, member?.name ?? transition.memberName, "shutdown re-abort")
               await client.session.abort({ sessionID })
             } catch { /* best effort */ }
           }
@@ -287,6 +306,7 @@ const plugin: Plugin = async (input) => {
               client.session.promptAsync({
                 sessionID,
                 parts: [{ type: "text", text: `[System: ${pending.c} new team message(s) available]` }],
+                ...getLeadPromptOptions(db, team.id),
               }).catch((err) => {
                 log(`wake-lead:failed err=${err instanceof Error ? err.message : String(err)}`)
               })
@@ -303,7 +323,8 @@ const plugin: Plugin = async (input) => {
           if (member && !hasReportedCompletion(db, member.team_id, member.name)) {
             const staleThreshold = Date.now() - 5000
             const peerMsgs = db.query(
-              "SELECT COUNT(*) as c FROM team_message WHERE team_id = ? AND to_name = ? AND delivered = 0 AND time_created < ?"
+              `SELECT COUNT(*) as c FROM team_message m WHERE team_id = ? AND to_name = ? AND delivered = 0 AND time_created < ?
+                 AND NOT EXISTS (SELECT 1 FROM scheduler_message_wake mw WHERE mw.message_id = m.id)`
             ).get(member.team_id, member.name, staleThreshold) as { c: number }
             if (peerMsgs.c > 0) {
               log(`wake-peer: ${member.name} has ${peerMsgs.c} pending peer messages`)
@@ -335,6 +356,7 @@ const plugin: Plugin = async (input) => {
         if (part?.type === "step-finish" && part.sessionID && part.tokens?.output !== undefined) {
           if (registry.getBySession(part.sessionID)) {
             progressTracker.recordStep(part.sessionID, part.tokens.output)
+            scheduler.onSessionStatus(part.sessionID, "busy")
           }
         }
       }
@@ -420,7 +442,10 @@ const plugin: Plugin = async (input) => {
           project_name: tool.schema.string().optional().describe("Project display name for first use of this working directory. If omitted, a short random name is generated."),
         },
         async execute(args, ctx) {
-          const result = await executeTeamCreate(deps, args, ctx.sessionID)
+          const result = await executeTeamCreate(deps, args, ctx.sessionID, {
+            agent: sessionPromptOptions.get(ctx.sessionID)?.agent ?? ctx.agent,
+            model: sessionPromptOptions.get(ctx.sessionID)?.model,
+          })
           ctx.metadata({ title: `Created team: ${args.name}` })
           return result
         },

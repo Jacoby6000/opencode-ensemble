@@ -254,6 +254,8 @@ describe("stress: stall detection via watchdog", () => {
     const teamId = getTeamId(deps, "stall-team")
     await executeTeamSpawn(deps, { name: "stuck", agent: "build", prompt: "do work", worktree: false }, lead)
     const stuckSess = getSession(deps, "stuck")
+    handleSessionStatusEvent(deps.db, deps.registry, stuckSess, "busy")
+    deps.scheduler.onSessionStatus(stuckSess, "busy")
 
     // Simulate 3 low-token steps
     pt.recordStep(stuckSess, 50)
@@ -303,6 +305,8 @@ describe("stress: stall detection via watchdog", () => {
     const teamId = getTeamId(deps, "dedup-team")
     await executeTeamSpawn(deps, { name: "dup", agent: "build", prompt: "t", worktree: false }, lead)
     const sess = getSession(deps, "dup")
+    handleSessionStatusEvent(deps.db, deps.registry, sess, "busy")
+    deps.scheduler.onSessionStatus(sess, "busy")
 
     pt.recordStep(sess, 10)
     pt.recordStep(sess, 10)
@@ -498,6 +502,8 @@ describe("stress: richer team_status output", () => {
     const teamId = getTeamId(deps, "status-team")
     await executeTeamSpawn(deps, { name: "alice", agent: "build", prompt: "t", worktree: false }, lead)
     const aliceSess = getSession(deps, "alice")
+    handleSessionStatusEvent(deps.db, deps.registry, aliceSess, "busy")
+    deps.scheduler.onSessionStatus(aliceSess, "busy")
 
     // Alice sends a message and claims a task
     await executeTeamMessage(deps, { to: "lead", text: "progress update" }, aliceSess)
@@ -804,7 +810,9 @@ describe("stress: completion loop prevention (issue #3)", () => {
     // Dave reports and goes idle
     await executeTeamMessage(deps, { to: "lead", text: "first pass done" }, daveSess)
     deps.db.run("UPDATE team_member SET status = 'busy' WHERE session_id = ?", [daveSess])
+    deps.scheduler.onSessionStatus(daveSess, "busy")
     handleSessionStatusEvent(deps.db, deps.registry, daveSess, "idle")
+    deps.scheduler.onSessionStatus(daveSess, "idle")
     expect(hasReportedCompletion(deps.db, teamId, "dave")).toBe(true)
 
     // Lead's reply is blocked (dave completed)
@@ -820,6 +828,7 @@ describe("stress: completion loop prevention (issue #3)", () => {
     deps.client.calls.length = 0
     const delivered = await executeTeamMessage(deps, { to: "dave", text: "do one more thing" }, lead)
     expect(delivered).toBe("Message sent to dave.")
+    await Bun.sleep(0)
     const promptCalls = deps.client.calls.filter(c => c.method === "session.promptAsync")
     expect(promptCalls).toHaveLength(1)
   })

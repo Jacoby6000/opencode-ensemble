@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test"
 import type { Database } from "../src/db"
-import { activateIdentity, expireStaleRuns, finishRun, listReadyWakes, markRunInjected, queueBroadcastWakes, queueMessageWake, queueWake, reconcileExpiredRun, releaseIdentity, renewRunLease, tryAcquireRun, tryReserveIdentity } from "../src/scheduler"
+import { activateIdentity, activateIdentityAndQueue, expireStaleRuns, findRunBySession, finishRun, getWakePayload, listReadyWakes, markRunInjected, queueBroadcastWakes, queueMessageWake, queueWake, reconcileExpiredRun, releaseIdentity, renewRunLease, requeueRun, terminateMemberScheduling, tryAcquireRun, tryReserveIdentity } from "../src/scheduler"
 import { insertMember, insertTeam, setupDb } from "./helpers"
 
 describe("durable scheduler", () => {
@@ -159,6 +159,23 @@ describe("durable scheduler", () => {
     expect(db.query("SELECT state FROM scheduler_identity WHERE id = ?").get(reservation.reservationId)).toEqual({ state: "reserved" })
   })
 
+  test("activates identity and queues its initial wake atomically", () => {
+    const reservation = tryReserveIdentity(db, {
+      teamId: "t1", memberName: "charlie", agent: "build",
+      limits: { global: 1, perAgent: {} }, reservationTtlMs: 100, now: 10,
+    })
+    if (!reservation.reserved) throw new Error("expected reservation")
+    insertMember(db, "t1", "charlie", "session-c")
+
+    const wake = activateIdentityAndQueue(db, reservation.reservationId, {
+      teamId: "t1", memberName: "charlie", sessionId: "session-c", agent: "build",
+      reason: "spawn", coalesceKey: "member:charlie", prompt: "start", now: 11,
+    })
+    expect(wake?.coalesced).toBe(false)
+    expect(db.query("SELECT state FROM scheduler_identity WHERE id = ?").get(reservation.reservationId)).toEqual({ state: "active" })
+    expect(db.query("SELECT prompt FROM scheduler_wake WHERE id = ?").get(wake?.wakeId)).toEqual({ prompt: "start" })
+  })
+
   test("transitions linked messages through injected and processed states", () => {
     db.run("INSERT INTO team_message (id, team_id, from_name, to_name, content, time_created) VALUES (?, ?, ?, ?, ?, ?)", ["msg-1", "t1", "lead", "alice", "work", 1])
     const wake = queueWake(db, {
@@ -296,7 +313,7 @@ describe("durable scheduler", () => {
     db.run("INSERT INTO team_message (id, team_id, from_name, to_name, content, time_created) VALUES ('msg-new', 't1', 'lead', 'alice', 'new', 2)")
     const oldWake = queueWake(db, {
       teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
-      reason: "message", coalesceKey: "member", messageId: "msg-old", now: 10,
+      reason: "spawn", coalesceKey: "member", messageId: "msg-old", prompt: "critical initial task", now: 10,
     })
     const acquired = tryAcquireRun(db, oldWake.wakeId, { global: 1, perAgent: {} }, 10, 20)
     if (!acquired.acquired) throw new Error("expected lease")
@@ -312,6 +329,7 @@ describe("durable scheduler", () => {
       { message_id: "msg-new" },
       { message_id: "msg-old" },
     ])
+    expect(getWakePayload(db, newWake.wakeId)?.prompt).toBe("critical initial task")
   })
 
   test("rejects linking a direct message to the wrong recipient", () => {
@@ -404,5 +422,48 @@ describe("durable scheduler", () => {
     })).toThrow(/10KB/)
     expect(db.query("SELECT id FROM team_message WHERE id = 'msg-large'").get()).toBeNull()
     expect(db.query("SELECT id FROM scheduler_wake").all()).toEqual([])
+  })
+
+  test("persists restart-safe wake prompts and linked message payloads", () => {
+    db.run("INSERT INTO team_message (id, team_id, from_name, to_name, content, time_created) VALUES ('msg-1', 't1', 'lead', 'alice', 'follow-up', 1)")
+    const wake = queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
+      reason: "spawn", coalesceKey: "member", messageId: "msg-1", prompt: "initial context", now: 10,
+    })
+    expect(getWakePayload(db, wake.wakeId)).toEqual({
+      prompt: "initial context",
+      messages: [{ id: "msg-1", fromName: "lead", content: "follow-up" }],
+    })
+  })
+
+  test("records injection evidence and can requeue a rejected active run", () => {
+    const wake = queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
+      reason: "message", coalesceKey: "member", now: 10,
+    })
+    const acquired = tryAcquireRun(db, wake.wakeId, { global: 1, perAgent: {} }, 100, 20)
+    if (!acquired.acquired) throw new Error("expected lease")
+    expect(findRunBySession(db, "session-a")).toMatchObject({ leaseId: acquired.leaseId, state: "active", injectedAt: null })
+    expect(markRunInjected(db, acquired.leaseId, 21)).toBe(true)
+    expect(findRunBySession(db, "session-a")?.injectedAt).toBe(21)
+    expect(requeueRun(db, acquired.leaseId, "transport rejected", 30, 22)).toBe(true)
+    expect(findRunBySession(db, "session-a")).toBeUndefined()
+    expect(db.query("SELECT state, not_before FROM scheduler_wake WHERE id = ?").get(wake.wakeId)).toEqual({ state: "queued", not_before: 52 })
+  })
+
+  test("terminalizes member wakes, leases, messages, and identity together", () => {
+    db.run("INSERT INTO scheduler_identity (id, team_id, member_name, agent, state, reserved_at, activated_at) VALUES ('identity-a', 't1', 'alice', 'build', 'active', 1, 1)")
+    db.run("INSERT INTO team_message (id, team_id, from_name, to_name, content, time_created) VALUES ('msg-1', 't1', 'lead', 'alice', 'work', 1)")
+    const wake = queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
+      reason: "message", coalesceKey: "member", messageId: "msg-1", now: 10,
+    })
+    expect(tryAcquireRun(db, wake.wakeId, { global: 1, perAgent: {} }, 100, 20).acquired).toBe(true)
+
+    expect(terminateMemberScheduling(db, "t1", "alice", "shutdown", 21)).toBe(true)
+    expect(db.query("SELECT state FROM scheduler_wake WHERE id = ?").get(wake.wakeId)).toEqual({ state: "failed" })
+    expect(db.query("SELECT state FROM scheduler_run_lease WHERE wake_id = ?").get(wake.wakeId)).toEqual({ state: "failed" })
+    expect(db.query("SELECT delivery_state FROM team_message WHERE id = 'msg-1'").get()).toEqual({ delivery_state: "failed" })
+    expect(db.query("SELECT state FROM scheduler_identity WHERE id = 'identity-a'").get()).toEqual({ state: "released" })
   })
 })

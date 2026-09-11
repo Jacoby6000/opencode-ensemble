@@ -120,6 +120,7 @@ async function preserveAndAbort(
   }
 
   // Now safe to abort — the branch is preserved
+  deps.scheduler.terminateMember(teamId, memberName, "shutdown")
   try {
     await deps.client.session.abort({ sessionID: sessionId })
   } catch {

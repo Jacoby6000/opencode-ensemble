@@ -38,6 +38,7 @@ export interface QueueWakeInput {
   agent: string
   reason: string
   coalesceKey: string
+  prompt?: string
   messageId?: string
   notBefore?: number
   now?: number
@@ -83,6 +84,98 @@ export interface ReadyWake {
   attemptCount: number
 }
 
+/** Prompt and linked mailbox content needed to dispatch one wake. */
+export interface WakePayload {
+  prompt: string | null
+  messages: Array<{ id: string; fromName: string; content: string }>
+}
+
+/** Active or fenced run correlated to an external teammate session. */
+export interface SchedulerRun {
+  leaseId: string
+  wakeId: string
+  teamId: string
+  memberName: string
+  sessionId: string
+  state: "active" | "expired"
+  injectedAt: number | null
+  expiresAt: number
+}
+
+/** Load the durable payload for one wake. */
+export function getWakePayload(_db: Database, _wakeId: string): WakePayload | undefined {
+  const wake = _db.query("SELECT prompt FROM scheduler_wake WHERE id = ?").get(_wakeId) as { prompt: string | null } | undefined
+  if (!wake) return undefined
+  const messages = _db.query(
+    "SELECT m.id, m.from_name, m.content FROM team_message m JOIN scheduler_message_wake mw ON mw.message_id = m.id WHERE mw.wake_id = ? ORDER BY m.time_created ASC, m.id ASC",
+  ).all(_wakeId) as Array<{ id: string; from_name: string; content: string }>
+  return {
+    prompt: wake.prompt,
+    messages: messages.map(message => ({ id: message.id, fromName: message.from_name, content: message.content })),
+  }
+}
+
+/** Find the current active or fenced run for an external session. */
+export function findRunBySession(_db: Database, _sessionId: string): SchedulerRun | undefined {
+  const run = _db.query(
+    "SELECT id, wake_id, team_id, member_name, session_id, state, injected_at, expires_at FROM scheduler_run_lease WHERE session_id = ? AND state IN ('active', 'expired') ORDER BY acquired_at DESC LIMIT 1",
+  ).get(_sessionId) as { id: string; wake_id: string; team_id: string; member_name: string; session_id: string; state: "active" | "expired"; injected_at: number | null; expires_at: number } | undefined
+  if (!run) return undefined
+  return {
+    leaseId: run.id,
+    wakeId: run.wake_id,
+    teamId: run.team_id,
+    memberName: run.member_name,
+    sessionId: run.session_id,
+    state: run.state,
+    injectedAt: run.injected_at,
+    expiresAt: run.expires_at,
+  }
+}
+
+/** Release an active lease and return its wake to the queue after a dispatch rejection. */
+export function requeueRun(_db: Database, _leaseId: string, _error: string, _backoffMs: number, _now = Date.now()): boolean {
+  if (!Number.isSafeInteger(_backoffMs) || _backoffMs < 0) throw new Error("Run backoff must be a non-negative safe integer")
+  return immediateTransaction(_db, () => {
+    const lease = _db.query(
+      "SELECT wake_id, team_id, member_name FROM scheduler_run_lease WHERE id = ? AND state = 'active'",
+    ).get(_leaseId) as { wake_id: string; team_id: string; member_name: string } | undefined
+    if (!lease) return false
+    _db.run("UPDATE scheduler_run_lease SET state = 'released', released_at = ? WHERE id = ? AND state = 'active'", [_now, _leaseId])
+    _db.run("UPDATE scheduler_wake SET state = 'queued', not_before = ?, last_error = ?, time_updated = ? WHERE id = ? AND state = 'leased'", [_now + _backoffMs, _error, _now, lease.wake_id])
+    setWakeMessageState(_db, lease.wake_id, "wake_queued")
+    recordEvent(_db, { teamId: lease.team_id, memberName: lease.member_name, wakeId: lease.wake_id, leaseId: _leaseId, type: "run_requeued", detail: _error, now: _now })
+    return true
+  })
+}
+
+/** Terminalize all durable scheduling state owned by one teammate. */
+export function terminateMemberScheduling(_db: Database, _teamId: string, _memberName: string, _reason: string, _now = Date.now()): boolean {
+  return immediateTransaction(_db, () => {
+    const wakes = _db.query(
+      "SELECT id FROM scheduler_wake WHERE team_id = ? AND member_name = ? AND state IN ('queued', 'leased')",
+    ).all(_teamId, _memberName) as Array<{ id: string }>
+    wakes.forEach(wake => {
+      setWakeMessageState(_db, wake.id, "failed")
+    })
+    const leases = _db.run(
+      "UPDATE scheduler_run_lease SET state = 'failed', released_at = ? WHERE team_id = ? AND member_name = ? AND state IN ('active', 'expired')",
+      [_now, _teamId, _memberName],
+    ).changes
+    const wakeChanges = _db.run(
+      "UPDATE scheduler_wake SET state = 'failed', last_error = ?, time_updated = ? WHERE team_id = ? AND member_name = ? AND state IN ('queued', 'leased')",
+      [_reason, _now, _teamId, _memberName],
+    ).changes
+    const identities = _db.run(
+      "UPDATE scheduler_identity SET state = 'released', expires_at = NULL, released_at = ? WHERE team_id = ? AND member_name = ? AND state IN ('reserved', 'active')",
+      [_now, _teamId, _memberName],
+    ).changes
+    if (leases + wakeChanges + identities === 0) return false
+    recordEvent(_db, { teamId: _teamId, memberName: _memberName, type: "member_scheduler_terminated", detail: _reason, now: _now })
+    return true
+  })
+}
+
 interface WakeRow {
   id: string
   team_id: string
@@ -124,6 +217,7 @@ export function markRunInjected(db: Database, leaseId: string, now = Date.now())
       "SELECT wake_id, team_id, member_name FROM scheduler_run_lease WHERE id = ? AND state = 'active' AND expires_at > ?",
     ).get(leaseId, now) as { wake_id: string; team_id: string; member_name: string } | undefined
     if (!lease) return false
+    db.run("UPDATE scheduler_run_lease SET injected_at = COALESCE(injected_at, ?) WHERE id = ? AND state = 'active'", [now, leaseId])
     setWakeMessageState(db, lease.wake_id, "injected")
     recordEvent(db, { teamId: lease.team_id, memberName: lease.member_name, wakeId: lease.wake_id, leaseId, type: "run_injected", now })
     return true
@@ -239,6 +333,14 @@ export function reconcileExpiredRun(
       ).get(lease.team_id, lease.member_name, lease.coalesce_key, lease.wake_id) as { id: string } | undefined
       if (successor) {
         db.run("INSERT OR IGNORE INTO scheduler_message_wake (message_id, wake_id, time_created) SELECT message_id, ?, ? FROM scheduler_message_wake WHERE wake_id = ?", [successor.id, now, lease.wake_id])
+        db.run(
+          `UPDATE scheduler_wake SET prompt = CASE
+             WHEN (SELECT prompt FROM scheduler_wake WHERE id = ?) IS NULL THEN prompt
+             WHEN prompt IS NULL THEN (SELECT prompt FROM scheduler_wake WHERE id = ?)
+             ELSE (SELECT prompt FROM scheduler_wake WHERE id = ?) || '\n\n' || prompt
+           END, time_updated = ? WHERE id = ?`,
+          [lease.wake_id, lease.wake_id, lease.wake_id, now, successor.id],
+        )
         db.run("DELETE FROM scheduler_message_wake WHERE wake_id = ?", [lease.wake_id])
         db.run("UPDATE scheduler_wake SET state = 'cancelled', time_updated = ? WHERE id = ? AND state = 'leased'", [now, lease.wake_id])
       } else {
@@ -309,20 +411,31 @@ export function tryReserveIdentity(db: Database, input: ReserveIdentityInput): R
 
 /** Mark a reserved identity as active after the member is persisted. */
 export function activateIdentity(db: Database, reservationId: string, now = Date.now()): boolean {
-  return immediateTransaction(db, () => {
-    const identity = db.query("SELECT team_id, member_name, agent, expires_at FROM scheduler_identity WHERE id = ? AND state = 'reserved'").get(reservationId) as { team_id: string; member_name: string; agent: string; expires_at: number } | undefined
-    if (!identity) return false
-    if (identity.expires_at <= now) {
-      db.run("UPDATE scheduler_identity SET state = 'expired', released_at = ? WHERE id = ? AND state = 'reserved'", [now, reservationId])
-      recordEvent(db, { teamId: identity.team_id, memberName: identity.member_name, type: "identity_reservation_expired", detail: reservationId, now })
-      return false
-    }
-    const member = getSchedulableMember(db, identity.team_id, identity.member_name)
-    if (!member || member.agent !== identity.agent) return false
-    db.run("UPDATE scheduler_identity SET state = 'active', expires_at = NULL, activated_at = ? WHERE id = ? AND state = 'reserved'", [now, reservationId])
-    recordEvent(db, { teamId: identity.team_id, memberName: identity.member_name, type: "identity_activated", detail: reservationId, now })
-    return true
+  return immediateTransaction(db, () => activateIdentityInTransaction(db, reservationId, now))
+}
+
+/** Atomically activate a persisted teammate identity and queue its initial wake. */
+export function activateIdentityAndQueue(_db: Database, _reservationId: string, _wake: QueueWakeInput): QueueWakeResult | undefined {
+  const now = _wake.now ?? Date.now()
+  return immediateTransaction(_db, () => {
+    if (!activateIdentityInTransaction(_db, _reservationId, now)) return undefined
+    return queueWakeInTransaction(_db, { ..._wake, now })
   })
+}
+
+function activateIdentityInTransaction(db: Database, reservationId: string, now: number): boolean {
+  const identity = db.query("SELECT team_id, member_name, agent, expires_at FROM scheduler_identity WHERE id = ? AND state = 'reserved'").get(reservationId) as { team_id: string; member_name: string; agent: string; expires_at: number } | undefined
+  if (!identity) return false
+  if (identity.expires_at <= now) {
+    db.run("UPDATE scheduler_identity SET state = 'expired', released_at = ? WHERE id = ? AND state = 'reserved'", [now, reservationId])
+    recordEvent(db, { teamId: identity.team_id, memberName: identity.member_name, type: "identity_reservation_expired", detail: reservationId, now })
+    return false
+  }
+  const member = getSchedulableMember(db, identity.team_id, identity.member_name)
+  if (!member || member.agent !== identity.agent) return false
+  db.run("UPDATE scheduler_identity SET state = 'active', expires_at = NULL, activated_at = ? WHERE id = ? AND state = 'reserved'", [now, reservationId])
+  recordEvent(db, { teamId: identity.team_id, memberName: identity.member_name, type: "identity_activated", detail: reservationId, now })
+  return true
 }
 
 /** Release reserved or active identity capacity. */
@@ -410,7 +523,7 @@ function queueWakeInTransaction(db: Database, input: QueueWakeInput & { now: num
   ).get(input.teamId, input.memberName, input.coalesceKey) as { id: string } | undefined
 
   if (existing) {
-    db.run("UPDATE scheduler_wake SET session_id = ?, agent = ?, time_updated = ?, not_before = MIN(not_before, ?) WHERE id = ?", [input.sessionId, input.agent, now, input.notBefore ?? now, existing.id])
+    db.run("UPDATE scheduler_wake SET session_id = ?, agent = ?, prompt = COALESCE(prompt, ?), time_updated = ?, not_before = MIN(not_before, ?) WHERE id = ?", [input.sessionId, input.agent, input.prompt ?? null, now, input.notBefore ?? now, existing.id])
     if (input.messageId) {
       linkMessageToWake(db, input, existing.id, now, allowBroadcast)
     }
@@ -420,8 +533,8 @@ function queueWakeInTransaction(db: Database, input: QueueWakeInput & { now: num
 
   const wakeId = generateId("wake")
   db.run(
-    "INSERT INTO scheduler_wake (id, team_id, member_name, session_id, agent, reason, coalesce_key, state, not_before, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
-    [wakeId, input.teamId, input.memberName, input.sessionId, input.agent, input.reason, input.coalesceKey, input.notBefore ?? now, now, now],
+    "INSERT INTO scheduler_wake (id, team_id, member_name, session_id, agent, reason, coalesce_key, prompt, state, not_before, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
+    [wakeId, input.teamId, input.memberName, input.sessionId, input.agent, input.reason, input.coalesceKey, input.prompt ?? null, input.notBefore ?? now, now, now],
   )
   if (input.messageId) linkMessageToWake(db, input, wakeId, now, allowBroadcast)
   recordEvent(db, { teamId: input.teamId, memberName: input.memberName, wakeId, type: "wake_queued", now })
