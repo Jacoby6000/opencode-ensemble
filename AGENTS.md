@@ -72,6 +72,7 @@ when running on Bun, `node:sqlite` when running on Node/Electron. Core tables:
 - team_member — member registry (name, session ID, agent, status)
 - team_task — shared task board (content, status, priority, assignee, deps)
 - team_message — message log (from, to, content, delivered flag)
+- team_group / team_group_participant — immutable named inboxes and membership
 - scheduler_identity — reserved and active teammate identity capacity
 - scheduler_wake — durable, coalesced work awaiting dispatch
 - scheduler_run_lease — active and reconciliation-fenced run capacity
@@ -112,7 +113,7 @@ member, the call is blocked. This covers sub-agents at arbitrary depth.
 | team_create         | Any session | Create a new team, caller is lead    |
 | team_spawn          | Lead only   | Spawn a teammate with a prompt (supports plan_approval mode) |
 | team_message        | Any member  | Send message to teammate or lead (approve/reject plans) |
-| team_broadcast      | Any member  | Send message to all team members     |
+| team_broadcast      | Any member  | Send to the team or a member-only named group |
 | team_tasks_list     | Any member  | View the shared team task board      |
 | team_tasks_add      | Any member  | Add tasks to the shared board        |
 | team_tasks_complete | Any member  | Mark a task complete, unblock deps   |
@@ -287,7 +288,7 @@ apply to this plugin's design:
 2. Teammates only see their tools. The context message injected by
    team_spawn should describe only the tools a teammate can use:
    team_message, team_broadcast, team_tasks_list, team_tasks_add,
-   team_tasks_complete, team_claim. Do not describe lead-only tools
+   team_tasks_complete, team_claim, team_results. Do not describe lead-only tools
    to teammates.
 
 3. Do not add periodic system reminders. Do not inject "remember
@@ -309,7 +310,7 @@ It must contain exactly:
 
 1. Their name and role in the team
 2. The task they are working on
-3. The 6 tools they can use (team_message, team_broadcast,
+3. The 7 tools they can use (team_message, team_broadcast, team_results,
    team_tasks_list, team_tasks_add, team_tasks_complete, team_claim)
    with a one-line description of each
 4. How to report completion (team_message to lead with findings)

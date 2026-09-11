@@ -64,6 +64,10 @@ export interface QueueBroadcastWakesInput {
   fromName: string
   content: string
   recipients: ReadonlyArray<Omit<QueueWakeInput, "teamId" | "messageId" | "now">>
+  /** Group destination ID; omitted for a whole-team broadcast. */
+  groupId?: string
+  /** Complete durable recipient set for a group message. */
+  groupRecipients?: ReadonlyArray<{ recipientName: string; recipientKind: "worker" | "lead" }>
   now?: number
 }
 
@@ -92,7 +96,7 @@ export interface ReadyWake {
 /** Prompt and linked mailbox content needed to dispatch one wake. */
 export interface WakePayload {
   prompt: string | null
-  messages: Array<{ id: string; fromName: string; content: string }>
+  messages: Array<{ id: string; fromName: string; content: string; groupName?: string }>
 }
 
 /** Active or fenced run correlated to an external teammate session. */
@@ -112,11 +116,16 @@ export function getWakePayload(_db: Database, _wakeId: string): WakePayload | un
   const wake = _db.query("SELECT prompt FROM scheduler_wake WHERE id = ?").get(_wakeId) as { prompt: string | null } | undefined
   if (!wake) return undefined
   const messages = _db.query(
-    "SELECT m.id, m.from_name, m.content FROM team_message m JOIN scheduler_message_wake mw ON mw.message_id = m.id WHERE mw.wake_id = ? ORDER BY m.time_created ASC, m.id ASC",
-  ).all(_wakeId) as Array<{ id: string; from_name: string; content: string }>
+    "SELECT m.id, m.from_name, m.content, g.name AS group_name FROM team_message m JOIN scheduler_message_wake mw ON mw.message_id = m.id LEFT JOIN team_group g ON g.id = m.group_id WHERE mw.wake_id = ? ORDER BY m.time_created ASC, m.id ASC",
+  ).all(_wakeId) as Array<{ id: string; from_name: string; content: string; group_name: string | null }>
   return {
     prompt: wake.prompt,
-    messages: messages.map(message => ({ id: message.id, fromName: message.from_name, content: message.content })),
+    messages: messages.map(message => ({
+      id: message.id,
+      fromName: message.from_name,
+      content: message.content,
+      ...(message.group_name ? { groupName: message.group_name } : {}),
+    })),
   }
 }
 
@@ -298,15 +307,33 @@ export function persistBroadcastWakesInTransaction(db: Database, input: QueueBro
   }
   const now = input.now ?? Date.now()
   db.run(
-    "INSERT INTO team_message (id, team_id, from_name, to_name, content, delivered, read, delivery_state, time_created) VALUES (?, ?, ?, NULL, ?, 0, 0, 'queued', ?)",
-    [input.messageId, input.teamId, input.fromName, input.content, now],
+    "INSERT INTO team_message (id, team_id, from_name, to_name, group_id, content, delivered, read, delivery_state, time_created) VALUES (?, ?, ?, NULL, ?, ?, 0, 0, 'queued', ?)",
+    [input.messageId, input.teamId, input.fromName, input.groupId ?? null, input.content, now],
   )
-  return input.recipients.map(recipient => queueWakeInTransaction(db, {
+  if (input.groupId) {
+    if (!input.groupRecipients || input.groupRecipients.length === 0) throw new Error("Group messages require durable recipients")
+    if (new Set(input.groupRecipients.map(recipient => recipient.recipientName)).size !== input.groupRecipients.length) {
+      throw new Error("Group recipients must be unique")
+    }
+    input.groupRecipients.forEach(recipient => {
+      db.run(
+        `INSERT INTO team_group_message_recipient
+          (message_id, team_id, recipient_name, recipient_kind, delivery_state, not_before, attempt_count, time_created, time_updated)
+         VALUES (?, ?, ?, ?, 'queued', ?, 0, ?, ?)`,
+        [input.messageId, input.teamId, recipient.recipientName, recipient.recipientKind, now, now, now],
+      )
+    })
+  } else if (input.groupRecipients) {
+    throw new Error("Whole-team broadcasts cannot register group recipients")
+  }
+  const wakes = input.recipients.map(recipient => queueWakeInTransaction(db, {
     ...recipient,
     teamId: input.teamId,
     messageId: input.messageId,
     now,
   }, true))
+  if (input.groupId) refreshMessageDeliveryAggregate(db, input.messageId)
+  return wakes
 }
 
 /** Renew an owned active lease before its expiry. */
@@ -532,11 +559,48 @@ function getSchedulableMember(db: Database, teamId: string, memberName: string):
   ).get(teamId, memberName) as { session_id: string; agent: string; member_kind: string } | undefined
 }
 
+/**
+ * Recompute the coarse team_message delivery fields from durable group-recipient state.
+ * Pending work wins and reports `wake_queued`; otherwise any partial success reports
+ * `injected`, all-recipient processed success reports `processed`, and no success reports
+ * `failed`. `delivered` means at least one recipient was injected or processed.
+ */
+export function refreshMessageDeliveryAggregate(db: Database, messageId: string): void {
+  const message = db.query("SELECT group_id FROM team_message WHERE id = ?").get(messageId) as { group_id: string | null } | undefined
+  if (!message?.group_id) return
+  const aggregate = db.query(
+    `SELECT COUNT(*) AS total,
+       SUM(CASE WHEN delivery_state IN ('queued', 'wake_queued', 'claimed') THEN 1 ELSE 0 END) AS pending,
+       SUM(CASE WHEN delivery_state IN ('injected', 'processed') THEN 1 ELSE 0 END) AS successful,
+       SUM(CASE WHEN delivery_state = 'processed' THEN 1 ELSE 0 END) AS processed
+     FROM team_group_message_recipient WHERE message_id = ?`,
+  ).get(messageId) as { total: number; pending: number; successful: number; processed: number }
+  if (aggregate.total === 0) throw new Error(`Group message ${messageId} has no durable recipients`)
+  const deliveryState = aggregate.pending > 0
+    ? "wake_queued"
+    : aggregate.processed === aggregate.total
+      ? "processed"
+      : aggregate.successful > 0
+        ? "injected"
+        : "failed"
+  db.run("UPDATE team_message SET delivered = ?, delivery_state = ? WHERE id = ?", [aggregate.successful > 0 ? 1 : 0, deliveryState, messageId])
+}
+
 function setWakeMessageState(db: Database, wakeId: string, state: "wake_queued" | "injected" | "processed" | "failed"): void {
   const messageIds = db.query("SELECT message_id FROM scheduler_message_wake WHERE wake_id = ?").all(wakeId) as Array<{ message_id: string }>
   if (messageIds.length === 0) return
   db.run("UPDATE scheduler_message_wake SET delivery_state = ? WHERE wake_id = ?", [state, wakeId])
   messageIds.forEach(({ message_id: messageId }) => {
+    const groupRecipient = db.run(
+      `UPDATE team_group_message_recipient SET delivery_state = ?, claim_token = NULL, claimed_at = NULL,
+         last_error = CASE WHEN ? = 'failed' THEN last_error ELSE NULL END, time_updated = ?
+       WHERE message_id = ? AND recipient_name = (SELECT member_name FROM scheduler_wake WHERE id = ?)`,
+      [state, state, Date.now(), messageId, wakeId],
+    ).changes
+    if (groupRecipient > 0) {
+      refreshMessageDeliveryAggregate(db, messageId)
+      return
+    }
     const aggregate = db.query(
       `SELECT
          COUNT(*) AS total,
@@ -599,12 +663,12 @@ function queueWakeInTransaction(db: Database, input: QueueWakeInput & { now: num
 
 function linkMessageToWake(db: Database, input: QueueWakeInput, wakeId: string, now: number, allowBroadcast: boolean): void {
   if (!input.messageId) return
-  const message = db.query("SELECT team_id, to_name, delivery_state FROM team_message WHERE id = ?").get(input.messageId) as { team_id: string; to_name: string | null; delivery_state: string } | undefined
+  const message = db.query("SELECT team_id, to_name, group_id, delivery_state FROM team_message WHERE id = ?").get(input.messageId) as { team_id: string; to_name: string | null; group_id: string | null; delivery_state: string } | undefined
   if (!message) throw new Error(`Message not found: ${input.messageId}`)
   if (message.team_id !== input.teamId || (message.to_name !== null && message.to_name !== input.memberName)) {
     throw new Error(`Message ${input.messageId} does not target ${input.teamId}/${input.memberName}`)
   }
-  if (message.to_name === null && !allowBroadcast) throw new Error("Broadcast messages must use queueBroadcastWakes")
+  if (message.to_name === null && !allowBroadcast) throw new Error("Multi-recipient messages must use queueBroadcastWakes")
   if (message.delivery_state === "processed" || message.delivery_state === "failed") {
     throw new Error(`Message ${input.messageId} is already terminal`)
   }

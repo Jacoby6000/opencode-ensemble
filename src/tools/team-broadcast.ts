@@ -6,13 +6,14 @@ import { generateId } from "../util"
 import { immediateTransaction, persistBroadcastWakesInTransaction, queueBroadcastWakes } from "../scheduler"
 import { getLeadPromptOptions } from "../member-model"
 import { claimSupervisorBroadcastInTransaction } from "../supervisor"
+import { sendGroupMessage } from "../groups"
 
 /**
- * Execute the team_broadcast tool. Sends a message to all team members + lead (excluding sender).
+ * Execute the team_broadcast tool for whole-team broadcasts or durable group inboxes.
  */
 export async function executeTeamBroadcast(
   deps: ToolDeps,
-  args: { text: string },
+  args: { text: string; group?: string; members?: string[] },
   sessionId: string,
 ): Promise<string> {
   const teamInfo = requireTeamMember(deps, sessionId)
@@ -22,6 +23,21 @@ export async function executeTeamBroadcast(
     ? deps.db.query("SELECT member_kind FROM team_member WHERE team_id = ? AND name = ?").get(teamInfo.teamId, senderName) as { member_kind: string } | null
     : null
   const supervisorBroadcast = sender?.member_kind === "supervisor"
+
+  if (args.members && !args.group) throw new Error("members requires group")
+  if (args.group) {
+    if (supervisorBroadcast) throw new Error("Supervisor cannot create, join, or send to group inboxes")
+    const sent = sendGroupMessage(deps.db, {
+      teamId: teamInfo.teamId,
+      sender: senderName,
+      group: args.group,
+      members: args.members,
+      content: args.text,
+    })
+    deps.scheduler.kick()
+    const recipientCount = sent.workerRecipientCount + (sent.leadRecipient ? 1 : 0)
+    return `Group "${sent.group.name}" message sent to ${recipientCount} recipient${recipientCount === 1 ? "" : "s"}.`
+  }
 
   let leadSessionId: string | undefined
   if (teamInfo.role !== "lead") {

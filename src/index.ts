@@ -181,7 +181,7 @@ const plugin: Plugin = async (input) => {
         const dashboardTokenPath = getDashboardTokenPath()
         const dashboardToken = loadOrCreateDashboardToken(dashboardTokenPath)
         log(`init:dashboard:token-file path=${dashboardTokenPath}`)
-        startDashboard(db, config.dashboard.port, { activityBuffer, client, token: dashboardToken }).catch((err) => {
+        startDashboard(db, config.dashboard.port, { activityBuffer, client, scheduler, token: dashboardToken }).catch((err) => {
           log(`init:dashboard:failed err=${err instanceof Error ? err.message : String(err)}`)
         })
       } catch (err) {
@@ -565,9 +565,11 @@ const plugin: Plugin = async (input) => {
       }),
 
       team_broadcast: tool({
-        description: "Send a message to all teammates and the lead (excluding yourself).",
+        description: "Send a whole-team broadcast, create a named group with its first message, or send to an existing group. Group membership is immutable and only participants may send.",
         args: {
           text: tool.schema.string().describe("Message content (max 10KB)"),
+          group: tool.schema.string().optional().describe("Group inbox name. With members, atomically creates the group; without members, sends to an existing group."),
+          members: tool.schema.array(tool.schema.string()).optional().describe("Immutable participants for a new group; creator must be included."),
         },
         async execute(args, ctx) {
           const result = await executeTeamBroadcast(deps, args, ctx.sessionID)
@@ -637,9 +639,12 @@ const plugin: Plugin = async (input) => {
       }),
 
       team_results: tool({
-        description: "Retrieve full message content from teammates. Returns unread messages and marks them as read. Use this after receiving a truncated message notification.",
+        description: "Retrieve unread ordinary messages, list all group inboxes, or inspect group history without changing group delivery/read state.",
         args: {
           from: tool.schema.string().optional().describe("Filter messages by sender name (optional, returns all if omitted)"),
+          list_groups: tool.schema.boolean().optional().describe("List every group inbox in the team"),
+          group: tool.schema.string().optional().describe("Inspect newest-first history for one group as a participant or observer"),
+          limit: tool.schema.number().int().min(1).max(50).optional().describe("Group history limit (default 20, maximum 50)"),
         },
         async execute(args, ctx) {
           const result = await executeTeamResults(deps, args, ctx.sessionID)

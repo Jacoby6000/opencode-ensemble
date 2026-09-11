@@ -86,6 +86,8 @@ export async function executeTeamSpawn(
   const existing = deps.db.query("SELECT name FROM team_member WHERE team_id = ? AND name = ?")
     .get(teamInfo.teamId, args.name)
   if (existing) throw new Error(`Teammate "${args.name}" already exists in team "${teamInfo.teamName}"`)
+  const groupCollision = deps.db.query("SELECT name FROM team_group WHERE team_id = ? AND name = ?").get(teamInfo.teamId, args.name)
+  if (groupCollision) throw new Error(`Teammate name "${args.name}" collides with group inbox "${args.name}"`)
 
   const reservation = tryReserveIdentity(deps.db, {
     teamId: teamInfo.teamId,
@@ -162,7 +164,7 @@ export async function executeTeamSpawn(
   // Permission rules on session.create are the hard gate (server-enforced).
   // For read-only agents, deny write tools and explicitly allow team tools.
   // For all agents with worktrees, allowlist the worktree path for edit/bash.
-  const TEAM_TOOLS = ["team_message", "team_broadcast", "team_tasks_list", "team_tasks_add", "team_tasks_complete", "team_claim"] as const
+  const TEAM_TOOLS = ["team_message", "team_broadcast", "team_results", "team_tasks_list", "team_tasks_add", "team_tasks_complete", "team_claim"] as const
   const permission: PermissionRule[] = []
 
   if (worktreeDir) {
@@ -317,6 +319,7 @@ export async function executeTeamSpawn(
       "", "Tools available to you:",
       "- team_message: send a message to the lead or another teammate",
       "- team_broadcast: send a message to all team members",
+      "- team_results: list or inspect group inboxes and retrieve unread messages",
       "- team_tasks_list: view the shared team task board",
     )
   } else {
@@ -324,6 +327,7 @@ export async function executeTeamSpawn(
       "", "Tools available to you:",
       "- team_message: send a message to the lead or another teammate",
       "- team_broadcast: send a message to all team members",
+      "- team_results: list or inspect group inboxes and retrieve unread messages",
       "- team_tasks_list: view the shared team task board",
       "- team_tasks_add: add tasks to the shared board",
       "- team_tasks_complete: mark a task complete on the shared board",

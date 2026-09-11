@@ -250,7 +250,7 @@ export function shouldNudgeIdleMember(db: Database, teamId: string, memberName: 
     .get(teamId, memberName) as { status: string } | null
   if (!member || member.status !== "ready") return false
 
-  const msg = db.query("SELECT id FROM team_message WHERE team_id = ? AND from_name = ? AND (to_name = 'lead' OR to_name IS NULL) LIMIT 1")
+  const msg = db.query("SELECT id FROM team_message WHERE team_id = ? AND from_name = ? AND group_id IS NULL AND (to_name = 'lead' OR to_name IS NULL) LIMIT 1")
     .get(teamId, memberName) as { id: string } | null
   return !msg
 }

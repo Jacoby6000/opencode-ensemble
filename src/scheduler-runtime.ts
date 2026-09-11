@@ -1,7 +1,8 @@
 import type { ResolvedEnsembleConfig } from "./config"
 import type { Database } from "./db"
+import { claimGroupLeadDeliveries, markGroupLeadDeliveryInjected, requeueGroupLeadDelivery } from "./groups"
 import { log } from "./log"
-import { getMemberPromptOptions } from "./member-model"
+import { getLeadPromptOptions, getMemberPromptOptions } from "./member-model"
 import { expireStaleRuns, findRunBySession, finishRun, getWakePayload, listReadyWakes, markRunInjected, reconcileExpiredRun, renewRunLease, requeueRun, terminateMemberScheduling, tryAcquireRun } from "./scheduler"
 import type { PluginClient } from "./types"
 import { armTeamSupervisionIfQuiescent, reconcileTeamSupervision, SUPERVISOR_MEMBER_NAME } from "./supervisor"
@@ -138,8 +139,8 @@ export class DurableScheduler implements SchedulerController {
           return
         }
         const message = getResult.error instanceof Error ? getResult.error.message : "session not found"
-          this.db.run("UPDATE team_member SET status = 'error', execution_status = 'failed', time_updated = ? WHERE team_id = ? AND name = ?", [Date.now(), run.teamId, run.memberName])
-          terminateMemberScheduling(this.db, run.teamId, run.memberName, message)
+        this.db.run("UPDATE team_member SET status = 'error', execution_status = 'failed', time_updated = ? WHERE team_id = ? AND name = ?", [Date.now(), run.teamId, run.memberName])
+        terminateMemberScheduling(this.db, run.teamId, run.memberName, message)
       }))
     } finally {
       this.reconcileSupervision(Date.now(), true)
@@ -170,6 +171,19 @@ export class DurableScheduler implements SchedulerController {
   private drain(): void {
     const now = Date.now()
     this.reconcileSupervision(now)
+    for (const delivery of claimGroupLeadDeliveries(this.db, this.projectId, this.config.leaseTtlMs, 50, now)) {
+      this.client.session.promptAsync({
+        sessionID: delivery.leadSessionId,
+        parts: [{ type: "text", text: `[Group ${delivery.groupName} from ${delivery.fromName}]: ${delivery.content}` }],
+        ...getLeadPromptOptions(this.db, delivery.teamId),
+      }).then(() => {
+        markGroupLeadDeliveryInjected(this.db, delivery.messageId, delivery.claimToken)
+      }).catch(err => {
+        const message = err instanceof Error ? err.message : String(err)
+        log(`scheduler:group-lead-dispatch:failed message=${delivery.messageId} err=${message}`)
+        requeueGroupLeadDelivery(this.db, delivery.messageId, delivery.claimToken, message, this.config.pumpIntervalMs)
+      })
+    }
     for (const wake of listReadyWakes(this.db, now, 50, this.projectId)) {
       const acquired = tryAcquireRun(this.db, wake.id, this.config.runLimits, this.config.leaseTtlMs, now, this.projectId)
       if (!acquired.acquired) continue
@@ -178,7 +192,9 @@ export class DurableScheduler implements SchedulerController {
         finishRun(this.db, acquired.leaseId, "failed", "wake payload missing", now, this.projectId)
         continue
       }
-      const parts = [payload.prompt, ...payload.messages.map(message => `[Team message from ${message.fromName}]: ${message.content}`)]
+      const parts = [payload.prompt, ...payload.messages.map(message => (message.groupName
+        ? `[Group ${message.groupName} from ${message.fromName}]: ${message.content}`
+        : `[Team message from ${message.fromName}]: ${message.content}`))]
         .filter((part): part is string => Boolean(part))
       const text = parts.length > 0 ? parts.join("\n\n") : `[System: Resume queued ${wake.reason} work]`
       this.client.session.promptAsync({

@@ -4,6 +4,8 @@ import { setupDb, insertTeam, insertMember, mockClient } from "./helpers"
 import { DASHBOARD_HOST, startDashboard as startDashboardServer, parseMessageParts } from "../src/dashboard"
 import type { DashboardOptions } from "../src/dashboard"
 import { ActivityBuffer } from "../src/activity"
+import { DEFAULT_CONFIG } from "../src/config"
+import { DurableScheduler } from "../src/scheduler-runtime"
 import type { PluginClient } from "../src/types"
 import { activateIdentity, markRunInjected, queueWake, tryAcquireRun, tryReserveIdentity } from "../src/scheduler"
 import { SUPERVISOR_AGENT, SUPERVISOR_MEMBER_NAME } from "../src/supervisor"
@@ -41,7 +43,7 @@ function insertMessage(db: Database, teamId: string, id: string, fromName: strin
 
 // biome-lint: use Record for JSON response shape
 interface HealthResponse { ensemble: boolean; pid: number }
-interface DashboardTeam { id: string; name: string; projectId: string; leadSessionId?: string; status: string; timeCreated: number; timeUpdated: number; members: Array<{ sessionId?: string } & Record<string, unknown>>; tasks: Array<Record<string, unknown>>; messages: Array<Record<string, unknown>>; scheduler?: Record<string, unknown> }
+interface DashboardTeam { id: string; name: string; projectId: string; leadSessionId?: string; status: string; timeCreated: number; timeUpdated: number; members: Array<{ sessionId?: string } & Record<string, unknown>>; tasks: Array<Record<string, unknown>>; groups?: Array<Record<string, unknown>>; messages: Array<Record<string, unknown>>; scheduler?: Record<string, unknown> }
 interface StateResponse { version: number; projects: Array<{ id: string; name: string; path: string; activeTeams: number; workingAgents: number; teams: DashboardTeam[] }>; teams: DashboardTeam[] }
 
 describe("dashboard", () => {
@@ -371,6 +373,23 @@ describe("dashboard", () => {
       expect(body.teams).toHaveLength(2)
     })
 
+    test("adds group metadata and group message summaries without changing the state version", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      insertMember(db, "t1", "broadcast", "sess-broadcast")
+      db.run("INSERT INTO team_group (id, team_id, name, created_by, time_created) VALUES ('g1', 't1', 'broadcast-room', 'alice', 1)")
+      db.run("INSERT INTO team_group_participant (team_id, group_id, participant_name, time_created) VALUES ('t1', 'g1', 'alice', 1)")
+      db.run("INSERT INTO team_group_participant (team_id, group_id, participant_name, time_created) VALUES ('t1', 'g1', 'lead', 1)")
+      db.run("UPDATE team_group SET sealed = 1 WHERE id = 'g1'")
+      db.run("INSERT INTO team_message (id, team_id, from_name, to_name, group_id, content, delivered, time_created) VALUES ('gm1', 't1', 'alice', NULL, 'g1', 'group body', 0, 2)")
+      server = await startDashboard(db, port)
+
+      const body = await (await fetch(`http://localhost:${port}/api/state`)).json() as StateResponse
+      expect(body.version).toBe(2)
+      expect(body.teams[0]!.groups).toEqual([{ id: "g1", name: "broadcast-room", creator: "alice", participants: ["alice", "lead"], createdAt: 1, canSend: true }])
+      expect(body.teams[0]!.messages[0]).toMatchObject({ id: "gm1", groupId: "g1", groupName: "broadcast-room", toName: null })
+    })
+
     test("returns task dependencies as readable id arrays", async () => {
       insertTeam(db, "t1", "alpha", "lead-sess")
       insertTask(db, "t1", "task-1", "Prepare dashboard contracts", "completed", "high")
@@ -434,6 +453,22 @@ describe("dashboard", () => {
       expect(namedBroadcast.messages.map(message => message.id)).toEqual(["msg-named-broadcast"])
       expect(broadcast.messages.map(message => message.id)).toEqual(["msg-broadcast"])
     })
+
+    test("returns authenticated group history without mutating message or scheduler state", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      insertMember(db, "t1", "bob", "sess-b")
+      db.run("INSERT INTO team_group (id, team_id, name, created_by, time_created) VALUES ('g1', 't1', 'architects', 'alice', 1)")
+      for (const name of ["alice", "bob"]) db.run("INSERT INTO team_group_participant (team_id, group_id, participant_name, time_created) VALUES ('t1', 'g1', ?, 1)", [name])
+      db.run("UPDATE team_group SET sealed = 1 WHERE id = 'g1'")
+      db.run("INSERT INTO team_message (id, team_id, from_name, to_name, group_id, content, delivered, read, delivery_state, time_created) VALUES ('gm1', 't1', 'alice', NULL, 'g1', 'group body', 0, 0, 'queued', 2)")
+      const before = db.query("SELECT delivered, read, delivery_state FROM team_message WHERE id = 'gm1'").get()
+      server = await startDashboard(db, port)
+
+      const result = await (await fetch(`http://localhost:${port}/api/teams/t1/messages?channelType=group&group=architects`)).json() as { messages: Array<Record<string, unknown>> }
+      expect(result.messages).toEqual([expect.objectContaining({ id: "gm1", groupId: "g1", groupName: "architects", content: "group body" })])
+      expect(db.query("SELECT delivered, read, delivery_state FROM team_message WHERE id = 'gm1'").get()).toEqual(before)
+    })
   })
 
   describe("POST /api/teams/:teamId/messages", () => {
@@ -492,6 +527,56 @@ describe("dashboard", () => {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to: null, content: "" }),
       })
       expect(empty.status).toBe(400)
+    })
+
+    test("allows lead group posts only when lead is a participant", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      insertMember(db, "t1", "bob", "sess-b")
+      db.run("INSERT INTO team_group (id, team_id, name, created_by, time_created) VALUES ('g1', 't1', 'leaders', 'alice', 1), ('g2', 't1', 'workers', 'alice', 1)")
+      for (const name of ["lead", "alice"]) db.run("INSERT INTO team_group_participant (team_id, group_id, participant_name, time_created) VALUES ('t1', 'g1', ?, 1)", [name])
+      for (const name of ["alice", "bob"]) db.run("INSERT INTO team_group_participant (team_id, group_id, participant_name, time_created) VALUES ('t1', 'g2', ?, 1)", [name])
+      db.run("UPDATE team_group SET sealed = 1 WHERE id IN ('g1', 'g2')")
+      server = await startDashboard(db, port)
+
+      const accepted = await fetch(`http://localhost:${port}/api/teams/t1/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group: "leaders", content: "lead note" }) })
+      expect(accepted.status).toBe(202)
+      const denied = await fetch(`http://localhost:${port}/api/teams/t1/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group: "workers", content: "override" }) })
+      expect(denied.status).toBe(403)
+    })
+
+    test("immediately dispatches accepted lead group posts without awaiting promptAsync", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      insertMember(db, "t1", "bob", "sess-b")
+      db.run("INSERT INTO team_group (id, team_id, name, created_by, time_created) VALUES ('g1', 't1', 'leaders', 'alice', 1)")
+      for (const name of ["lead", "alice", "bob"]) db.run("INSERT INTO team_group_participant (team_id, group_id, participant_name, time_created) VALUES ('t1', 'g1', ?, 1)", [name])
+      db.run("UPDATE team_group SET sealed = 1 WHERE id = 'g1'")
+      const client = mockClient()
+      client.session.promptAsync = options => {
+        client.calls.push({ method: "session.promptAsync", args: [options] })
+        return new Promise(() => {})
+      }
+      const scheduler = new DurableScheduler(db, client, DEFAULT_CONFIG.scheduler, true, "/tmp/test-project")
+      const options = { scheduler }
+      server = await startDashboard(db, port, options)
+
+      const response = await Promise.race([
+        fetch(`http://localhost:${port}/api/teams/t1/messages`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ group: "leaders", content: "dispatch now" }),
+        }),
+        Bun.sleep(2_000).then(() => { throw new Error("dashboard POST awaited promptAsync") }),
+      ])
+      await Bun.sleep(0)
+
+      expect(response.status).toBe(202)
+      const body = await response.json() as { recipientCount: number }
+      expect(body.recipientCount).toBe(2)
+      const dispatches = client.calls.filter(call => call.method === "session.promptAsync")
+      expect(dispatches).toHaveLength(2)
+      expect(dispatches.map(call => (call.args[0] as { sessionID: string }).sessionID).sort()).toEqual(["sess-a", "sess-b"])
     })
   })
 

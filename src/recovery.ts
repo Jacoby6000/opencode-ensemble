@@ -222,7 +222,7 @@ export async function recoverUndeliveredMessages(
      JOIN team t ON t.id = m.team_id
      JOIN team_member tm ON tm.team_id = m.team_id AND tm.name = m.to_name
      WHERE t.status = 'active' AND tm.status IN ('ready', 'busy') AND tm.reported_to_lead = 0
-       AND m.delivery_state = 'queued' AND m.delivered = 0 AND m.to_name IS NOT NULL AND m.to_name <> 'lead'
+        AND m.delivery_state = 'queued' AND m.delivered = 0 AND m.group_id IS NULL AND m.to_name IS NOT NULL AND m.to_name <> 'lead'
        AND NOT EXISTS (SELECT 1 FROM scheduler_message_wake mw WHERE mw.message_id = m.id)
      ORDER BY m.time_created ASC`,
   ).all() as Array<{ id: string; team_id: string; to_name: string; session_id: string; agent: string }>

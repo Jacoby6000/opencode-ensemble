@@ -244,7 +244,7 @@ Build with `bun run build`, then restart OpenCode to pick up changes.
 
 ## Tools
 
-14 tools. The lead has all of them. Teammates get 6 (messaging + tasks).
+14 tools. The lead has all of them. Teammates get 7 (messaging, group inspection, and tasks).
 
 **Team lifecycle** (lead only, except archived-team purge may also be run from the main session)
 
@@ -265,8 +265,10 @@ Archived-team purge is intentionally two-step. First call `team_cleanup` with `p
 | Tool | What it does |
 |------|-------------|
 | `team_message` | Send a direct message to a teammate or the lead. Also handles plan approval/rejection. |
-| `team_broadcast` | Message everyone on the team. |
-| `team_results` | Retrieve full message content (messages to lead are truncated on delivery). |
+| `team_broadcast` | Message everyone, atomically create a named group with immutable participants and its first message, or send to an existing group as a participant. |
+| `team_results` | Retrieve unread ordinary messages, list all team groups, or inspect any group history without changing delivery/read state. |
+
+Named group inboxes are team-scoped routing controls, not private archives. Only participants can send and only active participants receive proactive delivery, while every active ordinary teammate and the lead can inspect group history. The dashboard shows group channels to authenticated users and keeps the composer read-only when the lead is not a participant.
 
 **Task board** (everyone)
 

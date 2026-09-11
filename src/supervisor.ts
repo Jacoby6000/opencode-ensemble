@@ -152,9 +152,10 @@ export function buildSupervisorReviewPrompt(_db: Database, _teamId: string, _gen
     "SELECT id, content, assignee FROM team_task WHERE team_id = ? AND status = 'completed' ORDER BY time_updated DESC LIMIT 10",
   ).all(_teamId) as Array<{ id: string; content: string; assignee: string | null }>
   const messages = _db.query(
-    `SELECT from_name, to_name, content FROM team_message WHERE team_id = ?
-     AND from_name <> ? ORDER BY time_created DESC LIMIT 10`,
-  ).all(_teamId, SUPERVISOR_MEMBER_NAME) as Array<{ from_name: string; to_name: string | null; content: string }>
+    `SELECT m.from_name, m.to_name, m.content, g.name AS group_name FROM team_message m
+     LEFT JOIN team_group g ON g.id = m.group_id WHERE m.team_id = ?
+     AND m.from_name <> ? ORDER BY m.time_created DESC LIMIT 10`,
+  ).all(_teamId, SUPERVISOR_MEMBER_NAME) as Array<{ from_name: string; to_name: string | null; group_name: string | null; content: string }>
   const workers = _db.query(
     `SELECT name, agent, reported_to_lead FROM team_member WHERE team_id = ?
      AND member_kind = 'worker' AND status = 'ready' ORDER BY time_created`,
@@ -166,7 +167,7 @@ export function buildSupervisorReviewPrompt(_db: Database, _teamId: string, _gen
     "Recently completed work:",
     ...completed.map(task => `- ${task.id} ${task.content}${task.assignee ? ` (by ${task.assignee})` : ""}`),
     "Recent team reports/messages:",
-    ...messages.map(message => `- ${message.from_name} -> ${message.to_name ?? "team"}: ${message.content}`),
+    ...messages.map(message => `- ${message.from_name} -> ${message.group_name ? `group:${message.group_name}` : (message.to_name ?? "team")}: ${message.content}`),
     "Eligible workers:",
     ...workers.map(worker => `- ${worker.name} (${worker.agent})${worker.reported_to_lead ? " [reported complete]" : ""}`),
     "Do not mutate tasks or call lifecycle tools. You are read-only.",

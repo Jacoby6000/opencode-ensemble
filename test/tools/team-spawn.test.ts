@@ -871,6 +871,7 @@ describe("team_spawn — agent mode enforcement", () => {
   const TEAM_TOOL_PERMISSIONS = [
     { permission: "team_message", pattern: "*", action: "allow" },
     { permission: "team_broadcast", pattern: "*", action: "allow" },
+    { permission: "team_results", pattern: "*", action: "allow" },
     { permission: "team_tasks_list", pattern: "*", action: "allow" },
     { permission: "team_tasks_add", pattern: "*", action: "allow" },
     { permission: "team_tasks_complete", pattern: "*", action: "allow" },

@@ -10,8 +10,10 @@ import type { ActivityBuffer, ActivityEntry } from "./activity"
 import type { PluginClient } from "./types"
 import { isDashboardAuthorized } from "./dashboard-auth"
 import { queueBroadcastWakes, queueMessageWake } from "./scheduler"
+import type { SchedulerController } from "./scheduler-runtime"
 import { SUPERVISOR_MEMBER_NAME } from "./supervisor"
 import { generateId } from "./util"
+import { listTeamGroups, sendGroupMessage } from "./groups"
 
 /** Loopback address used by the dashboard listener and singleton probe. */
 export const DASHBOARD_HOST = "127.0.0.1"
@@ -82,6 +84,8 @@ interface MessageRow {
   id: string
   from_name: string
   to_name: string | null
+  group_id: string | null
+  group_name: string | null
   content: string
   delivered: number
   read: number
@@ -92,6 +96,8 @@ interface MessageSummaryRow {
   id: string
   from_name: string
   to_name: string | null
+  group_id: string | null
+  group_name: string | null
   content_preview: string
   content_length: number
   delivered: number
@@ -155,7 +161,7 @@ function buildState(db: Database): EnsembleDashboardState {
   const teams = db.query("SELECT id, name, project_id, lead_session_id, status, lead_agent, time_created, time_updated FROM team ORDER BY time_created DESC").all() as TeamRow[]
   const memberStmt = db.query("SELECT name, agent, status, execution_status, session_id, worktree_branch, CASE WHEN prompt IS NOT NULL AND prompt <> '' THEN 1 ELSE 0 END AS has_prompt, model, plan_approval, time_created, time_updated, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message FROM team_member WHERE team_id = ? AND member_kind = 'worker'")
   const taskStmt = db.query("SELECT id, content, status, priority, assignee, depends_on, time_created, time_updated FROM team_task WHERE team_id = ?")
-  const msgStmt = db.query("SELECT id, from_name, to_name, substr(content, 1, 160) AS content_preview, length(content) AS content_length, delivered, read, time_created FROM team_message WHERE team_id = ? ORDER BY time_created DESC, id DESC LIMIT 50")
+  const msgStmt = db.query("SELECT m.id, m.from_name, m.to_name, m.group_id, g.name AS group_name, substr(m.content, 1, 160) AS content_preview, length(m.content) AS content_length, m.delivered, m.read, m.time_created FROM team_message m LEFT JOIN team_group g ON g.id = m.group_id WHERE m.team_id = ? ORDER BY m.time_created DESC, m.id DESC LIMIT 50")
   const schedulerCountsStmt = db.query(`SELECT
     (SELECT COUNT(*) FROM scheduler_identity WHERE team_id = ? AND member_name <> ? AND state = 'active') AS active_identities,
     (SELECT COUNT(*) FROM scheduler_identity WHERE team_id = ? AND member_name <> ? AND state = 'reserved') AS reserved_identities,
@@ -218,10 +224,13 @@ function buildState(db: Database): EnsembleDashboardState {
         timeCreated: tk.time_created,
         timeUpdated: tk.time_updated,
       })),
+      groups: listTeamGroups(db, t.id, "lead"),
       messages: (msgStmt.all(t.id) as MessageSummaryRow[]).map((msg) => ({
         id: msg.id,
         fromName: msg.from_name,
         toName: msg.to_name,
+        groupId: msg.group_id,
+        groupName: msg.group_name,
         preview: msg.content_preview,
         contentLength: msg.content_length,
         delivered: msg.delivered === 1,
@@ -300,6 +309,8 @@ function mapMessage(row: MessageRow) {
     id: row.id,
     fromName: row.from_name,
     toName: row.to_name,
+    groupId: row.group_id,
+    groupName: row.group_name,
     content: row.content,
     delivered: row.delivered === 1,
     read: row.read === 1,
@@ -329,9 +340,12 @@ function handleMessagesRoute(db: Database, teamId: string, url: URL, res: Server
   }
 
   const channel = url.searchParams.get("channel")
-  const broadcastChannel = url.searchParams.get("channelType") === "broadcast"
-  if (channel && broadcastChannel) {
-    sendJson(res, { error: "Choose either a member channel or broadcast channel" }, 400)
+  const channelType = url.searchParams.get("channelType")
+  const broadcastChannel = channelType === "broadcast"
+  const requestedGroup = url.searchParams.get("group")
+  const groupChannel = channelType === "group" ? requestedGroup : null
+  if ((channel && channelType) || (requestedGroup && channelType !== "group") || (channelType === "group" && !groupChannel) || (channelType && channelType !== "broadcast" && channelType !== "group")) {
+    sendJson(res, { error: "Choose exactly one valid member, broadcast, or group channel" }, 400)
     return
   }
   if (channel) {
@@ -341,18 +355,32 @@ function handleMessagesRoute(db: Database, teamId: string, url: URL, res: Server
       return
     }
   }
+  let groupId: string | null = null
+  if (groupChannel) {
+    const group = db.query("SELECT id FROM team_group WHERE team_id = ? AND name = ? AND sealed = 1").get(teamId, groupChannel) as { id: string } | undefined
+    if (!group) {
+      sendJson(res, { error: "Team group not found" }, 404)
+      return
+    }
+    groupId = group.id
+  }
 
-  const rows = (broadcastChannel
+  const select = "SELECT m.id, m.from_name, m.to_name, m.group_id, g.name AS group_name, m.content, m.delivered, m.read, m.time_created FROM team_message m LEFT JOIN team_group g ON g.id = m.group_id"
+  const rows = (groupId
     ? cursor
-      ? db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? AND to_name IS NULL AND (time_created < ? OR (time_created = ? AND id < ?)) ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, cursor.timeCreated, cursor.timeCreated, cursor.id, limit + 1)
-      : db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? AND to_name IS NULL ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, limit + 1)
+      ? db.query(`${select} WHERE m.team_id = ? AND m.group_id = ? AND (m.time_created < ? OR (m.time_created = ? AND m.id < ?)) ORDER BY m.time_created DESC, m.id DESC LIMIT ?`).all(teamId, groupId, cursor.timeCreated, cursor.timeCreated, cursor.id, limit + 1)
+      : db.query(`${select} WHERE m.team_id = ? AND m.group_id = ? ORDER BY m.time_created DESC, m.id DESC LIMIT ?`).all(teamId, groupId, limit + 1)
+    : broadcastChannel
+    ? cursor
+      ? db.query(`${select} WHERE m.team_id = ? AND m.group_id IS NULL AND m.to_name IS NULL AND (m.time_created < ? OR (m.time_created = ? AND m.id < ?)) ORDER BY m.time_created DESC, m.id DESC LIMIT ?`).all(teamId, cursor.timeCreated, cursor.timeCreated, cursor.id, limit + 1)
+      : db.query(`${select} WHERE m.team_id = ? AND m.group_id IS NULL AND m.to_name IS NULL ORDER BY m.time_created DESC, m.id DESC LIMIT ?`).all(teamId, limit + 1)
     : channel
       ? cursor
-        ? db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? AND to_name IS NOT NULL AND (from_name = ? OR to_name = ?) AND (time_created < ? OR (time_created = ? AND id < ?)) ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, channel, channel, cursor.timeCreated, cursor.timeCreated, cursor.id, limit + 1)
-        : db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? AND to_name IS NOT NULL AND (from_name = ? OR to_name = ?) ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, channel, channel, limit + 1)
+        ? db.query(`${select} WHERE m.team_id = ? AND m.group_id IS NULL AND m.to_name IS NOT NULL AND (m.from_name = ? OR m.to_name = ?) AND (m.time_created < ? OR (m.time_created = ? AND m.id < ?)) ORDER BY m.time_created DESC, m.id DESC LIMIT ?`).all(teamId, channel, channel, cursor.timeCreated, cursor.timeCreated, cursor.id, limit + 1)
+        : db.query(`${select} WHERE m.team_id = ? AND m.group_id IS NULL AND m.to_name IS NOT NULL AND (m.from_name = ? OR m.to_name = ?) ORDER BY m.time_created DESC, m.id DESC LIMIT ?`).all(teamId, channel, channel, limit + 1)
       : cursor
-        ? db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? AND (time_created < ? OR (time_created = ? AND id < ?)) ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, cursor.timeCreated, cursor.timeCreated, cursor.id, limit + 1)
-        : db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, limit + 1)) as MessageRow[]
+        ? db.query(`${select} WHERE m.team_id = ? AND (m.time_created < ? OR (m.time_created = ? AND m.id < ?)) ORDER BY m.time_created DESC, m.id DESC LIMIT ?`).all(teamId, cursor.timeCreated, cursor.timeCreated, cursor.id, limit + 1)
+        : db.query(`${select} WHERE m.team_id = ? ORDER BY m.time_created DESC, m.id DESC LIMIT ?`).all(teamId, limit + 1)) as MessageRow[]
 
   const hasNextPage = rows.length > limit
   const page = hasNextPage ? rows.slice(0, limit) : rows
@@ -384,7 +412,13 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   }
 }
 
-async function handleSendMessageRoute(db: Database, teamId: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleSendMessageRoute(
+  db: Database,
+  teamId: string,
+  req: IncomingMessage,
+  res: ServerResponse,
+  scheduler?: SchedulerController,
+): Promise<void> {
   let body: unknown
   try {
     body = await readJsonBody(req)
@@ -405,7 +439,7 @@ async function handleSendMessageRoute(db: Database, teamId: string, req: Incomin
     sendJson(res, { error: "Request body must be an object" }, 400)
     return
   }
-  const input = body as { to?: unknown; content?: unknown }
+  const input = body as { to?: unknown; group?: unknown; content?: unknown }
   if (typeof input.content !== "string" || input.content.trim().length === 0) {
     sendJson(res, { error: "content must be a non-empty string" }, 400)
     return
@@ -415,7 +449,15 @@ async function handleSendMessageRoute(db: Database, teamId: string, req: Incomin
     sendJson(res, { error: "Message content exceeds 10KB limit" }, 413)
     return
   }
-  if (input.to !== null && (typeof input.to !== "string" || input.to.length === 0)) {
+  if (input.group !== undefined && (typeof input.group !== "string" || input.group.length === 0)) {
+    sendJson(res, { error: "group must be a non-empty group name" }, 400)
+    return
+  }
+  if (input.group !== undefined && input.to !== undefined) {
+    sendJson(res, { error: "Choose either a direct/broadcast destination or group" }, 400)
+    return
+  }
+  if (input.group === undefined && input.to !== null && (typeof input.to !== "string" || input.to.length === 0)) {
     sendJson(res, { error: "to must be a team member name or null for broadcast" }, 400)
     return
   }
@@ -426,6 +468,22 @@ async function handleSendMessageRoute(db: Database, teamId: string, req: Incomin
   }
   if (team.status !== "active") {
     sendJson(res, { error: "Team is not active" }, 409)
+    return
+  }
+
+  if (typeof input.group === "string") {
+    try {
+      const sent = sendGroupMessage(db, { teamId, sender: "lead", group: input.group, content })
+      scheduler?.kick()
+      sendJson(res, {
+        message: { id: sent.messageId, fromName: "lead", toName: null, groupId: sent.group.id, groupName: sent.group.name, content, delivered: false, read: false, timeCreated: sent.timeCreated },
+        recipientCount: sent.workerRecipientCount,
+      }, 202)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Group message rejected"
+      const status = /Only participants/.test(message) ? 403 : /eligible recipient/.test(message) ? 409 : /not found/.test(message) ? 404 : 400
+      sendJson(res, { error: message }, status)
+    }
     return
   }
 
@@ -494,6 +552,8 @@ export interface DashboardOptions {
   activityBuffer?: ActivityBuffer
   /** SDK client for on-demand session message retrieval. */
   client?: PluginClient
+  /** Durable scheduler used to dispatch newly accepted group messages immediately. */
+  scheduler?: SchedulerController
 }
 
 function sendJson(res: ServerResponse, data: unknown, status = 200, headers?: Record<string, string>): void {
@@ -667,7 +727,7 @@ async function handleDashboardRequest(
       return
     }
     try {
-      await handleSendMessageRoute(db, teamId, req, res)
+      await handleSendMessageRoute(db, teamId, req, res, options.scheduler)
     } catch {
       if (!res.headersSent) sendJson(res, { error: "Failed to queue message" }, 500)
     }

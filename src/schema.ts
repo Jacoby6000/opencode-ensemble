@@ -312,7 +312,154 @@ export const MIGRATIONS: string[] = [
      quiet_since          INTEGER,
      last_reviewed        INTEGER NOT NULL DEFAULT -1,
      broadcast_generation INTEGER
-   );`,
+    );`,
+  // Migration 15: Durable, immutable, team-scoped group inboxes.
+  `CREATE TABLE team_group (
+     id           TEXT PRIMARY KEY,
+     team_id      TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     name         TEXT NOT NULL,
+     created_by   TEXT NOT NULL,
+     time_created INTEGER NOT NULL,
+     sealed       INTEGER NOT NULL DEFAULT 0 CHECK(sealed IN (0, 1)),
+     UNIQUE(team_id, name),
+     UNIQUE(team_id, id)
+   );
+   CREATE INDEX team_group_team_idx ON team_group(team_id, time_created);
+
+   CREATE TABLE team_group_participant (
+     team_id          TEXT NOT NULL,
+     group_id         TEXT NOT NULL,
+     participant_name TEXT NOT NULL,
+     time_created     INTEGER NOT NULL,
+     PRIMARY KEY(team_id, group_id, participant_name),
+     FOREIGN KEY(team_id, group_id) REFERENCES team_group(team_id, id) ON DELETE CASCADE
+   );
+   CREATE INDEX team_group_participant_member_idx ON team_group_participant(team_id, participant_name, group_id);
+
+   ALTER TABLE team_message ADD COLUMN group_id TEXT REFERENCES team_group(id) ON DELETE CASCADE;
+   CREATE INDEX team_message_group_idx ON team_message(team_id, group_id, time_created DESC, id DESC) WHERE group_id IS NOT NULL;
+
+   CREATE TABLE team_group_message_recipient (
+     message_id      TEXT NOT NULL REFERENCES team_message(id) ON DELETE CASCADE,
+     team_id         TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     recipient_name  TEXT NOT NULL,
+     recipient_kind  TEXT NOT NULL CHECK(recipient_kind IN ('worker', 'lead')),
+     delivery_state  TEXT NOT NULL DEFAULT 'queued'
+                       CHECK(delivery_state IN ('queued', 'wake_queued', 'claimed', 'injected', 'processed', 'failed')),
+     claim_token     TEXT,
+     claimed_at      INTEGER,
+     not_before      INTEGER NOT NULL,
+     attempt_count   INTEGER NOT NULL DEFAULT 0,
+     last_error      TEXT,
+     time_created    INTEGER NOT NULL,
+     time_updated    INTEGER NOT NULL,
+     PRIMARY KEY(message_id, recipient_name)
+   );
+   CREATE UNIQUE INDEX team_group_message_recipient_claim_idx
+     ON team_group_message_recipient(claim_token) WHERE claim_token IS NOT NULL;
+   CREATE INDEX team_group_message_recipient_ready_idx
+     ON team_group_message_recipient(recipient_kind, delivery_state, not_before, time_created);
+   CREATE INDEX team_group_message_recipient_team_idx
+     ON team_group_message_recipient(team_id, delivery_state);
+
+   CREATE TRIGGER team_group_insert_guard
+   BEFORE INSERT ON team_group BEGIN
+     SELECT CASE WHEN length(NEW.name) < 1 OR length(NEW.name) > 64
+       OR NEW.name GLOB '*[^a-z0-9-]*' OR substr(NEW.name, 1, 1) = '-'
+       OR substr(NEW.name, -1, 1) = '-'
+       THEN RAISE(ABORT, 'invalid group name') END;
+     SELECT CASE WHEN NEW.name IN ('lead', 'broadcast', 'all', 'team')
+       THEN RAISE(ABORT, 'reserved group name') END;
+     SELECT CASE WHEN EXISTS (
+       SELECT 1 FROM team_member WHERE team_id = NEW.team_id AND name = NEW.name
+     ) THEN RAISE(ABORT, 'group name collides with worker') END;
+   END;
+   CREATE TRIGGER team_group_immutable
+   BEFORE UPDATE ON team_group
+   WHEN NEW.id <> OLD.id OR NEW.team_id <> OLD.team_id OR NEW.name <> OLD.name
+     OR NEW.created_by <> OLD.created_by OR NEW.time_created <> OLD.time_created
+     OR NOT (OLD.sealed = 0 AND NEW.sealed = 1)
+   BEGIN
+     SELECT RAISE(ABORT, 'group names are immutable');
+   END;
+   CREATE TRIGGER team_group_seal_guard
+   BEFORE UPDATE OF sealed ON team_group WHEN OLD.sealed = 0 AND NEW.sealed = 1 BEGIN
+     SELECT CASE WHEN (SELECT COUNT(*) FROM team_group_participant p
+       WHERE p.team_id = OLD.team_id AND p.group_id = OLD.id) < 2
+       THEN RAISE(ABORT, 'group requires at least two participants') END;
+     SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM team_group_participant p
+       WHERE p.team_id = OLD.team_id AND p.group_id = OLD.id AND p.participant_name = OLD.created_by)
+       THEN RAISE(ABORT, 'group creator must be a participant') END;
+   END;
+   CREATE TRIGGER team_group_delete_guard
+   BEFORE DELETE ON team_group
+   WHEN EXISTS (SELECT 1 FROM team WHERE id = OLD.team_id)
+   BEGIN
+     SELECT RAISE(ABORT, 'group deletion is not supported');
+   END;
+   CREATE TRIGGER team_group_participant_insert_guard
+   BEFORE INSERT ON team_group_participant BEGIN
+     SELECT CASE WHEN NOT EXISTS (
+       SELECT 1 FROM team_group g WHERE g.team_id = NEW.team_id AND g.id = NEW.group_id AND g.sealed = 0
+     ) THEN RAISE(ABORT, 'group membership is immutable or belongs to another team') END;
+     SELECT CASE WHEN NEW.participant_name <> 'lead' AND NOT EXISTS (
+       SELECT 1 FROM team_member m WHERE m.team_id = NEW.team_id AND m.name = NEW.participant_name
+         AND m.member_kind = 'worker' AND m.status IN ('ready', 'busy')
+     ) THEN RAISE(ABORT, 'group participant is not an active worker') END;
+   END;
+   CREATE TRIGGER team_group_participant_immutable_update
+   BEFORE UPDATE ON team_group_participant BEGIN
+     SELECT RAISE(ABORT, 'group membership is immutable');
+   END;
+   CREATE TRIGGER team_group_participant_immutable_delete
+   BEFORE DELETE ON team_group_participant
+   WHEN EXISTS (SELECT 1 FROM team_group WHERE id = OLD.group_id)
+   BEGIN
+     SELECT RAISE(ABORT, 'group membership is immutable');
+   END;
+   CREATE TRIGGER team_member_group_name_insert_guard
+   BEFORE INSERT ON team_member WHEN NEW.member_kind = 'worker' BEGIN
+     SELECT CASE WHEN EXISTS (
+       SELECT 1 FROM team_group WHERE team_id = NEW.team_id AND name = NEW.name
+     ) THEN RAISE(ABORT, 'worker name collides with group') END;
+   END;
+   CREATE TRIGGER team_member_group_name_update_guard
+   BEFORE UPDATE OF name, member_kind ON team_member WHEN NEW.member_kind = 'worker' BEGIN
+     SELECT CASE WHEN EXISTS (
+       SELECT 1 FROM team_group WHERE team_id = NEW.team_id AND name = NEW.name
+     ) THEN RAISE(ABORT, 'worker name collides with group') END;
+   END;
+   CREATE TRIGGER team_message_destination_insert_guard
+   BEFORE INSERT ON team_message BEGIN
+     SELECT CASE WHEN NEW.group_id IS NOT NULL AND NEW.to_name IS NOT NULL
+       THEN RAISE(ABORT, 'message has multiple destinations') END;
+     SELECT CASE WHEN NEW.group_id IS NOT NULL AND NOT EXISTS (
+       SELECT 1 FROM team_group g WHERE g.id = NEW.group_id AND g.team_id = NEW.team_id AND g.sealed = 1
+     ) THEN RAISE(ABORT, 'message group belongs to another team') END;
+   END;
+   CREATE TRIGGER team_message_destination_update_guard
+   BEFORE UPDATE OF team_id, to_name, group_id ON team_message BEGIN
+     SELECT CASE WHEN NEW.group_id IS NOT NULL AND NEW.to_name IS NOT NULL
+       THEN RAISE(ABORT, 'message has multiple destinations') END;
+     SELECT CASE WHEN NEW.group_id IS NOT NULL AND NOT EXISTS (
+       SELECT 1 FROM team_group g WHERE g.id = NEW.group_id AND g.team_id = NEW.team_id AND g.sealed = 1
+     ) THEN RAISE(ABORT, 'message group belongs to another team') END;
+   END;
+   CREATE TRIGGER team_group_message_recipient_insert_guard
+   BEFORE INSERT ON team_group_message_recipient BEGIN
+     SELECT CASE WHEN NOT EXISTS (
+       SELECT 1 FROM team_message m
+       JOIN team_group_participant p ON p.team_id = m.team_id AND p.group_id = m.group_id
+       WHERE m.id = NEW.message_id AND m.team_id = NEW.team_id AND m.group_id IS NOT NULL
+         AND p.participant_name = NEW.recipient_name
+     ) THEN RAISE(ABORT, 'group recipient does not match message destination') END;
+     SELECT CASE WHEN (NEW.recipient_kind = 'lead') <> (NEW.recipient_name = 'lead')
+       THEN RAISE(ABORT, 'group recipient kind mismatch') END;
+     SELECT CASE WHEN NEW.recipient_kind = 'worker' AND NOT EXISTS (
+       SELECT 1 FROM team_member m WHERE m.team_id = NEW.team_id AND m.name = NEW.recipient_name
+         AND m.member_kind = 'worker' AND m.status IN ('ready', 'busy') AND m.reported_to_lead = 0
+     ) THEN RAISE(ABORT, 'group worker recipient is not eligible') END;
+   END;`,
 ]
 
 /**

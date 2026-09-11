@@ -104,6 +104,16 @@ describe("dashboard UI contract", () => {
     expect(DASHBOARD_JS_CORE).toContain("Bearer ")
   })
 
+  test("group channels are collision-safe and nonmember lead composition is read-only", () => {
+    expect(DASHBOARD_JS_CORE).toContain("function channelParts")
+    expect(DASHBOARD_JS_RENDER).toContain("'member:'+m.name")
+    expect(DASHBOARD_JS_RENDER).toContain("'group:'+g.name")
+    expect(DASHBOARD_JS_RENDER).toContain("Groups")
+    expect(DASHBOARD_JS_RENDER).toContain("Read-only: lead is not a group participant.")
+    expect(DASHBOARD_JS_RENDER).toContain("text.disabled=unavailable")
+    expect(DASHBOARD_JS_EVENTS).toContain("{group:cp.name,content:content}")
+  })
+
   test("clears a fragment token even when session storage is unavailable", () => {
     const replacements: string[] = []
     const evaluate = new Function(
