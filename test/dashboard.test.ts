@@ -367,6 +367,84 @@ describe("dashboard", () => {
       const res = await fetch(`http://localhost:${port}/api/teams/t1/messages?limit=51`)
       expect(res.status).toBe(400)
     })
+
+    test("filters direct and broadcast conversation channels", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      insertMember(db, "t1", "broadcast", "sess-broadcast")
+      insertMessage(db, "t1", "msg-direct", "lead", "alice", "Direct body")
+      insertMessage(db, "t1", "msg-reply", "alice", "lead", "Reply body")
+      insertMessage(db, "t1", "msg-named-broadcast", "lead", "broadcast", "Direct to named member")
+      insertMessage(db, "t1", "msg-broadcast", "lead", null, "Broadcast body")
+      server = await startDashboard(db, port)
+
+      const direct = await (await fetch(`http://localhost:${port}/api/teams/t1/messages?channel=alice`)).json() as { messages: Array<{ id: string }> }
+      const namedBroadcast = await (await fetch(`http://localhost:${port}/api/teams/t1/messages?channel=broadcast`)).json() as { messages: Array<{ id: string }> }
+      const broadcast = await (await fetch(`http://localhost:${port}/api/teams/t1/messages?channelType=broadcast`)).json() as { messages: Array<{ id: string }> }
+
+      expect(direct.messages.map(message => message.id).sort()).toEqual(["msg-direct", "msg-reply"])
+      expect(namedBroadcast.messages.map(message => message.id)).toEqual(["msg-named-broadcast"])
+      expect(broadcast.messages.map(message => message.id)).toEqual(["msg-broadcast"])
+    })
+  })
+
+  describe("POST /api/teams/:teamId/messages", () => {
+    test("queues a direct dashboard message durably for the selected team", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      server = await startDashboard(db, port)
+
+      const res = await fetch(`http://localhost:${port}/api/teams/t1/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: "alice", content: "Please inspect the failure." }),
+      })
+
+      expect(res.status).toBe(202)
+      const body = await res.json() as { message: { id: string; fromName: string; toName: string; content: string } }
+      expect(body.message).toMatchObject({ fromName: "lead", toName: "alice", content: "Please inspect the failure." })
+      expect(db.query("SELECT team_id, from_name, to_name, content FROM team_message WHERE id = ?").get(body.message.id)).toEqual({
+        team_id: "t1", from_name: "lead", to_name: "alice", content: "Please inspect the failure.",
+      })
+      expect(db.query("SELECT COUNT(*) AS count FROM scheduler_message_wake WHERE message_id = ?").get(body.message.id)).toEqual({ count: 1 })
+    })
+
+    test("queues one broadcast with independent recipient deliveries", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      insertMember(db, "t1", "bob", "sess-b")
+      server = await startDashboard(db, port)
+
+      const res = await fetch(`http://localhost:${port}/api/teams/t1/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: null, content: "Status check." }),
+      })
+
+      expect(res.status).toBe(202)
+      const body = await res.json() as { message: { id: string; toName: null }; recipientCount: number }
+      expect(body.recipientCount).toBe(2)
+      expect(body.message.toName).toBeNull()
+      expect(db.query("SELECT COUNT(*) AS count FROM scheduler_message_wake WHERE message_id = ?").get(body.message.id)).toEqual({ count: 2 })
+    })
+
+    test("rejects malformed, cross-team, and unschedulable recipients", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertTeam(db, "t2", "beta", "lead-other")
+      insertMember(db, "t2", "alice", "sess-other")
+      server = await startDashboard(db, port)
+
+      const wrongContentType = await fetch(`http://localhost:${port}/api/teams/t1/messages`, { method: "POST", body: "{}" })
+      expect(wrongContentType.status).toBe(415)
+      const crossTeam = await fetch(`http://localhost:${port}/api/teams/t1/messages`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to: "alice", content: "hello" }),
+      })
+      expect(crossTeam.status).toBe(404)
+      const empty = await fetch(`http://localhost:${port}/api/teams/t1/messages`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to: null, content: "" }),
+      })
+      expect(empty.status).toBe(400)
+    })
   })
 
   describe("GET /api/teams/:teamId/members/:memberName", () => {
@@ -409,7 +487,7 @@ describe("dashboard", () => {
       expect(res.status).toBe(404)
     })
 
-    test("rejects non-GET methods", async () => {
+    test("rejects unsupported methods", async () => {
       server = await startDashboard(db, port)
       const res = await fetch(`http://localhost:${port}/api/state`, { method: "POST" })
       expect(res.status).toBe(405)

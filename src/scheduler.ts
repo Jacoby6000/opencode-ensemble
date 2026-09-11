@@ -116,10 +116,14 @@ export function getWakePayload(_db: Database, _wakeId: string): WakePayload | un
 }
 
 /** Find the current active or fenced run for an external session. */
-export function findRunBySession(_db: Database, _sessionId: string): SchedulerRun | undefined {
-  const run = _db.query(
-    "SELECT id, wake_id, team_id, member_name, session_id, state, injected_at, expires_at FROM scheduler_run_lease WHERE session_id = ? AND state IN ('active', 'expired') ORDER BY acquired_at DESC LIMIT 1",
-  ).get(_sessionId) as { id: string; wake_id: string; team_id: string; member_name: string; session_id: string; state: "active" | "expired"; injected_at: number | null; expires_at: number } | undefined
+export function findRunBySession(_db: Database, _sessionId: string, projectId?: string): SchedulerRun | undefined {
+  const run = (projectId
+    ? _db.query(
+      "SELECT l.id, l.wake_id, l.team_id, l.member_name, l.session_id, l.state, l.injected_at, l.expires_at FROM scheduler_run_lease l JOIN team t ON t.id = l.team_id WHERE l.session_id = ? AND t.project_id = ? AND l.state IN ('active', 'expired') ORDER BY l.acquired_at DESC LIMIT 1",
+    ).get(_sessionId, projectId)
+    : _db.query(
+      "SELECT id, wake_id, team_id, member_name, session_id, state, injected_at, expires_at FROM scheduler_run_lease WHERE session_id = ? AND state IN ('active', 'expired') ORDER BY acquired_at DESC LIMIT 1",
+    ).get(_sessionId)) as { id: string; wake_id: string; team_id: string; member_name: string; session_id: string; state: "active" | "expired"; injected_at: number | null; expires_at: number } | undefined
   if (!run) return undefined
   return {
     leaseId: run.id,
@@ -194,11 +198,15 @@ interface ExpiredLeaseRow {
 }
 
 /** List queued wakes whose delay has elapsed, oldest first. */
-export function listReadyWakes(db: Database, now = Date.now(), limit = 50): ReadyWake[] {
+export function listReadyWakes(db: Database, now = Date.now(), limit = 50, projectId?: string): ReadyWake[] {
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("Ready wake limit must be an integer from 1 to 100")
-  const rows = db.query(
-    "SELECT id, team_id, member_name, session_id, agent, reason, attempt_count FROM scheduler_wake WHERE state = 'queued' AND not_before <= ? ORDER BY time_created ASC, id ASC LIMIT ?",
-  ).all(now, limit) as Array<{ id: string; team_id: string; member_name: string; session_id: string; agent: string; reason: string; attempt_count: number }>
+  const rows = (projectId
+    ? db.query(
+      "SELECT w.id, w.team_id, w.member_name, w.session_id, w.agent, w.reason, w.attempt_count FROM scheduler_wake w JOIN team t ON t.id = w.team_id WHERE w.state = 'queued' AND w.not_before <= ? AND t.project_id = ? ORDER BY w.time_created ASC, w.id ASC LIMIT ?",
+    ).all(now, projectId, limit)
+    : db.query(
+      "SELECT id, team_id, member_name, session_id, agent, reason, attempt_count FROM scheduler_wake WHERE state = 'queued' AND not_before <= ? ORDER BY time_created ASC, id ASC LIMIT ?",
+    ).all(now, limit)) as Array<{ id: string; team_id: string; member_name: string; session_id: string; agent: string; reason: string; attempt_count: number }>
   return rows.map(row => ({
     id: row.id,
     teamId: row.team_id,
@@ -225,9 +233,9 @@ export function markRunInjected(db: Database, leaseId: string, now = Date.now())
 }
 
 /** Release a run lease and complete or fail its wake and linked messages. */
-export function finishRun(db: Database, leaseId: string, outcome: "processed" | "failed", error?: string, now = Date.now()): boolean {
+export function finishRun(db: Database, leaseId: string, outcome: "processed" | "failed", error?: string, now = Date.now(), projectId?: string): boolean {
   return immediateTransaction(db, () => {
-    expireStaleRunsInTransaction(db, now)
+    expireStaleRunsInTransaction(db, now, projectId)
     const lease = db.query(
       "SELECT wake_id, team_id, member_name FROM scheduler_run_lease WHERE id = ? AND state = 'active' AND expires_at > ?",
     ).get(leaseId, now) as { wake_id: string; team_id: string; member_name: string } | undefined
@@ -252,8 +260,8 @@ export function finishRun(db: Database, leaseId: string, outcome: "processed" | 
 }
 
 /** Fence stale run leases pending external-session reconciliation. */
-export function expireStaleRuns(db: Database, now = Date.now()): number {
-  return immediateTransaction(db, () => expireStaleRunsInTransaction(db, now))
+export function expireStaleRuns(db: Database, now = Date.now(), projectId?: string): number {
+  return immediateTransaction(db, () => expireStaleRunsInTransaction(db, now, projectId))
 }
 
 /** Persist a message and its wake request in one immediate transaction. */
@@ -292,14 +300,14 @@ export function queueBroadcastWakes(db: Database, input: QueueBroadcastWakesInpu
 }
 
 /** Renew an owned active lease before its expiry. */
-export function renewRunLease(db: Database, leaseId: string, leaseTtlMs: number, now = Date.now()): boolean {
+export function renewRunLease(db: Database, leaseId: string, leaseTtlMs: number, now = Date.now(), projectId?: string): boolean {
   if (!Number.isFinite(leaseTtlMs) || leaseTtlMs <= 0) throw new Error("Lease TTL must be positive")
   return immediateTransaction(db, () => {
     const lease = db.query(
       "SELECT wake_id, team_id, member_name FROM scheduler_run_lease WHERE id = ? AND state = 'active' AND expires_at > ?",
     ).get(leaseId, now) as { wake_id: string; team_id: string; member_name: string } | undefined
     if (!lease) {
-      expireStaleRunsInTransaction(db, now)
+      expireStaleRunsInTransaction(db, now, projectId)
       return false
     }
     db.run("UPDATE scheduler_run_lease SET expires_at = ? WHERE id = ? AND state = 'active'", [now + leaseTtlMs, leaseId])
@@ -315,9 +323,10 @@ export function reconcileExpiredRun(
   outcome: "requeue" | "processed" | "failed",
   error?: string,
   now = Date.now(),
+  projectId?: string,
 ): boolean {
   return immediateTransaction(db, () => {
-    expireStaleRunsInTransaction(db, now)
+    expireStaleRunsInTransaction(db, now, projectId)
     const lease = db.query(
       "SELECT l.wake_id, l.team_id, l.member_name, w.coalesce_key FROM scheduler_run_lease l JOIN scheduler_wake w ON w.id = l.wake_id WHERE l.id = ? AND l.state = 'expired'",
     ).get(leaseId) as { wake_id: string; team_id: string; member_name: string; coalesce_key: string } | undefined
@@ -355,10 +364,14 @@ export function reconcileExpiredRun(
   })
 }
 
-function expireStaleRunsInTransaction(db: Database, now: number): number {
-  const expired = db.query(
-    "SELECT id, wake_id, team_id, member_name FROM scheduler_run_lease WHERE state = 'active' AND expires_at <= ?",
-  ).all(now) as ExpiredLeaseRow[]
+function expireStaleRunsInTransaction(db: Database, now: number, projectId?: string): number {
+  const expired = (projectId
+    ? db.query(
+      "SELECT l.id, l.wake_id, l.team_id, l.member_name FROM scheduler_run_lease l JOIN team t ON t.id = l.team_id WHERE l.state = 'active' AND l.expires_at <= ? AND t.project_id = ?",
+    ).all(now, projectId)
+    : db.query(
+      "SELECT id, wake_id, team_id, member_name FROM scheduler_run_lease WHERE state = 'active' AND expires_at <= ?",
+    ).all(now)) as ExpiredLeaseRow[]
   expired.forEach(lease => {
     db.run("UPDATE scheduler_run_lease SET state = 'expired' WHERE id = ? AND state = 'active'", [lease.id])
     recordEvent(db, { teamId: lease.team_id, memberName: lease.member_name, wakeId: lease.wake_id, leaseId: lease.id, type: "lease_expired", now })
@@ -569,11 +582,12 @@ export function tryAcquireRun(
   limits: SchedulerRunLimits,
   leaseTtlMs: number,
   now = Date.now(),
+  projectId?: string,
 ): AcquireRunResult {
   if (!Number.isFinite(leaseTtlMs) || leaseTtlMs <= 0) throw new Error("Lease TTL must be positive")
 
   return immediateTransaction(db, () => {
-    expireStaleRunsInTransaction(db, now)
+    expireStaleRunsInTransaction(db, now, projectId)
 
     const wake = db.query(
       "SELECT id, team_id, member_name, session_id, agent, state, not_before FROM scheduler_wake WHERE id = ?",

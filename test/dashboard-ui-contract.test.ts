@@ -63,6 +63,15 @@ describe("dashboard UI contract", () => {
     expect(DASHBOARD_JS_EVENTS).toContain("function selectTeam")
   })
 
+  test("header exposes a project-grouped team switcher", () => {
+    expect(DASHBOARD_HEAD).toContain('id="team-switcher"')
+    expect(DASHBOARD_HEAD).toContain('aria-label="Switch team"')
+    expect(DASHBOARD_HEAD).toContain('onchange="selectTeam(this.value)"')
+    expect(DASHBOARD_JS_RENDER).toContain("function rTeamSwitcher")
+    expect(DASHBOARD_JS_RENDER).toContain("<optgroup")
+    expect(DASHBOARD_JS_EVENTS).toContain("rTeamSwitcher(t)")
+  })
+
   test("project navigation can collapse", () => {
     expect(DASHBOARD_HEAD).not.toContain('<button id="nav-toggle"')
     expect(DASHBOARD_HEAD).toContain('id="project-rail"')
@@ -249,5 +258,34 @@ describe("dashboard UI contract", () => {
     expect(DASHBOARD_JS_RENDER).toContain("text")
     expect(DASHBOARD_JS_RENDER).toContain("prompt")
     expect(DASHBOARD_JS_RENDER).toContain("response")
+  })
+
+  test("exposes overview and comprehensive conversation views", () => {
+    expect(DASHBOARD_HEAD).toContain('data-view="overview"')
+    expect(DASHBOARD_HEAD).toContain('data-view="conversations"')
+    expect(DASHBOARD_HEAD).toContain('id="conversation-view"')
+    expect(DASHBOARD_HEAD).toContain('id="conversation-channels"')
+    expect(DASHBOARD_HEAD).toContain('id="conversation-history"')
+    expect(DASHBOARD_HEAD).toContain('id="conversation-compose"')
+    expect(DASHBOARD_JS_RENDER).toContain("function rConversations")
+    expect(DASHBOARD_JS_EVENTS).toContain("function selectView")
+  })
+
+  test("supports direct and broadcast channels with authenticated composition", () => {
+    expect(DASHBOARD_JS_RENDER).toContain("Broadcast mailbox")
+    expect(DASHBOARD_JS_RENDER).toContain("Send broadcast")
+    expect(DASHBOARD_JS_RENDER).toContain("Send message")
+    expect(DASHBOARD_JS_EVENTS).toContain("function sendConversationMessage")
+    expect(DASHBOARD_JS_EVENTS).toContain("method:'POST'")
+    expect(DASHBOARD_JS_EVENTS).toContain("apiFetch('api/teams/'")
+  })
+
+  test("persists deep-linkable team, member, and view state", () => {
+    expect(DASHBOARD_JS_CORE).toContain("URLSearchParams(location.search)")
+    expect(DASHBOARD_JS_EVENTS).toContain("function syncLocation")
+    expect(DASHBOARD_JS_EVENTS).toContain("popstate")
+    expect(DASHBOARD_JS_EVENTS).toContain("view")
+    expect(DASHBOARD_JS_EVENTS).toContain("team")
+    expect(DASHBOARD_JS_EVENTS).toContain("member")
   })
 })

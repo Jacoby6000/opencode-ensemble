@@ -50,6 +50,7 @@ export class DurableScheduler implements SchedulerController {
     private readonly client: PluginClient,
     private readonly config: ResolvedEnsembleConfig["scheduler"],
     private readonly dispatchEnabled = true,
+    private readonly projectId?: string,
   ) {}
 
   kick(): void {
@@ -63,24 +64,24 @@ export class DurableScheduler implements SchedulerController {
   }
 
   onSessionStatus(sessionId: string, status: "idle" | "busy" | "retry", retryAt?: number): void {
-    const run = findRunBySession(this.db, sessionId)
+    const run = findRunBySession(this.db, sessionId, this.projectId)
     if (!run) return
     const now = Date.now()
     if (status === "busy" || status === "retry") {
       if (run.state === "active") {
         markRunInjected(this.db, run.leaseId, now)
         const retryExtension = retryAt && retryAt > now ? retryAt - now + this.config.leaseTtlMs : this.config.leaseTtlMs
-        renewRunLease(this.db, run.leaseId, retryExtension, now)
+        renewRunLease(this.db, run.leaseId, retryExtension, now, this.projectId)
       }
       return
     }
     if (run.state === "expired") {
-      reconcileExpiredRun(this.db, run.leaseId, run.injectedAt === null ? "requeue" : "processed", undefined, now)
+      reconcileExpiredRun(this.db, run.leaseId, run.injectedAt === null ? "requeue" : "processed", undefined, now, this.projectId)
       this.kick()
       return
     }
     if (run.injectedAt !== null) {
-      finishRun(this.db, run.leaseId, "processed", undefined, now)
+      finishRun(this.db, run.leaseId, "processed", undefined, now, this.projectId)
       this.kick()
     }
   }
@@ -89,17 +90,21 @@ export class DurableScheduler implements SchedulerController {
     if (this.maintenanceRunning) return
     this.maintenanceRunning = true
     try {
-      expireStaleRuns(this.db)
-      const sessions = this.db.query(
-        "SELECT DISTINCT session_id FROM scheduler_run_lease WHERE state IN ('active', 'expired')",
-      ).all() as Array<{ session_id: string }>
+      expireStaleRuns(this.db, Date.now(), this.projectId)
+      const sessions = (this.projectId
+        ? this.db.query(
+          "SELECT DISTINCT l.session_id FROM scheduler_run_lease l JOIN team t ON t.id = l.team_id WHERE l.state IN ('active', 'expired') AND t.project_id = ?",
+        ).all(this.projectId)
+        : this.db.query(
+          "SELECT DISTINCT session_id FROM scheduler_run_lease WHERE state IN ('active', 'expired')",
+        ).all()) as Array<{ session_id: string }>
       if (sessions.length === 0) return
       const timeoutMs = Math.min(5_000, Math.max(1, this.config.leaseTtlMs))
       const statusResult = await settleWithin(this.client.session.status(), timeoutMs)
       if (statusResult.state !== "fulfilled") {
         const detail = statusResult.state === "timed_out" ? "timed out" : statusResult.error instanceof Error ? statusResult.error.message : String(statusResult.error)
         log(`scheduler:reconcile:status-failed err=${detail}`)
-        expireStaleRuns(this.db)
+        expireStaleRuns(this.db, Date.now(), this.projectId)
         return
       }
       const statuses = statusResult.value.data ?? {}
@@ -109,17 +114,17 @@ export class DurableScheduler implements SchedulerController {
           this.onSessionStatus(sessionId, status)
           return
         }
-        const run = findRunBySession(this.db, sessionId)
+        const run = findRunBySession(this.db, sessionId, this.projectId)
         if (!run) return
         if (run.state === "active") return
         const getResult = await settleWithin(this.client.session.get({ sessionID: sessionId }), timeoutMs)
         if (getResult.state === "fulfilled") {
           if (run.state === "expired") {
-            reconcileExpiredRun(this.db, run.leaseId, run.injectedAt === null ? "requeue" : "processed")
+            reconcileExpiredRun(this.db, run.leaseId, run.injectedAt === null ? "requeue" : "processed", undefined, Date.now(), this.projectId)
           } else if (run.injectedAt === null) {
             requeueRun(this.db, run.leaseId, "recovered before injection", 0)
           } else {
-            finishRun(this.db, run.leaseId, "processed")
+            finishRun(this.db, run.leaseId, "processed", undefined, Date.now(), this.projectId)
           }
           return
         }
@@ -159,12 +164,12 @@ export class DurableScheduler implements SchedulerController {
 
   private drain(): void {
     const now = Date.now()
-    for (const wake of listReadyWakes(this.db, now)) {
-      const acquired = tryAcquireRun(this.db, wake.id, this.config.runLimits, this.config.leaseTtlMs, now)
+    for (const wake of listReadyWakes(this.db, now, 50, this.projectId)) {
+      const acquired = tryAcquireRun(this.db, wake.id, this.config.runLimits, this.config.leaseTtlMs, now, this.projectId)
       if (!acquired.acquired) continue
       const payload = getWakePayload(this.db, wake.id)
       if (!payload) {
-        finishRun(this.db, acquired.leaseId, "failed", "wake payload missing", now)
+        finishRun(this.db, acquired.leaseId, "failed", "wake payload missing", now, this.projectId)
         continue
       }
       const parts = [payload.prompt, ...payload.messages.map(message => `[Team message from ${message.fromName}]: ${message.content}`)]

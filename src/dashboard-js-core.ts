@@ -1,10 +1,12 @@
 /** Dashboard JS — utilities, data helpers, and state management. */
 export const DASHBOARD_JS_CORE = `
-let S=null,selId=null,selProjectId=null,fails=0,pollT=Date.now(),prevMC=0,selCard=-1,navCollapsed=false,verbose=(function(){try{return localStorage.getItem('ensemble-verbose')==='1'}catch(e){return false}})(),drawerActivity=null,drawerSession=null;
+const initialQuery=new URLSearchParams(location.search);
+let S=null,selId=initialQuery.get('team'),selProjectId=initialQuery.get('project'),selectedView=initialQuery.get('view')==='conversations'?'conversations':'overview',selectedChannel=initialQuery.get('member')||'@broadcast',fails=0,pollT=Date.now(),prevMC=0,selCard=-1,navCollapsed=false,verbose=(function(){try{return localStorage.getItem('ensemble-verbose')==='1'}catch(e){return false}})(),drawerActivity=null,drawerSession=null,conversationSending=false,conversationError='';
 const expCards=new Set(),expMsgs=new Set();
 const dashboardToken=(function(){let t='';try{t=new URLSearchParams(location.hash.slice(1)).get('token')||''}catch(e){}if(t){try{sessionStorage.setItem('ensemble-dashboard-token',t)}catch(e){}try{history.replaceState(null,'',location.pathname+location.search)}catch(e){}return t}try{return sessionStorage.getItem('ensemble-dashboard-token')||''}catch(e){return ''}})();
 function apiFetch(url,options){const o=options||{},h=new Headers(o.headers||{});if(dashboardToken)h.set('Authorization','Bearer '+dashboardToken);return fetch(url,{...o,headers:h}).then(function(r){if(!r.ok)throw new Error('Dashboard API request failed: '+r.status);return r})}
 const fullMessageBodies=new Map(),teamMessageLoads=new Map(),fullMemberPrompts=new Map(),loadedMemberPrompts=new Set(),memberPromptLoads=new Map();
+const conversationPages=new Map(),conversationLoads=new Map();
 function messageContent(m){return fullMessageBodies.get(m.id)||m.preview||''}
 function memberPromptKey(teamId,memberName){return teamId+'\\n'+memberName}
 function memberPrompt(teamId,memberName){return fullMemberPrompts.get(memberPromptKey(teamId,memberName))||''}
@@ -18,6 +20,15 @@ async function ensureMemberPrompt(teamId,memberName){
   if(memberPromptLoads.has(key))return memberPromptLoads.get(key);
   const request=apiFetch('api/teams/'+encodeURIComponent(teamId)+'/members/'+encodeURIComponent(memberName)).then(r=>r.json()).then(data=>{fullMemberPrompts.set(key,data.prompt||'');loadedMemberPrompts.add(key)}).finally(()=>memberPromptLoads.delete(key));
   memberPromptLoads.set(key,request);return request;
+}
+function conversationKey(teamId,channel){return teamId+'\\n'+channel}
+async function ensureConversation(teamId,channel,older){
+  const key=conversationKey(teamId,channel),current=conversationPages.get(key),cursor=older&&current?current.nextCursor:null;
+  if(current&&!older)return current;if(conversationLoads.has(key))return conversationLoads.get(key);
+  var url='api/teams/'+encodeURIComponent(teamId)+'/messages?limit=50&'+(channel==='@broadcast'?'channelType=broadcast':'channel='+encodeURIComponent(channel));
+  if(cursor)url+='&cursor='+encodeURIComponent(cursor);
+  const request=apiFetch(url).then(r=>r.json()).then(data=>{const prior=older&&current?current.messages:[];const seen=new Set(prior.map(m=>m.id));const messages=prior.concat((data.messages||[]).filter(m=>!seen.has(m.id)));const page={messages:messages,nextCursor:data.nextCursor||null};conversationPages.set(key,page);messages.forEach(m=>fullMessageBodies.set(m.id,m.content||''));return page}).finally(()=>conversationLoads.delete(key));
+  conversationLoads.set(key,request);return request;
 }
 const E=s=>s?String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):'';
 const D=ms=>{const s=Math.floor(Math.abs(ms)/1000);return s<60?s+'s':s<3600?Math.floor(s/60)+'m':Math.floor(s/3600)+'h'};

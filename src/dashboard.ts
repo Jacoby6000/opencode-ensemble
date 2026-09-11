@@ -9,6 +9,8 @@ import { log } from "./log"
 import type { ActivityBuffer, ActivityEntry } from "./activity"
 import type { PluginClient } from "./types"
 import { isDashboardAuthorized } from "./dashboard-auth"
+import { queueBroadcastWakes, queueMessageWake } from "./scheduler"
+import { generateId } from "./util"
 
 /** Loopback address used by the dashboard listener and singleton probe. */
 export const DASHBOARD_HOST = "127.0.0.1"
@@ -316,9 +318,31 @@ function handleMessagesRoute(db: Database, teamId: string, url: URL, res: Server
     return
   }
 
-  const rows = (cursor
-    ? db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? AND (time_created < ? OR (time_created = ? AND id < ?)) ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, cursor.timeCreated, cursor.timeCreated, cursor.id, limit + 1)
-    : db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, limit + 1)) as MessageRow[]
+  const channel = url.searchParams.get("channel")
+  const broadcastChannel = url.searchParams.get("channelType") === "broadcast"
+  if (channel && broadcastChannel) {
+    sendJson(res, { error: "Choose either a member channel or broadcast channel" }, 400)
+    return
+  }
+  if (channel) {
+    const member = db.query("SELECT 1 FROM team_member WHERE team_id = ? AND name = ?").get(teamId, channel)
+    if (!member) {
+      sendJson(res, { error: "Team member not found" }, 404)
+      return
+    }
+  }
+
+  const rows = (broadcastChannel
+    ? cursor
+      ? db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? AND to_name IS NULL AND (time_created < ? OR (time_created = ? AND id < ?)) ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, cursor.timeCreated, cursor.timeCreated, cursor.id, limit + 1)
+      : db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? AND to_name IS NULL ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, limit + 1)
+    : channel
+      ? cursor
+        ? db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? AND to_name IS NOT NULL AND (from_name = ? OR to_name = ?) AND (time_created < ? OR (time_created = ? AND id < ?)) ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, channel, channel, cursor.timeCreated, cursor.timeCreated, cursor.id, limit + 1)
+        : db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? AND to_name IS NOT NULL AND (from_name = ? OR to_name = ?) ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, channel, channel, limit + 1)
+      : cursor
+        ? db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? AND (time_created < ? OR (time_created = ? AND id < ?)) ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, cursor.timeCreated, cursor.timeCreated, cursor.id, limit + 1)
+        : db.query("SELECT id, from_name, to_name, content, delivered, read, time_created FROM team_message WHERE team_id = ? ORDER BY time_created DESC, id DESC LIMIT ?").all(teamId, limit + 1)) as MessageRow[]
 
   const hasNextPage = rows.length > limit
   const page = hasNextPage ? rows.slice(0, limit) : rows
@@ -327,6 +351,123 @@ function handleMessagesRoute(db: Database, teamId: string, url: URL, res: Server
     messages: page.map(mapMessage),
     nextCursor: hasNextPage && last ? encodeMessageCursor({ timeCreated: last.time_created, id: last.id }) : null,
   })
+}
+
+const MAX_DASHBOARD_MESSAGE_BYTES = 10 * 1024
+const MAX_DASHBOARD_REQUEST_BYTES = MAX_DASHBOARD_MESSAGE_BYTES + 1024
+
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const contentType = req.headers["content-type"] ?? ""
+  if (!contentType.toLowerCase().startsWith("application/json")) throw new Error("unsupported_media_type")
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    size += buffer.length
+    if (size > MAX_DASHBOARD_REQUEST_BYTES) throw new Error("body_too_large")
+    chunks.push(buffer)
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown
+  } catch {
+    throw new Error("malformed_json")
+  }
+}
+
+async function handleSendMessageRoute(db: Database, teamId: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let body: unknown
+  try {
+    body = await readJsonBody(req)
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "malformed_json"
+    if (reason === "unsupported_media_type") {
+      sendJson(res, { error: "Content-Type must be application/json" }, 415)
+      return
+    }
+    if (reason === "body_too_large") {
+      sendJson(res, { error: "Message content exceeds 10KB limit" }, 413)
+      return
+    }
+    sendJson(res, { error: "Malformed JSON body" }, 400)
+    return
+  }
+  if (typeof body !== "object" || body === null) {
+    sendJson(res, { error: "Request body must be an object" }, 400)
+    return
+  }
+  const input = body as { to?: unknown; content?: unknown }
+  if (typeof input.content !== "string" || input.content.trim().length === 0) {
+    sendJson(res, { error: "content must be a non-empty string" }, 400)
+    return
+  }
+  const content = input.content.trim()
+  if (new TextEncoder().encode(content).length > MAX_DASHBOARD_MESSAGE_BYTES) {
+    sendJson(res, { error: "Message content exceeds 10KB limit" }, 413)
+    return
+  }
+  if (input.to !== null && (typeof input.to !== "string" || input.to.length === 0)) {
+    sendJson(res, { error: "to must be a team member name or null for broadcast" }, 400)
+    return
+  }
+  const team = db.query("SELECT status FROM team WHERE id = ?").get(teamId) as { status: string } | undefined
+  if (!team) {
+    sendJson(res, { error: "Team not found" }, 404)
+    return
+  }
+  if (team.status !== "active") {
+    sendJson(res, { error: "Team is not active" }, 409)
+    return
+  }
+
+  const messageId = generateId("msg")
+  const now = Date.now()
+  if (typeof input.to === "string") {
+    const member = db.query(
+      "SELECT session_id, agent FROM team_member WHERE team_id = ? AND name = ? AND status IN ('ready', 'busy')",
+    ).get(teamId, input.to) as { session_id: string; agent: string } | undefined
+    if (!member) {
+      sendJson(res, { error: "Schedulable team member not found" }, 404)
+      return
+    }
+    queueMessageWake(db, {
+      messageId,
+      teamId,
+      fromName: "lead",
+      toName: input.to,
+      content,
+      memberName: input.to,
+      sessionId: member.session_id,
+      agent: member.agent,
+      reason: "dashboard_message",
+      coalesceKey: `member:${input.to}`,
+      now,
+    })
+    sendJson(res, { message: { id: messageId, fromName: "lead", toName: input.to, content, delivered: false, read: false, timeCreated: now }, recipientCount: 1 }, 202)
+    return
+  }
+
+  const members = db.query(
+    "SELECT name, session_id, agent FROM team_member WHERE team_id = ? AND status IN ('ready', 'busy') ORDER BY time_created ASC",
+  ).all(teamId) as Array<{ name: string; session_id: string; agent: string }>
+  if (members.length === 0) {
+    sendJson(res, { error: "Team has no schedulable recipients" }, 409)
+    return
+  }
+  queueBroadcastWakes(db, {
+    messageId,
+    teamId,
+    fromName: "lead",
+    content,
+    recipients: members.map(member => ({
+      memberName: member.name,
+      sessionId: member.session_id,
+      agent: member.agent,
+      reason: "dashboard_broadcast",
+      coalesceKey: `member:${member.name}`,
+    })),
+    now,
+  })
+  sendJson(res, { message: { id: messageId, fromName: "lead", toName: null, content, delivered: false, read: false, timeCreated: now }, recipientCount: members.length }, 202)
 }
 
 /** Dashboard server handle returned by startDashboard. */
@@ -481,18 +622,13 @@ async function handleActivityRoute(
   sendJson(res, { activity: combined })
 }
 
-function handleDashboardRequest(
+async function handleDashboardRequest(
   db: Database,
   port: number,
   req: IncomingMessage,
   res: ServerResponse,
   options: DashboardOptions,
-): void {
-  if (req.method !== "GET") {
-    sendText(res, "Method Not Allowed", 405, "text/plain; charset=utf-8", { Allow: "GET" })
-    return
-  }
-
+): Promise<void> {
   let url: URL
   try {
     url = new URL(req.url ?? "/", `http://${DASHBOARD_HOST}:${port}`)
@@ -506,6 +642,33 @@ function handleDashboardRequest(
     return
   }
 
+  const messagesMatch = url.pathname.match(/^\/api\/teams\/([^/]+)\/messages$/)
+  if (messagesMatch && req.method === "POST") {
+    const encodedTeamId = messagesMatch[1]
+    if (!encodedTeamId) {
+      sendJson(res, { error: "Malformed team ID" }, 400)
+      return
+    }
+    let teamId: string
+    try {
+      teamId = decodeURIComponent(encodedTeamId)
+    } catch {
+      sendJson(res, { error: "Malformed team ID" }, 400)
+      return
+    }
+    try {
+      await handleSendMessageRoute(db, teamId, req, res)
+    } catch {
+      if (!res.headersSent) sendJson(res, { error: "Failed to queue message" }, 500)
+    }
+    return
+  }
+
+  if (req.method !== "GET") {
+    sendText(res, "Method Not Allowed", 405, "text/plain; charset=utf-8", { Allow: "GET" })
+    return
+  }
+
   if (url.pathname === "/api/health") {
     sendJson(res, { ensemble: true, pid: process.pid })
     return
@@ -516,7 +679,6 @@ function handleDashboardRequest(
     return
   }
 
-  const messagesMatch = url.pathname.match(/^\/api\/teams\/([^/]+)\/messages$/)
   if (messagesMatch) {
     const encodedTeamId = messagesMatch[1]
     if (!encodedTeamId) {
@@ -568,11 +730,7 @@ function handleDashboardRequest(
       sendJson(res, { error: "Malformed session ID" }, 400)
       return
     }
-    handleActivityRoute(sessionId, options, res).catch(() => {
-      if (!res.headersSent) {
-        sendJson(res, { error: "Failed to fetch activity" }, 500)
-      }
-    })
+    await handleActivityRoute(sessionId, options, res)
     return
   }
 
@@ -609,7 +767,11 @@ function toDashboardServer(server: Server): DashboardServer {
  */
 export async function startDashboard(db: Database, port: number, options: DashboardOptions): Promise<DashboardServer | null> {
   return new Promise((resolve) => {
-    const server = createServer((req, res) => handleDashboardRequest(db, port, req, res, options))
+    const server = createServer((req, res) => {
+      handleDashboardRequest(db, port, req, res, options).catch(() => {
+        if (!res.headersSent) sendJson(res, { error: "Dashboard request failed" }, 500)
+      })
+    })
 
     server.once("error", async (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {

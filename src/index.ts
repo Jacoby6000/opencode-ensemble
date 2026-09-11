@@ -79,7 +79,7 @@ const plugin: Plugin = async (input) => {
   initLog(rawClient)
   const client = wrapThrowingClient(rawClient)
   const mainInstance = !isWorktreeInstance(input.directory)
-  const scheduler = new DurableScheduler(db, client, config.scheduler, mainInstance)
+  const scheduler = new DurableScheduler(db, client, config.scheduler, mainInstance, input.directory)
   const deps: ToolDeps = { db, registry, tracker, purgeApprovals, client, directory: input.directory, config, progressTracker, scheduler }
 
   // Every plugin instance needs local session identity for status/tool hooks.

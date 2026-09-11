@@ -10,6 +10,12 @@ function rSel(){
   patch(el,h);
 }
 
+function rTeamSwitcher(current){
+  const select=document.getElementById('team-switcher'),projects=allProjects();
+  const html=projects.map(p=>'<optgroup label="'+E(projectLabel(p))+'">'+[...(p.teams||[])].sort((a,b)=>b.timeUpdated-a.timeUpdated).map(t=>'<option value="'+E(t.id)+'" '+(current&&current.id===t.id?'selected':'')+'>'+E(t.name)+(t.status==='active'?'':' · '+E(t.status))+'</option>').join('')+'</optgroup>').join('');
+  patch(select,html);select.disabled=!current;
+}
+
 function renderProjectNavHeader(){return '<div class="flex items-center justify-between gap-2 mb-3"><div class="text-[10px] uppercase tracking-[.18em] text-txt-500">Projects</div><button id="nav-toggle" type="button" aria-label="Hide project navigation" aria-controls="projects" aria-expanded="true" class="text-[10px] text-txt-500 border border-base-800 rounded px-1.5 py-[2px] hover:text-txt-200 hover:border-base-700 transition-colors">hide</button></div>'}
 function renderProjectSection(p,cp,c){const teams=p.teams||[];return '<section>'+renderProjectButton(p,cp)+'<div class="mt-2 ml-[7px] border-l border-base-800/80">'+[...teams].sort((a,b)=>b.timeUpdated-a.timeUpdated).map(t=>renderTeamLink(t,c)).join('')+'</div></section>'}
 function renderProjectButton(p,cp){const teams=p.teams||[],active=teams.filter(t=>t.status==='active').length,sel=cp&&cp.id===p.id,pss=projectStatus(p);return '<button type="button" aria-current="'+(sel?'true':'false')+'" title="'+E(statusTitleProject(p))+'" class="project-link group w-full text-left text-txt-300 hover:text-txt-100 transition-colors" data-project="'+E(p.id)+'" onclick="selectProject(this.dataset.project)"><div class="flex items-center gap-2 min-w-0"><span class="w-[5px] h-[5px] rounded-full '+pss.dot+(pss.label==='working'?' pulse':'')+' shrink-0"></span><span class="font-mono font-semibold truncate">'+E(projectLabel(p))+'</span>'+chip(pss.label,pss.color)+'</div><div class="mt-1 ml-3 text-[10px] text-txt-500">'+active+' team'+(active!==1?'s':'')+'</div></button>'}
@@ -123,6 +129,7 @@ function openDrawer(name){
   if(m.isRetrying)meta.push(chip('retrying'+(m.retryAttempt!=null?' (attempt '+m.retryAttempt+')':'')+(m.retryMessage?': '+E(m.retryMessage):''),'amber'));
   if(m.worktreeBranch)meta.push(chip(E(m.worktreeBranch),'muted'));
   h+='<div class="flex flex-wrap gap-1.5 mb-4 pb-4 border-b border-base-800/50">'+meta.join('')+'</div>';
+  h+='<button type="button" data-conversation="'+E(m.name)+'" onclick="closeDrawer();selectConversation(this.dataset.conversation)" class="mb-4 w-full rounded border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-[12px] font-medium text-blue-300 hover:bg-blue-500/15">Open full conversation</button>';
   // Prompt
   if(prompt){
     h+='<div class="mb-4"><div class="text-txt-400 text-[10px] uppercase tracking-wider mb-2">Original Prompt</div>';
@@ -186,6 +193,29 @@ function openDrawer(name){
     const loads=[];if(needsMessages)loads.push(ensureTeamMessages(t.id));if(needsPrompt)loads.push(ensureMemberPrompt(t.id,m.name));
     Promise.all(loads).then(function(){if(drawer.classList.contains('open')&&drawer.dataset.member===name)openDrawer(name)}).catch(()=>{});
   }
+}
+
+function rConversations(t){
+  const channel=selectedChannel==='@broadcast'?'@broadcast':((t.members||[]).some(m=>m.name===selectedChannel)?selectedChannel:'@broadcast');selectedChannel=channel;
+  const page=conversationPages.get(conversationKey(t.id,channel)),loading=conversationLoads.has(conversationKey(t.id,channel));
+  const channels=document.getElementById('conversation-channels');
+  const channelButton=(id,label,detail)=>'<button type="button" class="block w-full rounded px-2.5 py-2 text-left '+(channel===id?'bg-base-800 text-txt-100':'text-txt-400 hover:bg-base-800/50 hover:text-txt-200')+'" aria-current="'+(channel===id?'true':'false')+'" data-channel="'+E(id)+'" onclick="selectConversation(this.dataset.channel)"><span class="block text-[12px] font-medium">'+E(label)+'</span><span class="block text-[10px] text-txt-500 mt-0.5">'+E(detail)+'</span></button>';
+  patch(channels,'<div class="text-[10px] uppercase tracking-[.16em] text-txt-500 mb-2">Channels</div><div class="space-y-1">'+channelButton('@broadcast','Broadcast mailbox','Messages to every agent')+(t.members||[]).map(m=>channelButton(m.name,m.name,(m.agent||'agent')+' · '+si(m.status).l)).join('')+'</div>');
+  const heading=channel==='@broadcast'?'Broadcast mailbox':channel;
+  patch(document.getElementById('conversation-heading'),'<div class="flex items-center gap-2"><h2 class="font-mono text-[15px] font-semibold text-txt-100">'+E(heading)+'</h2>'+chip(channel==='@broadcast'?'team-wide':'direct',channel==='@broadcast'?'amber':'blue')+'</div><div class="mt-1 text-[11px] text-txt-500">'+(channel==='@broadcast'?'Messages sent to all schedulable agents in this team.':'Complete mailbox history involving this agent.')+'</div>');
+  const history=document.getElementById('conversation-history');
+  if(!page){patch(history,'<div class="flex h-full items-center justify-center text-[12px] text-txt-500">'+(loading?'Loading conversation...':'No messages yet')+'</div>')}
+  else{
+    const ordered=[...page.messages].sort((a,b)=>a.timeCreated-b.timeCreated||String(a.id).localeCompare(String(b.id)));
+    let html=page.nextCursor?'<div class="mb-3 text-center"><button type="button" onclick="loadOlderMessages()" class="rounded border border-base-700 px-2.5 py-1 text-[11px] text-txt-400 hover:text-txt-100">Load older messages</button></div>':'';
+    html+=ordered.length?ordered.map(m=>{const fromLead=m.fromName==='lead',target=m.toName?' → '+m.toName:' → all';return '<article class="mb-3 '+(fromLead?'ml-8':'mr-8')+'"><div class="rounded-lg border '+(fromLead?'border-emerald-500/20 bg-emerald-500/[0.05]':'border-blue-500/20 bg-blue-500/[0.05]')+' p-3"><div class="mb-2 flex items-center gap-2 text-[10px]"><span class="font-medium '+(fromLead?'text-emerald-400':'text-blue-400')+'">'+E(m.fromName)+'</span><span class="text-txt-500">'+E(target)+'</span><span class="ml-auto text-txt-500">'+relT(m.timeCreated)+'</span></div><div class="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-txt-200">'+E(m.content)+'</div></div></article>'}).join(''):'<div class="flex h-full items-center justify-center text-[12px] text-txt-500">No messages in this channel</div>';
+    patch(history,html);
+  }
+  const selectedMember=channel==='@broadcast'?null:(t.members||[]).find(m=>m.name===channel),hasRecipients=(t.members||[]).some(m=>m.status==='ready'||m.status==='busy'),unavailable=t.status!=='active'||(channel==='@broadcast'?!hasRecipients:!selectedMember||!['ready','busy'].includes(selectedMember.status));
+  const send=document.getElementById('conversation-send');send.disabled=conversationSending||unavailable;send.textContent=conversationSending?'Sending...':(channel==='@broadcast'?'Send broadcast':'Send message');
+  const status=document.getElementById('conversation-status');status.textContent=conversationError;status.className='text-[11px] '+(conversationError?'text-red-400':'text-txt-400');
+  if(unavailable&&!conversationError)status.textContent=t.status!=='active'?'Archived teams are read-only.':'This channel has no available recipient.';
+  if(!page&&!loading)ensureConversation(t.id,channel,false).then(rConversations.bind(null,t)).catch(err=>{conversationError=err.message;rConversations(t)});
 }
 
 function rDrawerActivityUpdate(){

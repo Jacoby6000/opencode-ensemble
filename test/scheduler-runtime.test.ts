@@ -169,4 +169,38 @@ describe("durable scheduler runtime", () => {
 
     expect(db.query("SELECT status FROM team_member WHERE name = 'alice'").get()).toEqual({ status: "shutdown_requested" })
   })
+
+  test("only dispatches wakes owned by its project", async () => {
+    db.run(
+      "INSERT INTO project (id, name, path, status, time_created, time_updated) VALUES (?, ?, ?, 'active', ?, ?)",
+      ["/tmp/other-project", "other-project", "/tmp/other-project", Date.now(), Date.now()],
+    )
+    db.run(
+      "INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)",
+      ["t2", "beta", "/tmp/other-project", "lead-2", Date.now(), Date.now()],
+    )
+    insertMember(db, "t2", "bob", "session-b")
+    queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
+      reason: "message", coalesceKey: "alice", prompt: "project A",
+    })
+    const otherWake = queueWake(db, {
+      teamId: "t2", memberName: "bob", sessionId: "session-b", agent: "build",
+      reason: "message", coalesceKey: "bob", prompt: "project B", now: Date.now() - 100,
+    })
+    const otherLease = tryAcquireRun(db, otherWake.wakeId, DEFAULT_CONFIG.scheduler.runLimits, 1, Date.now() - 100)
+    if (!otherLease.acquired) throw new Error("expected other-project lease")
+    const client = mockClient()
+    const scheduler = new DurableScheduler(db, client, DEFAULT_CONFIG.scheduler, true, "/tmp/test-project")
+
+    scheduler.kick()
+    await Bun.sleep(0)
+
+    const prompts = client.calls
+      .filter(call => call.method === "session.promptAsync")
+      .map(call => (call.args[0] as { sessionID: string }).sessionID)
+    expect(prompts).toEqual(["session-a"])
+    expect(db.query("SELECT state FROM scheduler_wake WHERE team_id = 't2'").get()).toEqual({ state: "leased" })
+    expect(db.query("SELECT state FROM scheduler_run_lease WHERE id = ?").get(otherLease.leaseId)).toEqual({ state: "active" })
+  })
 })
