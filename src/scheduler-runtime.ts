@@ -4,6 +4,7 @@ import { log } from "./log"
 import { getMemberPromptOptions } from "./member-model"
 import { expireStaleRuns, findRunBySession, finishRun, getWakePayload, listReadyWakes, markRunInjected, reconcileExpiredRun, renewRunLease, requeueRun, terminateMemberScheduling, tryAcquireRun } from "./scheduler"
 import type { PluginClient } from "./types"
+import { armTeamSupervisionIfQuiescent, reconcileTeamSupervision, SUPERVISOR_MEMBER_NAME } from "./supervisor"
 
 type BoundedResult<T> = { state: "fulfilled"; value: T } | { state: "rejected"; error: unknown } | { state: "timed_out" }
 
@@ -26,7 +27,8 @@ function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<Bounde
 function isNotFound(error: unknown): boolean {
   if (!error || typeof error !== "object") return false
   const candidate = error as { status?: unknown; response?: { status?: unknown } }
-  return candidate.status === 404 || candidate.response?.status === 404
+  if (candidate.status === 404 || candidate.response?.status === 404) return true
+  return error instanceof Error && /(?:\b404\b|not[ -]?found)/i.test(error.message)
 }
 
 /** Runtime scheduler operations used by tools and session event hooks. */
@@ -51,6 +53,7 @@ export class DurableScheduler implements SchedulerController {
     private readonly config: ResolvedEnsembleConfig["scheduler"],
     private readonly dispatchEnabled = true,
     private readonly projectId?: string,
+    private readonly recoverSupervisors?: () => Promise<void>,
   ) {}
 
   kick(): void {
@@ -90,6 +93,7 @@ export class DurableScheduler implements SchedulerController {
     if (this.maintenanceRunning) return
     this.maintenanceRunning = true
     try {
+      await this.recoverSupervisors?.()
       expireStaleRuns(this.db, Date.now(), this.projectId)
       const sessions = (this.projectId
         ? this.db.query(
@@ -138,6 +142,7 @@ export class DurableScheduler implements SchedulerController {
           terminateMemberScheduling(this.db, run.teamId, run.memberName, message)
       }))
     } finally {
+      this.reconcileSupervision(Date.now(), true)
       this.maintenanceRunning = false
       this.kick()
     }
@@ -164,6 +169,7 @@ export class DurableScheduler implements SchedulerController {
 
   private drain(): void {
     const now = Date.now()
+    this.reconcileSupervision(now)
     for (const wake of listReadyWakes(this.db, now, 50, this.projectId)) {
       const acquired = tryAcquireRun(this.db, wake.id, this.config.runLimits, this.config.leaseTtlMs, now, this.projectId)
       if (!acquired.acquired) continue
@@ -179,13 +185,50 @@ export class DurableScheduler implements SchedulerController {
         sessionID: wake.sessionId,
         parts: [{ type: "text", text }],
         ...getMemberPromptOptions(this.db, wake.teamId, wake.memberName),
+        ...(wake.memberName === SUPERVISOR_MEMBER_NAME ? {
+          tools: {
+            team_status: true,
+            team_message: true,
+            team_broadcast: true,
+            team_tasks_list: true,
+          },
+        } : {}),
       }).then(() => {
         markRunInjected(this.db, acquired.leaseId)
       }).catch(err => {
         const message = err instanceof Error ? err.message : String(err)
         log(`scheduler:dispatch:failed wake=${wake.id} member=${wake.memberName} err=${message}`)
+        if (wake.memberName === SUPERVISOR_MEMBER_NAME && isNotFound(err)) {
+          const current = this.db.query(
+            "SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND member_kind = 'supervisor'",
+          ).get(wake.teamId, wake.memberName) as { session_id: string } | undefined
+          if (current?.session_id === wake.sessionId) {
+            this.db.run(
+              "UPDATE team_member SET status = 'error', execution_status = 'failed', time_updated = ? WHERE team_id = ? AND name = ? AND session_id = ?",
+              [Date.now(), wake.teamId, wake.memberName, wake.sessionId],
+            )
+            terminateMemberScheduling(this.db, wake.teamId, wake.memberName, message)
+          } else {
+            finishRun(this.db, acquired.leaseId, "failed", message)
+          }
+          this.kick()
+          return
+        }
         requeueRun(this.db, acquired.leaseId, message, this.config.pumpIntervalMs)
       })
     }
+  }
+
+  private reconcileSupervision(now = Date.now(), armQuietPeriod = false): void {
+    const teams = (this.projectId
+      ? this.db.query("SELECT id FROM team WHERE status = 'active' AND project_id = ?").all(this.projectId)
+      : this.db.query("SELECT id FROM team WHERE status = 'active'").all()) as Array<{ id: string }>
+    teams.forEach(team => {
+      if (armQuietPeriod) {
+        armTeamSupervisionIfQuiescent(this.db, team.id, now)
+      } else {
+        reconcileTeamSupervision(this.db, team.id, now)
+      }
+    })
   }
 }

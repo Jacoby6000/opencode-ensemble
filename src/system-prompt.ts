@@ -25,7 +25,7 @@ export function buildLeadSystemPrompt(db: Database, teamId: string, config?: Res
   const team = db.query("SELECT name FROM team WHERE id = ?").get(teamId) as { name: string } | null
   if (!team) return ""
 
-  const members = db.query("SELECT name, status FROM team_member WHERE team_id = ?").all(teamId) as Array<{ name: string; status: string }>
+  const members = db.query("SELECT name, status FROM team_member WHERE team_id = ? AND member_kind = 'worker'").all(teamId) as Array<{ name: string; status: string }>
 
   const taskCounts = db.query(
     "SELECT status, COUNT(*) as count FROM team_task WHERE team_id = ? GROUP BY status",
@@ -215,7 +215,7 @@ export function buildTeamCompactionContext(
   const team = db.query("SELECT name FROM team WHERE id = ?").get(teamId) as { name: string } | null
   if (!team) return ""
 
-  const members = db.query("SELECT name, status FROM team_member WHERE team_id = ?").all(teamId) as Array<{ name: string; status: string }>
+  const members = db.query("SELECT name, status FROM team_member WHERE team_id = ? AND member_kind = 'worker'").all(teamId) as Array<{ name: string; status: string }>
 
   const taskCounts = db.query(
     "SELECT status, COUNT(*) as count FROM team_task WHERE team_id = ? GROUP BY status",

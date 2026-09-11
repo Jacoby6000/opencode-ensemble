@@ -1,5 +1,6 @@
 import type { Database } from "./db"
 import { generateId } from "./util"
+import { invalidateTeamSupervision, rearmTerminalSupervisorReview } from "./supervision-state"
 
 const MAX_MESSAGE_BYTES = 10 * 1024
 
@@ -22,6 +23,10 @@ export interface ReserveIdentityInput {
   agent: string
   limits: SchedulerIdentityLimits
   reservationTtlMs: number
+  /** Whether this ordinary-worker reservation invalidates current supervision. */
+  affectsSupervision?: boolean
+  /** Allow reservation while replacing an existing terminal member row in place. */
+  allowExistingTerminalMember?: boolean
   now?: number
 }
 
@@ -174,6 +179,7 @@ export function terminateMemberScheduling(_db: Database, _teamId: string, _membe
       "UPDATE scheduler_identity SET state = 'released', expires_at = NULL, released_at = ? WHERE team_id = ? AND member_name = ? AND state IN ('reserved', 'active')",
       [_now, _teamId, _memberName],
     ).changes
+    rearmTerminalSupervisorReview(_db, _teamId)
     if (leases + wakeChanges + identities === 0) return false
     recordEvent(_db, { teamId: _teamId, memberName: _memberName, type: "member_scheduler_terminated", detail: _reason, now: _now })
     return true
@@ -246,6 +252,7 @@ export function finishRun(db: Database, leaseId: string, outcome: "processed" | 
     db.run("UPDATE scheduler_run_lease SET state = ?, released_at = ? WHERE id = ? AND state = 'active'", [leaseState, now, leaseId])
     db.run("UPDATE scheduler_wake SET state = ?, last_error = ?, time_updated = ? WHERE id = ? AND state = 'leased'", [wakeState, error ?? null, now, lease.wake_id])
     setWakeMessageState(db, lease.wake_id, outcome)
+    if (outcome === "failed") rearmTerminalSupervisorReview(db, lease.team_id)
     recordEvent(db, {
       teamId: lease.team_id,
       memberName: lease.member_name,
@@ -279,24 +286,27 @@ export function queueMessageWake(db: Database, input: QueueMessageWakeInput): Qu
 
 /** Persist a broadcast and all recipient wakes in one immediate transaction. */
 export function queueBroadcastWakes(db: Database, input: QueueBroadcastWakesInput): QueueWakeResult[] {
-  if (new TextEncoder().encode(input.content).length > MAX_MESSAGE_BYTES) throw new Error("Message content exceeds 10KB limit")
   if (input.recipients.length === 0) throw new Error("Broadcasts require at least one recipient")
+  return immediateTransaction(db, () => persistBroadcastWakesInTransaction(db, input))
+}
+
+/** Persist a broadcast and zero or more recipient wakes inside the caller's transaction. */
+export function persistBroadcastWakesInTransaction(db: Database, input: QueueBroadcastWakesInput): QueueWakeResult[] {
+  if (new TextEncoder().encode(input.content).length > MAX_MESSAGE_BYTES) throw new Error("Message content exceeds 10KB limit")
   if (new Set(input.recipients.map(recipient => recipient.memberName)).size !== input.recipients.length) {
     throw new Error("Broadcast recipients must be unique")
   }
   const now = input.now ?? Date.now()
-  return immediateTransaction(db, () => {
-    db.run(
-      "INSERT INTO team_message (id, team_id, from_name, to_name, content, delivered, read, delivery_state, time_created) VALUES (?, ?, ?, NULL, ?, 0, 0, 'queued', ?)",
-      [input.messageId, input.teamId, input.fromName, input.content, now],
-    )
-    return input.recipients.map(recipient => queueWakeInTransaction(db, {
-      ...recipient,
-      teamId: input.teamId,
-      messageId: input.messageId,
-      now,
-    }, true))
-  })
+  db.run(
+    "INSERT INTO team_message (id, team_id, from_name, to_name, content, delivered, read, delivery_state, time_created) VALUES (?, ?, ?, NULL, ?, 0, 0, 'queued', ?)",
+    [input.messageId, input.teamId, input.fromName, input.content, now],
+  )
+  return input.recipients.map(recipient => queueWakeInTransaction(db, {
+    ...recipient,
+    teamId: input.teamId,
+    messageId: input.messageId,
+    now,
+  }, true))
 }
 
 /** Renew an owned active lease before its expiry. */
@@ -352,12 +362,14 @@ export function reconcileExpiredRun(
         )
         db.run("DELETE FROM scheduler_message_wake WHERE wake_id = ?", [lease.wake_id])
         db.run("UPDATE scheduler_wake SET state = 'cancelled', time_updated = ? WHERE id = ? AND state = 'leased'", [now, lease.wake_id])
+        rearmTerminalSupervisorReview(db, lease.team_id)
       } else {
         db.run("UPDATE scheduler_wake SET state = 'queued', time_updated = ? WHERE id = ? AND state = 'leased'", [now, lease.wake_id])
       }
     } else {
       const wakeState = outcome === "processed" ? "completed" : "failed"
       db.run("UPDATE scheduler_wake SET state = ?, last_error = ?, time_updated = ? WHERE id = ? AND state = 'leased'", [wakeState, error ?? null, now, lease.wake_id])
+      if (outcome === "failed") rearmTerminalSupervisorReview(db, lease.team_id)
     }
     recordEvent(db, { teamId: lease.team_id, memberName: lease.member_name, wakeId: lease.wake_id, leaseId, type: `expired_run_${outcome}`, detail: error, now })
     return true
@@ -396,8 +408,11 @@ export function tryReserveIdentity(db: Database, input: ReserveIdentityInput): R
       recordEvent(db, { teamId: identity.team_id, memberName: identity.member_name, type: "identity_reservation_expired", detail: identity.id, now })
     })
 
-    const member = db.query("SELECT 1 FROM team_member WHERE team_id = ? AND name = ? LIMIT 1").get(input.teamId, input.memberName)
-    if (member) return { reserved: false, reason: "identity_exists" }
+    const member = db.query("SELECT status FROM team_member WHERE team_id = ? AND name = ? LIMIT 1")
+      .get(input.teamId, input.memberName) as { status: string } | undefined
+    if (member && !(input.allowExistingTerminalMember && ["shutdown", "error"].includes(member.status))) {
+      return { reserved: false, reason: "identity_exists" }
+    }
     const existing = db.query(
       "SELECT id FROM scheduler_identity WHERE team_id = ? AND member_name = ? AND state IN ('reserved', 'active') LIMIT 1",
     ).get(input.teamId, input.memberName)
@@ -417,6 +432,7 @@ export function tryReserveIdentity(db: Database, input: ReserveIdentityInput): R
       "INSERT INTO scheduler_identity (id, team_id, member_name, agent, state, reserved_at, expires_at) VALUES (?, ?, ?, ?, 'reserved', ?, ?)",
       [reservationId, input.teamId, input.memberName, input.agent, now, now + input.reservationTtlMs],
     )
+    if (input.affectsSupervision !== false) invalidateTeamSupervision(db, input.teamId, now)
     recordEvent(db, { teamId: input.teamId, memberName: input.memberName, type: "identity_reserved", detail: reservationId, now })
     return { reserved: true, reservationId }
   })
@@ -433,6 +449,31 @@ export function activateIdentityAndQueue(_db: Database, _reservationId: string, 
   return immediateTransaction(_db, () => {
     if (!activateIdentityInTransaction(_db, _reservationId, now)) return undefined
     return queueWakeInTransaction(_db, { ..._wake, now })
+  })
+}
+
+/** Atomically persist a member and activate its previously reserved identity. */
+export function activateIdentityWithPersistence(
+  db: Database,
+  reservationId: string,
+  persistMember: () => void,
+  now = Date.now(),
+): boolean {
+  return immediateTransaction(db, () => {
+    const identity = db.query(
+      "SELECT team_id, member_name, expires_at FROM scheduler_identity WHERE id = ? AND state = 'reserved'",
+    ).get(reservationId) as { team_id: string; member_name: string; expires_at: number } | undefined
+    if (!identity) return false
+    if (identity.expires_at <= now) {
+      db.run("UPDATE scheduler_identity SET state = 'expired', released_at = ? WHERE id = ? AND state = 'reserved'", [now, reservationId])
+      recordEvent(db, { teamId: identity.team_id, memberName: identity.member_name, type: "identity_reservation_expired", detail: reservationId, now })
+      return false
+    }
+    persistMember()
+    if (!activateIdentityInTransaction(db, reservationId, now)) {
+      throw new Error(`Persisted member does not match identity reservation ${reservationId}`)
+    }
+    return true
   })
 }
 
@@ -462,7 +503,8 @@ export function releaseIdentity(db: Database, reservationId: string, now = Date.
   })
 }
 
-function immediateTransaction<T>(db: Database, operation: () => T): T {
+/** Execute one synchronous operation inside a SQLite BEGIN IMMEDIATE transaction. */
+export function immediateTransaction<T>(db: Database, operation: () => T): T {
   db.exec("BEGIN IMMEDIATE")
   try {
     const result = operation()
@@ -484,10 +526,10 @@ function recordEvent(
   )
 }
 
-function getSchedulableMember(db: Database, teamId: string, memberName: string): { session_id: string; agent: string } | undefined {
+function getSchedulableMember(db: Database, teamId: string, memberName: string): { session_id: string; agent: string; member_kind: string } | undefined {
   return db.query(
-    "SELECT tm.session_id, tm.agent FROM team_member tm JOIN team t ON t.id = tm.team_id WHERE tm.team_id = ? AND tm.name = ? AND t.status = 'active' AND tm.status IN ('ready', 'busy')",
-  ).get(teamId, memberName) as { session_id: string; agent: string } | undefined
+    "SELECT tm.session_id, tm.agent, tm.member_kind FROM team_member tm JOIN team t ON t.id = tm.team_id WHERE tm.team_id = ? AND tm.name = ? AND t.status = 'active' AND tm.status IN ('ready', 'busy')",
+  ).get(teamId, memberName) as { session_id: string; agent: string; member_kind: string } | undefined
 }
 
 function setWakeMessageState(db: Database, wakeId: string, state: "wake_queued" | "injected" | "processed" | "failed"): void {
@@ -525,12 +567,13 @@ function queueWakeInTransaction(db: Database, input: QueueWakeInput & { now: num
   if (!input.teamId || !input.memberName || !input.sessionId || !input.agent || !input.reason || !input.coalesceKey) {
     throw new Error("Wake requests require team, member, session, agent, reason, and coalesce key")
   }
+  const now = input.now
   const member = getSchedulableMember(db, input.teamId, input.memberName)
   if (!member) throw new Error(`Member ${input.teamId}/${input.memberName} is not schedulable`)
   if (member.session_id !== input.sessionId || member.agent !== input.agent) {
     throw new Error(`Wake routing does not match member ${input.teamId}/${input.memberName}`)
   }
-  const now = input.now
+  if (member.member_kind === "worker") invalidateTeamSupervision(db, input.teamId, now)
   const existing = db.query(
     "SELECT id FROM scheduler_wake WHERE team_id = ? AND member_name = ? AND coalesce_key = ? AND state = 'queued' ORDER BY time_created ASC LIMIT 1",
   ).get(input.teamId, input.memberName, input.coalesceKey) as { id: string } | undefined
@@ -598,6 +641,7 @@ export function tryAcquireRun(
     if (!member || member.session_id !== wake.session_id || member.agent !== wake.agent) {
       db.run("UPDATE scheduler_wake SET state = 'cancelled', last_error = 'member routing changed', time_updated = ? WHERE id = ? AND state = 'queued'", [now, wake.id])
       setWakeMessageState(db, wake.id, "failed")
+      rearmTerminalSupervisorReview(db, wake.team_id)
       recordEvent(db, { teamId: wake.team_id, memberName: wake.member_name, wakeId: wake.id, type: "wake_cancelled", detail: "member routing changed", now })
       return { acquired: false, reason: "wake_unavailable" }
     }

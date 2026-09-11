@@ -187,7 +187,7 @@ export async function executeTeamSpawn(
 
   // Resolve identity before session creation so both SDK calls start with the
   // same agent and model. Invalid model strings retain the agent and fall back.
-  const memberCount = (deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(teamInfo.teamId) as { c: number }).c
+  const memberCount = (deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND member_kind = 'worker'").get(teamInfo.teamId) as { c: number }).c
   const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config)
   const modelParam = resolvedModel ? parseModelId(resolvedModel) : undefined
   if (resolvedModel && !modelParam) {
@@ -277,7 +277,7 @@ export async function executeTeamSpawn(
 
   // Show other teammates so this agent knows who to message
   const otherMembers = deps.db.query(
-    "SELECT name FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error')"
+    "SELECT name FROM team_member WHERE team_id = ? AND member_kind = 'worker' AND name != ? AND status NOT IN ('shutdown', 'error')"
   ).all(teamInfo.teamId, args.name) as Array<{ name: string }>
   if (otherMembers.length > 0) {
     context.push(`Other teammates: ${otherMembers.map(m => m.name).join(", ")}`)

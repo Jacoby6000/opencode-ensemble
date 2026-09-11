@@ -6,6 +6,7 @@ import type { DashboardOptions } from "../src/dashboard"
 import { ActivityBuffer } from "../src/activity"
 import type { PluginClient } from "../src/types"
 import { activateIdentity, markRunInjected, queueWake, tryAcquireRun, tryReserveIdentity } from "../src/scheduler"
+import { SUPERVISOR_AGENT, SUPERVISOR_MEMBER_NAME } from "../src/supervisor"
 
 function randomPort(): number {
   return 19000 + Math.floor(Math.random() * 10000)
@@ -190,6 +191,53 @@ describe("dashboard", () => {
       expect(scheduler.recentEvents.length).toBeGreaterThan(0)
       expect(JSON.stringify(scheduler)).not.toContain("secret scheduler prompt")
       expect(scheduler.recentEvents[0]).not.toHaveProperty("detail")
+    })
+
+    test("excludes simultaneous hidden Supervisor identities, wakes, runs, and events", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      const workerReservation = tryReserveIdentity(db, {
+        teamId: "t1", memberName: "alice", agent: "build",
+        limits: { global: 4, perAgent: {} }, reservationTtlMs: 60_000,
+      })
+      if (!workerReservation.reserved) throw new Error("expected worker reservation")
+      insertMember(db, "t1", "alice", "sess-a")
+      activateIdentity(db, workerReservation.reservationId)
+      const workerWake = queueWake(db, {
+        teamId: "t1", memberName: "alice", sessionId: "sess-a", agent: "build",
+        reason: "message", coalesceKey: "alice",
+      })
+      const workerLease = tryAcquireRun(db, workerWake.wakeId, { global: 4, perAgent: {} }, 60_000)
+      if (!workerLease.acquired) throw new Error("expected worker lease")
+      markRunInjected(db, workerLease.leaseId)
+
+      const supervisorReservation = tryReserveIdentity(db, {
+        teamId: "t1", memberName: SUPERVISOR_MEMBER_NAME, agent: SUPERVISOR_AGENT,
+        limits: { global: 4, perAgent: {} }, reservationTtlMs: 60_000,
+      })
+      if (!supervisorReservation.reserved) throw new Error("expected Supervisor reservation")
+      insertMember(db, "t1", SUPERVISOR_MEMBER_NAME, "supervisor-session")
+      db.run("UPDATE team_member SET agent = ?, member_kind = 'supervisor' WHERE team_id = 't1' AND name = ?", [SUPERVISOR_AGENT, SUPERVISOR_MEMBER_NAME])
+      activateIdentity(db, supervisorReservation.reservationId)
+      const supervisorWake = queueWake(db, {
+        teamId: "t1", memberName: SUPERVISOR_MEMBER_NAME, sessionId: "supervisor-session", agent: SUPERVISOR_AGENT,
+        reason: "supervisor_review", coalesceKey: "supervisor:0",
+      })
+      const supervisorLease = tryAcquireRun(db, supervisorWake.wakeId, { global: 4, perAgent: {} }, 60_000)
+      if (!supervisorLease.acquired) throw new Error("expected Supervisor lease")
+      markRunInjected(db, supervisorLease.leaseId)
+
+      server = await startDashboard(db, port)
+      const body = (await (await fetch(`http://localhost:${port}/api/state`)).json()) as StateResponse
+      const team = body.teams[0]!
+      const scheduler = team.scheduler as {
+        activeIdentities: number; reservedIdentities: number; queuedWakes: number; leasedWakes: number
+        activeRuns: number; expiredRuns: number; recentEvents: Array<{ memberName: string | null }>
+      }
+
+      expect(team.members.map(member => member.name)).toEqual(["alice"])
+      expect(scheduler).toMatchObject({ activeIdentities: 1, reservedIdentities: 0, queuedWakes: 0, leasedWakes: 1, activeRuns: 1, expiredRuns: 0 })
+      expect(scheduler.recentEvents.length).toBeGreaterThan(0)
+      expect(scheduler.recentEvents.every(event => event.memberName !== SUPERVISOR_MEMBER_NAME)).toBe(true)
     })
 
     test("Fix 1: exposes last_nudged_at as an additive lastNudgedAt field", async () => {

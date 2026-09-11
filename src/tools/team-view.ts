@@ -12,7 +12,7 @@ export async function executeTeamView(
 ): Promise<string> {
   const teamInfo = requireTeamMember(deps, sessionId)
 
-  const member = deps.db.query("SELECT session_id, status, agent FROM team_member WHERE team_id = ? AND name = ?")
+  const member = deps.db.query("SELECT session_id, status, agent FROM team_member WHERE team_id = ? AND name = ? AND member_kind = 'worker'")
     .get(teamInfo.teamId, args.member) as { session_id: string; status: string; agent: string } | null
   if (!member) throw new Error(`Teammate "${args.member}" not found in team "${teamInfo.teamName}"`)
 

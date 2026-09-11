@@ -30,6 +30,28 @@ describe("schema migrations", () => {
     expect(cols.some(column => column.name === "lead_model")).toBe(true)
   })
 
+  test("migration 14 adds explicit member kinds and durable team supervision state", () => {
+    applyMigrations(db)
+
+    const memberColumns = db.query("PRAGMA table_info(team_member)").all() as Array<{ name: string; dflt_value: string | null }>
+    expect(memberColumns.find(column => column.name === "member_kind")?.dflt_value).toBe("'worker'")
+    const supervisionColumns = db.query("PRAGMA table_info(team_supervision)").all() as Array<{ name: string }>
+    expect(supervisionColumns.map(column => column.name)).toEqual([
+      "team_id",
+      "generation",
+      "quiet_since",
+      "last_reviewed",
+      "broadcast_generation",
+    ])
+    const wakeColumns = db.query("PRAGMA table_info(scheduler_wake)").all() as Array<{ name: string }>
+    expect(wakeColumns.some(column => column.name === "supervision_generation")).toBe(true)
+
+    db.run("INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated) VALUES ('t1', 'team', 'default', 'lead', 'active', 0, 0, 0)")
+    db.run("INSERT INTO team_member (team_id, name, session_id, agent, time_created, time_updated) VALUES ('t1', 'alice', 's1', 'build', 0, 0)")
+    expect(db.query("SELECT member_kind FROM team_member WHERE name = 'alice'").get()).toEqual({ member_kind: "worker" })
+    expect(() => db.run("UPDATE team_member SET member_kind = 'other' WHERE name = 'alice'")).toThrow()
+  })
+
   test("creates project table", () => {
     applyMigrations(db)
     const row = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='project'").get()

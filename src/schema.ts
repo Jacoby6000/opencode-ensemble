@@ -301,6 +301,18 @@ export const MIGRATIONS: string[] = [
    ALTER TABLE scheduler_run_lease ADD COLUMN injected_at INTEGER;`,
   // Migration 13: Preserve the lead's selected model on asynchronous wake-ups.
   `ALTER TABLE team ADD COLUMN lead_model TEXT;`,
+  // Migration 14: Persist internal member identity and restart-safe supervision epochs.
+  `ALTER TABLE team_member ADD COLUMN member_kind TEXT NOT NULL DEFAULT 'worker'
+     CHECK(member_kind IN ('worker', 'supervisor'));
+   CREATE UNIQUE INDEX team_member_one_supervisor_idx ON team_member(team_id) WHERE member_kind = 'supervisor';
+   ALTER TABLE scheduler_wake ADD COLUMN supervision_generation INTEGER;
+   CREATE TABLE team_supervision (
+     team_id              TEXT PRIMARY KEY REFERENCES team(id) ON DELETE CASCADE,
+     generation           INTEGER NOT NULL DEFAULT 0,
+     quiet_since          INTEGER,
+     last_reviewed        INTEGER NOT NULL DEFAULT -1,
+     broadcast_generation INTEGER
+   );`,
 ]
 
 /**

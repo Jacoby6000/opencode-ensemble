@@ -1,6 +1,5 @@
 import { describe, test, expect } from "bun:test"
 import { wrapThrowingClient } from "../src/client"
-import type { PluginClient } from "../src/types"
 
 /** Fake SDK client that returns HeyAPI-style { data } or { error } responses. */
 function fakeSDK(overrides: Record<string, unknown> = {}) {
@@ -45,6 +44,19 @@ describe("wrapThrowingClient", () => {
       "session.create": async () => ({ error: { message: "bad request" } }),
     }))
     await expect(client.session.create({ title: "test" })).rejects.toThrow("bad request")
+  })
+
+  test("preserves HTTP status on thrown SDK errors", async () => {
+    const client = wrapThrowingClient(fakeSDK({
+      "session.promptAsync": async () => ({ error: { message: "session missing" }, response: { status: 404 } }),
+    }))
+
+    try {
+      await client.session.promptAsync({ sessionID: "missing", parts: [] })
+      throw new Error("expected promptAsync to reject")
+    } catch (error) {
+      expect((error as Error & { status?: number }).status).toBe(404)
+    }
   })
 
   test("throws with stringified error when error is not an object", async () => {

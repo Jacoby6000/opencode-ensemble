@@ -110,7 +110,7 @@ export async function recoverStaleMembers(db: Database, client?: PluginClient, c
       FROM team_member tm
       JOIN team t ON tm.team_id = t.id
       JOIN project p ON t.project_id = p.id
-      WHERE tm.status = 'busy' AND t.status = 'active'
+       WHERE tm.member_kind = 'worker' AND tm.status = 'busy' AND t.status = 'active'
         AND NOT EXISTS (
           SELECT 1 FROM scheduler_run_lease l
           WHERE l.team_id = tm.team_id AND l.member_name = tm.name AND l.state IN ('active', 'expired')
@@ -120,7 +120,7 @@ export async function recoverStaleMembers(db: Database, client?: PluginClient, c
 
   const result = db.run(
     `UPDATE team_member SET status = 'error', execution_status = 'idle', time_updated = ?
-      WHERE status = 'busy'
+       WHERE member_kind = 'worker' AND status = 'busy'
         AND NOT EXISTS (
           SELECT 1 FROM scheduler_run_lease l
           WHERE l.team_id = team_member.team_id AND l.member_name = team_member.name AND l.state IN ('active', 'expired')

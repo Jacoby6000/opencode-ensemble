@@ -1,6 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { OpencodeClient } from "@opencode-ai/sdk/v2"
+import type { PermissionConfig } from "@opencode-ai/sdk/v2"
 import path from "node:path"
 import { mkdirSync } from "node:fs"
 import { createDb, getDbPath } from "./db"
@@ -40,10 +41,41 @@ import { Watchdog } from "./watchdog"
 import { DurableScheduler } from "./scheduler-runtime"
 import { getLeadPromptOptions } from "./member-model"
 import type { MemberPromptOptions } from "./member-model"
+import { provisionSupervisorForTeam, reconcileSupervisors, recordWorkerQuiescenceEvent, SUPERVISOR_AGENT, SUPERVISOR_MEMBER_NAME } from "./supervisor"
 
 const DEFAULT_RATE_LIMIT_REFILL = 2
 const DEFAULT_RATE_LIMIT_INTERVAL_MS = 1000
 const DEFAULT_WATCHDOG_CHECK_MS = 60 * 1000 // 60 seconds
+const SUPERVISOR_AGENT_PERMISSION = {
+  read: "deny",
+  edit: "deny",
+  glob: "deny",
+  grep: "deny",
+  list: "deny",
+  bash: "deny",
+  task: "deny",
+  question: "deny",
+  webfetch: "deny",
+  websearch: "deny",
+  skill: "deny",
+  lsp: "deny",
+  external_directory: "deny",
+  todowrite: "deny",
+  team_create: "deny",
+  team_spawn: "deny",
+  team_tasks_add: "deny",
+  team_tasks_complete: "deny",
+  team_claim: "deny",
+  team_shutdown: "deny",
+  team_merge: "deny",
+  team_cleanup: "deny",
+  team_view: "deny",
+  team_results: "deny",
+  team_status: "allow",
+  team_tasks_list: "allow",
+  team_message: "allow",
+  team_broadcast: "allow",
+} as const satisfies PermissionConfig
 
 /**
  * opencode-ensemble plugin entry point.
@@ -79,7 +111,11 @@ const plugin: Plugin = async (input) => {
   initLog(rawClient)
   const client = wrapThrowingClient(rawClient)
   const mainInstance = !isWorktreeInstance(input.directory)
-  const scheduler = new DurableScheduler(db, client, config.scheduler, mainInstance, input.directory)
+  let supervisorRecoveryEnabled = false
+  const scheduler = new DurableScheduler(db, client, config.scheduler, mainInstance, input.directory, async () => {
+    if (!supervisorRecoveryEnabled) return
+    await reconcileSupervisors(db, client, registry, input.directory, config.scheduler)
+  })
   const deps: ToolDeps = { db, registry, tracker, purgeApprovals, client, directory: input.directory, config, progressTracker, scheduler }
 
   // Every plugin instance needs local session identity for status/tool hooks.
@@ -112,6 +148,14 @@ const plugin: Plugin = async (input) => {
       if (result.archived > 0) log(`init:recovery:orphaned-teams-archived=${result.archived}`)
     }).catch((err) => {
       log(`init:recover-orphaned-teams:failed err=${err instanceof Error ? err.message : String(err)}`)
+    }).then(() => {
+      supervisorRecoveryEnabled = true
+      return reconcileSupervisors(db, client, registry, input.directory, config.scheduler)
+    }).then(count => {
+      if (count > 0) log(`init:supervisors:provisioned=${count}`)
+      scheduler.kick()
+    }).catch(err => {
+      log(`init:supervisors:failed err=${err instanceof Error ? err.message : String(err)}`)
     })
 
     scheduler.recover().then(() => recoverStaleMembers(db, client, input.directory)).then((recovery) => {
@@ -172,6 +216,17 @@ const plugin: Plugin = async (input) => {
   watchdog.start()
 
   return {
+    async config(config) {
+      config.agent ??= {}
+      config.agent[SUPERVISOR_AGENT] = {
+        mode: "subagent",
+        hidden: true,
+        description: "Internal read-only Ensemble team supervisor",
+        prompt: "Review immutable team snapshots only. Never mutate tasks or use lifecycle tools. Broadcast at most once when specific ownership assignments are needed; otherwise remain silent.",
+        permission: SUPERVISOR_AGENT_PERMISSION,
+      }
+    },
+
     // Event hook — drives state machine transitions + descendant tracking + toasts
     async event({ event }) {
       if (event.type === "message.updated") {
@@ -188,12 +243,17 @@ const plugin: Plugin = async (input) => {
 
       if (event.type === "session.status") {
         const { sessionID, status } = event.properties
+        const statusTime = Date.now()
         const statusType = status.type as "idle" | "busy" | "retry"
         const retryPayload = statusType === "retry"
           ? (status as { attempt: number; message: string; action?: { reason: string; provider: string; title: string; message: string; label: string; link?: string }; next: number })
           : undefined
         const transition = handleSessionStatusEvent(db, registry, sessionID, statusType, retryPayload)
         scheduler.onSessionStatus(sessionID, statusType, retryPayload?.next)
+        if (statusType === "idle" && transition) {
+          recordWorkerQuiescenceEvent(db, transition.teamId, transition.memberName, statusTime)
+        }
+        if (transition) scheduler.kick()
 
         // Fire toast notifications for meaningful transitions
           if (transition) {
@@ -297,7 +357,7 @@ const plugin: Plugin = async (input) => {
             const pending = db.query("SELECT COUNT(*) as c FROM team_message WHERE team_id = ? AND to_name = 'lead' AND delivered = 0").get(team.id) as { c: number }
             // Skip wake if all teammates are done or if we woke recently (issue #3 — breaks completion loop)
             const allDone = (db.query(
-              "SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND status NOT IN ('ready', 'shutdown', 'error')"
+              "SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND member_kind = 'worker' AND status NOT IN ('ready', 'shutdown', 'error')"
             ).get(team.id) as { c: number }).c === 0
             const lastWake = wakeLeadTimestamps.get(team.id) ?? 0
             if (pending.c > 0 && !allDone && Date.now() - lastWake > WAKE_LEAD_COOLDOWN_MS) {
@@ -318,7 +378,7 @@ const plugin: Plugin = async (input) => {
           const member = db.query(
             `SELECT tm.team_id, tm.name FROM team_member tm
              JOIN team t ON tm.team_id = t.id
-             WHERE tm.session_id = ? AND t.status = 'active'`
+             WHERE tm.session_id = ? AND tm.member_kind = 'worker' AND t.status = 'active'`
           ).get(sessionID) as { team_id: string; name: string } | null
           if (member && !hasReportedCompletion(db, member.team_id, member.name)) {
             const staleThreshold = Date.now() - 5000
@@ -400,7 +460,9 @@ const plugin: Plugin = async (input) => {
       log(`system-prompt:transform role=${teamInfo.role} session=${input.sessionID}`)
       const prompt = teamInfo.role === "lead"
         ? buildLeadSystemPrompt(db, teamInfo.teamId, config)
-        : buildTeammateSystemPrompt(db, teamInfo.teamId, teamInfo.memberName ?? "unknown")
+        : teamInfo.memberName === SUPERVISOR_MEMBER_NAME
+          ? "You are the hidden read-only Supervisor. Follow only the current generation-fenced review prompt; do not mutate tasks or use lifecycle tools."
+          : buildTeammateSystemPrompt(db, teamInfo.teamId, teamInfo.memberName ?? "unknown")
       log(`system-prompt:injected role=${teamInfo.role} len=${prompt.length}`)
       output.system.push(prompt)
     },
@@ -409,7 +471,9 @@ const plugin: Plugin = async (input) => {
     "experimental.session.compacting": async (input, output) => {
       const teamInfo = findTeamBySession(db, registry, input.sessionID)
       if (!teamInfo) return
-      const context = buildTeamCompactionContext(db, teamInfo.teamId, teamInfo.role, teamInfo.memberName)
+      const context = teamInfo.memberName === SUPERVISOR_MEMBER_NAME
+        ? "[Supervisor Context] Remain read-only. Follow only the current generation-fenced review and broadcast at most once."
+        : buildTeamCompactionContext(db, teamInfo.teamId, teamInfo.role, teamInfo.memberName)
       output.context.push(context)
     },
 
@@ -445,7 +509,13 @@ const plugin: Plugin = async (input) => {
           const result = await executeTeamCreate(deps, args, ctx.sessionID, {
             agent: sessionPromptOptions.get(ctx.sessionID)?.agent ?? ctx.agent,
             model: sessionPromptOptions.get(ctx.sessionID)?.model,
+          }, async teamId => {
+            const provisioned = await provisionSupervisorForTeam(db, client, registry, teamId, config.scheduler)
+            if (provisioned.status === "capacity_denied") {
+              throw new Error(`identity capacity denied (${provisioned.reason})`)
+            }
           })
+          scheduler.kick()
           ctx.metadata({ title: `Created team: ${args.name}` })
           return result
         },
@@ -629,7 +699,7 @@ const plugin: Plugin = async (input) => {
           // Collect member session IDs before cleanup so we can clean up activity buffers after
           const teamInfoForCleanup = findTeamBySession(db, registry, ctx.sessionID)
           const memberSessions = teamInfoForCleanup
-            ? (db.query("SELECT session_id FROM team_member WHERE team_id = ?").all(teamInfoForCleanup.teamId) as Array<{ session_id: string }>).map(m => m.session_id)
+            ? (db.query("SELECT session_id FROM team_member WHERE team_id = ? AND member_kind = 'worker'").all(teamInfoForCleanup.teamId) as Array<{ session_id: string }>).map(m => m.session_id)
             : []
           const result = await executeTeamCleanup(deps, args, ctx.sessionID, undefined, undefined, undefined, config.mergeOnCleanup, undefined, approvePurge)
           // Clean up activity buffers for team members after successful cleanup
@@ -667,7 +737,7 @@ const plugin: Plugin = async (input) => {
         async execute(_args, ctx) {
           const result = await executeTeamStatus(deps, ctx.sessionID)
           const statusMap: Record<string, string> = { busy: "working", ready: "idle", shutdown_requested: "stopping", shutdown: "done", error: "error" }
-          const members = deps.db.query("SELECT name, status FROM team_member WHERE team_id IN (SELECT id FROM team WHERE lead_session_id = ? OR id IN (SELECT team_id FROM team_member WHERE session_id = ?))").all(ctx.sessionID, ctx.sessionID) as Array<{ name: string; status: string }>
+          const members = deps.db.query("SELECT name, status FROM team_member WHERE member_kind = 'worker' AND team_id IN (SELECT id FROM team WHERE lead_session_id = ? OR id IN (SELECT team_id FROM team_member WHERE session_id = ?))").all(ctx.sessionID, ctx.sessionID) as Array<{ name: string; status: string }>
           const summary = members.map(m => `${m.name}: ${statusMap[m.status] ?? m.status}`).join(", ")
           ctx.metadata({ title: summary || "No teammates" })
           return result

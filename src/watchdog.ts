@@ -108,7 +108,7 @@ export class Watchdog {
       `SELECT tm.team_id, tm.name, tm.session_id
        FROM team_member tm
        JOIN team t ON tm.team_id = t.id
-       WHERE t.status = 'active' AND tm.status = 'busy'`
+        WHERE t.status = 'active' AND tm.member_kind = 'worker' AND tm.status = 'busy'`
     ).all() as Array<{ team_id: string; name: string; session_id: string }>
 
     for (const member of busy) {
@@ -202,7 +202,7 @@ export class Watchdog {
       `SELECT tm.team_id, tm.name, tm.session_id
        FROM team_member tm
        JOIN team t ON tm.team_id = t.id
-       WHERE t.status = 'active' AND tm.status = 'busy'`
+        WHERE t.status = 'active' AND tm.member_kind = 'worker' AND tm.status = 'busy'`
     ).all() as Array<{ team_id: string; name: string; session_id: string }>
 
     for (const member of busy) {
@@ -252,7 +252,8 @@ export class Watchdog {
        JOIN team t ON tm.team_id = t.id
        JOIN project p ON t.project_id = p.id
        WHERE t.status = 'active'
-         AND tm.status = 'busy'
+          AND tm.member_kind = 'worker'
+          AND tm.status = 'busy'
          AND tm.time_updated < ?`
     ).all(cutoff) as Array<{ team_id: string; name: string; session_id: string; worktree_branch: string | null; team_name: string; project_name: string }>
 

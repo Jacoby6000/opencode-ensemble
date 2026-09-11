@@ -347,7 +347,7 @@ function formatCount(count: number, noun: string, plural = `${noun}s`): string {
 
 function buildPurgePreview(deps: ToolDeps, targets: PurgeTarget[], branchesByTeam: Map<string, string[]>): string {
   const rows = targets.map(target => {
-    const members = (deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(target.id) as { c: number }).c
+    const members = (deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND member_kind = 'worker'").get(target.id) as { c: number }).c
     const tasks = (deps.db.query("SELECT COUNT(*) as c FROM team_task WHERE team_id = ?").get(target.id) as { c: number }).c
     const messages = (deps.db.query("SELECT COUNT(*) as c FROM team_message WHERE team_id = ?").get(target.id) as { c: number }).c
     const branches = branchesByTeam.get(target.id)?.length ?? 0
@@ -452,10 +452,10 @@ export async function executeTeamCleanup(
 
   const teamInfo = requireLead(deps, sessionId)
 
-  const members = deps.db.query("SELECT name, session_id, status, worktree_dir, worktree_branch, workspace_id FROM team_member WHERE team_id = ?")
-    .all(teamInfo.teamId) as Array<{ name: string; session_id: string; status: string; worktree_dir: string | null; worktree_branch: string | null; workspace_id: string | null }>
+  const members = deps.db.query("SELECT name, session_id, status, worktree_dir, worktree_branch, workspace_id, member_kind FROM team_member WHERE team_id = ?")
+    .all(teamInfo.teamId) as Array<{ name: string; session_id: string; status: string; worktree_dir: string | null; worktree_branch: string | null; workspace_id: string | null; member_kind: string }>
 
-  const active = members.filter(m => m.status !== "shutdown" && m.status !== "error")
+  const active = members.filter(m => m.member_kind === "worker" && m.status !== "shutdown" && m.status !== "error")
 
   if (active.length > 0 && !args.force) {
     const names = active.map(m => m.name).join(", ")
@@ -501,6 +501,18 @@ export async function executeTeamCleanup(
         await deps.client.session.abort({ sessionID: member.session_id })
       } catch { /* best effort */ }
     }
+  }
+
+  for (const supervisor of members.filter(member => member.member_kind === "supervisor" && member.status !== "shutdown")) {
+    deps.scheduler.terminateMember(teamInfo.teamId, supervisor.name, "team cleanup")
+    try {
+      // Internal Supervisors are always provisioned without a worktree or branch, so preservation is inapplicable.
+      await deps.client.session.abort({ sessionID: supervisor.session_id })
+    } catch { /* best effort */ }
+    deps.db.run(
+      "UPDATE team_member SET status = 'shutdown', execution_status = 'idle', time_updated = ? WHERE team_id = ? AND name = ?",
+      [Date.now(), teamInfo.teamId, supervisor.name],
+    )
   }
 
   members.forEach(member => {

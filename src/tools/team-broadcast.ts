@@ -3,8 +3,9 @@ import { requireTeamMember } from "./shared"
 import { broadcastMessage } from "../messaging"
 import { log } from "../log"
 import { generateId } from "../util"
-import { queueBroadcastWakes } from "../scheduler"
+import { immediateTransaction, persistBroadcastWakesInTransaction, queueBroadcastWakes } from "../scheduler"
 import { getLeadPromptOptions } from "../member-model"
+import { claimSupervisorBroadcastInTransaction } from "../supervisor"
 
 /**
  * Execute the team_broadcast tool. Sends a message to all team members + lead (excluding sender).
@@ -17,6 +18,10 @@ export async function executeTeamBroadcast(
   const teamInfo = requireTeamMember(deps, sessionId)
 
   const senderName = teamInfo.role === "lead" ? "lead" : (teamInfo.memberName ?? "unknown")
+  const sender = teamInfo.role === "member"
+    ? deps.db.query("SELECT member_kind FROM team_member WHERE team_id = ? AND name = ?").get(teamInfo.teamId, senderName) as { member_kind: string } | null
+    : null
+  const supervisorBroadcast = sender?.member_kind === "supervisor"
 
   let leadSessionId: string | undefined
   if (teamInfo.role !== "lead") {
@@ -26,25 +31,37 @@ export async function executeTeamBroadcast(
   }
 
   const members = deps.db.query(
-    "SELECT name, session_id, agent FROM team_member WHERE team_id = ? AND session_id <> ? AND status IN ('ready', 'busy') AND reported_to_lead = 0 ORDER BY time_created ASC",
-  ).all(teamInfo.teamId, sessionId) as Array<{ name: string; session_id: string; agent: string }>
-  const messageId = members.length > 0
-    ? generateId("msg")
-    : broadcastMessage(deps.db, { teamId: teamInfo.teamId, from: senderName, content: args.text })
-  if (members.length > 0) {
-    queueBroadcastWakes(deps.db, {
-      messageId,
-      teamId: teamInfo.teamId,
-      fromName: senderName,
-      content: args.text,
-      recipients: members.map(member => ({
-        memberName: member.name,
-        sessionId: member.session_id,
-        agent: member.agent,
-        reason: "broadcast",
-        coalesceKey: `member:${member.name}`,
-      })),
+    `SELECT name, session_id, agent FROM team_member
+     WHERE team_id = ? AND member_kind = 'worker' AND session_id <> ? AND status IN ('ready', 'busy')
+       AND (? = 1 OR reported_to_lead = 0) ORDER BY time_created ASC`,
+  ).all(teamInfo.teamId, sessionId, supervisorBroadcast ? 1 : 0) as Array<{ name: string; session_id: string; agent: string }>
+  const broadcastInput = {
+    messageId: generateId("msg"),
+    teamId: teamInfo.teamId,
+    fromName: senderName,
+    content: args.text,
+    recipients: members.map(member => ({
+      memberName: member.name,
+      sessionId: member.session_id,
+      agent: member.agent,
+      reason: "broadcast",
+      coalesceKey: `member:${member.name}`,
+    })),
+  }
+  let messageId: string
+  if (supervisorBroadcast) {
+    immediateTransaction(deps.db, () => {
+      claimSupervisorBroadcastInTransaction(deps.db, sessionId)
+      persistBroadcastWakesInTransaction(deps.db, broadcastInput)
     })
+    messageId = broadcastInput.messageId
+  } else if (members.length > 0) {
+    queueBroadcastWakes(deps.db, broadcastInput)
+    messageId = broadcastInput.messageId
+  } else {
+    messageId = broadcastMessage(deps.db, { teamId: teamInfo.teamId, from: senderName, content: args.text })
+  }
+  if (members.length > 0) {
     deps.scheduler.kick()
   }
 

@@ -10,6 +10,7 @@ import type { ActivityBuffer, ActivityEntry } from "./activity"
 import type { PluginClient } from "./types"
 import { isDashboardAuthorized } from "./dashboard-auth"
 import { queueBroadcastWakes, queueMessageWake } from "./scheduler"
+import { SUPERVISOR_MEMBER_NAME } from "./supervisor"
 import { generateId } from "./util"
 
 /** Loopback address used by the dashboard listener and singleton probe. */
@@ -152,20 +153,29 @@ export interface EnsembleDashboardState {
 function buildState(db: Database): EnsembleDashboardState {
   const projects = db.query("SELECT id, name, path, status, time_created, time_updated FROM project ORDER BY time_updated DESC").all() as ProjectRow[]
   const teams = db.query("SELECT id, name, project_id, lead_session_id, status, lead_agent, time_created, time_updated FROM team ORDER BY time_created DESC").all() as TeamRow[]
-  const memberStmt = db.query("SELECT name, agent, status, execution_status, session_id, worktree_branch, CASE WHEN prompt IS NOT NULL AND prompt <> '' THEN 1 ELSE 0 END AS has_prompt, model, plan_approval, time_created, time_updated, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message FROM team_member WHERE team_id = ?")
+  const memberStmt = db.query("SELECT name, agent, status, execution_status, session_id, worktree_branch, CASE WHEN prompt IS NOT NULL AND prompt <> '' THEN 1 ELSE 0 END AS has_prompt, model, plan_approval, time_created, time_updated, last_nudged_at, retry_until, retry_attempt, retry_provider, retry_message FROM team_member WHERE team_id = ? AND member_kind = 'worker'")
   const taskStmt = db.query("SELECT id, content, status, priority, assignee, depends_on, time_created, time_updated FROM team_task WHERE team_id = ?")
   const msgStmt = db.query("SELECT id, from_name, to_name, substr(content, 1, 160) AS content_preview, length(content) AS content_length, delivered, read, time_created FROM team_message WHERE team_id = ? ORDER BY time_created DESC, id DESC LIMIT 50")
   const schedulerCountsStmt = db.query(`SELECT
-    (SELECT COUNT(*) FROM scheduler_identity WHERE team_id = ? AND state = 'active') AS active_identities,
-    (SELECT COUNT(*) FROM scheduler_identity WHERE team_id = ? AND state = 'reserved') AS reserved_identities,
-    (SELECT COUNT(*) FROM scheduler_wake WHERE team_id = ? AND state = 'queued') AS queued_wakes,
-    (SELECT COUNT(*) FROM scheduler_wake WHERE team_id = ? AND state = 'leased') AS leased_wakes,
-    (SELECT COUNT(*) FROM scheduler_run_lease WHERE team_id = ? AND state = 'active') AS active_runs,
-    (SELECT COUNT(*) FROM scheduler_run_lease WHERE team_id = ? AND state = 'expired') AS expired_runs`)
-  const schedulerEventsStmt = db.query("SELECT member_name, type AS event_type, time_created FROM scheduler_event WHERE team_id = ? ORDER BY time_created DESC, id DESC LIMIT 20")
+    (SELECT COUNT(*) FROM scheduler_identity WHERE team_id = ? AND member_name <> ? AND state = 'active') AS active_identities,
+    (SELECT COUNT(*) FROM scheduler_identity WHERE team_id = ? AND member_name <> ? AND state = 'reserved') AS reserved_identities,
+    (SELECT COUNT(*) FROM scheduler_wake WHERE team_id = ? AND member_name <> ? AND state = 'queued') AS queued_wakes,
+    (SELECT COUNT(*) FROM scheduler_wake WHERE team_id = ? AND member_name <> ? AND state = 'leased') AS leased_wakes,
+    (SELECT COUNT(*) FROM scheduler_run_lease WHERE team_id = ? AND member_name <> ? AND state = 'active') AS active_runs,
+    (SELECT COUNT(*) FROM scheduler_run_lease WHERE team_id = ? AND member_name <> ? AND state = 'expired') AS expired_runs`)
+  const schedulerEventsStmt = db.query(
+    "SELECT member_name, type AS event_type, time_created FROM scheduler_event WHERE team_id = ? AND (member_name IS NULL OR member_name <> ?) ORDER BY time_created DESC, id DESC LIMIT 20",
+  )
 
   const mappedTeams = teams.map((t) => {
-    const scheduler = schedulerCountsStmt.get(t.id, t.id, t.id, t.id, t.id, t.id) as SchedulerCountsRow
+    const scheduler = schedulerCountsStmt.get(
+      t.id, SUPERVISOR_MEMBER_NAME,
+      t.id, SUPERVISOR_MEMBER_NAME,
+      t.id, SUPERVISOR_MEMBER_NAME,
+      t.id, SUPERVISOR_MEMBER_NAME,
+      t.id, SUPERVISOR_MEMBER_NAME,
+      t.id, SUPERVISOR_MEMBER_NAME,
+    ) as SchedulerCountsRow
     const members = (memberStmt.all(t.id) as MemberRow[]).map((m) => ({
       name: m.name,
       agent: m.agent,
@@ -225,7 +235,7 @@ function buildState(db: Database): EnsembleDashboardState {
         leasedWakes: scheduler.leased_wakes,
         activeRuns: scheduler.active_runs,
         expiredRuns: scheduler.expired_runs,
-        recentEvents: (schedulerEventsStmt.all(t.id) as SchedulerEventRow[]).map(event => ({
+        recentEvents: (schedulerEventsStmt.all(t.id, SUPERVISOR_MEMBER_NAME) as SchedulerEventRow[]).map(event => ({
           memberName: event.member_name,
           type: event.event_type,
           timeCreated: event.time_created,
@@ -325,7 +335,7 @@ function handleMessagesRoute(db: Database, teamId: string, url: URL, res: Server
     return
   }
   if (channel) {
-    const member = db.query("SELECT 1 FROM team_member WHERE team_id = ? AND name = ?").get(teamId, channel)
+    const member = db.query("SELECT 1 FROM team_member WHERE team_id = ? AND name = ? AND member_kind = 'worker'").get(teamId, channel)
     if (!member) {
       sendJson(res, { error: "Team member not found" }, 404)
       return
@@ -423,7 +433,7 @@ async function handleSendMessageRoute(db: Database, teamId: string, req: Incomin
   const now = Date.now()
   if (typeof input.to === "string") {
     const member = db.query(
-      "SELECT session_id, agent FROM team_member WHERE team_id = ? AND name = ? AND status IN ('ready', 'busy')",
+      "SELECT session_id, agent FROM team_member WHERE team_id = ? AND name = ? AND member_kind = 'worker' AND status IN ('ready', 'busy')",
     ).get(teamId, input.to) as { session_id: string; agent: string } | undefined
     if (!member) {
       sendJson(res, { error: "Schedulable team member not found" }, 404)
@@ -447,7 +457,7 @@ async function handleSendMessageRoute(db: Database, teamId: string, req: Incomin
   }
 
   const members = db.query(
-    "SELECT name, session_id, agent FROM team_member WHERE team_id = ? AND status IN ('ready', 'busy') ORDER BY time_created ASC",
+    "SELECT name, session_id, agent FROM team_member WHERE team_id = ? AND member_kind = 'worker' AND status IN ('ready', 'busy') ORDER BY time_created ASC",
   ).all(teamId) as Array<{ name: string; session_id: string; agent: string }>
   if (members.length === 0) {
     sendJson(res, { error: "Team has no schedulable recipients" }, 409)
@@ -704,7 +714,7 @@ async function handleDashboardRequest(
     try {
       const teamId = decodeURIComponent(encodedTeamId)
       const memberName = decodeURIComponent(encodedMemberName)
-      const member = db.query("SELECT prompt FROM team_member WHERE team_id = ? AND name = ?").get(teamId, memberName) as { prompt: string | null } | undefined
+      const member = db.query("SELECT prompt FROM team_member WHERE team_id = ? AND name = ? AND member_kind = 'worker'").get(teamId, memberName) as { prompt: string | null } | undefined
       if (!member) {
         sendJson(res, { error: "Team member not found" }, 404)
         return

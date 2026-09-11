@@ -1,6 +1,8 @@
 import type { ToolDeps } from "../types"
 import { requireTeamMember } from "./shared"
 import { log } from "../log"
+import { invalidateTeamSupervision } from "../supervision-state"
+import { armTeamSupervisionIfQuiescent } from "../supervisor"
 
 /**
  * Execute the team_tasks_complete tool. Marks a task as completed
@@ -83,5 +85,8 @@ export async function executeTeamTasksComplete(
   } catch { log(`tasks-complete:toast:failed`) }
 
   const unblockedMsg = unblocked > 0 ? ` Unblocked ${unblocked} dependent task${unblocked !== 1 ? "s" : ""}.` : ""
+  invalidateTeamSupervision(deps.db, teamInfo.teamId, now)
+  armTeamSupervisionIfQuiescent(deps.db, teamInfo.teamId, now)
+  deps.scheduler.kick()
   return `Completed task: ${task.content}${unblockedMsg}`
 }

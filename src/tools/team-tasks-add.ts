@@ -1,6 +1,8 @@
 import type { ToolDeps } from "../types"
 import { requireTeamMember } from "./shared"
 import { generateId } from "../util"
+import { invalidateTeamSupervision } from "../supervision-state"
+import { armTeamSupervisionIfQuiescent } from "../supervisor"
 
 interface TaskInput {
   content: string
@@ -43,6 +45,9 @@ export async function executeTeamTasksAdd(
     )
     ids.push(id)
   }
+  invalidateTeamSupervision(deps.db, teamInfo.teamId, now)
+  armTeamSupervisionIfQuiescent(deps.db, teamInfo.teamId, now)
+  deps.scheduler.kick()
 
   return `Added ${ids.length} task${ids.length !== 1 ? "s" : ""}: ${ids.join(", ")}`
 }

@@ -154,6 +154,45 @@ describe("durable scheduler runtime", () => {
     expect(db.query("SELECT state FROM scheduler_wake WHERE id = ?").get(wake.wakeId)).toEqual({ state: "leased" })
   })
 
+  test("arms a missed idle epoch only during maintenance and preserves its timestamp", async () => {
+    const scheduler = new DurableScheduler(db, mockClient(), DEFAULT_CONFIG.scheduler)
+
+    scheduler.kick()
+    await Bun.sleep(0)
+    expect(db.query("SELECT quiet_since FROM team_supervision WHERE team_id = 't1'").get()).toEqual({ quiet_since: null })
+
+    const before = Date.now()
+    await scheduler.recover()
+    const after = Date.now()
+    const state = db.query("SELECT quiet_since FROM team_supervision WHERE team_id = 't1'").get() as { quiet_since: number }
+    expect(state.quiet_since).toBeGreaterThanOrEqual(before)
+    expect(state.quiet_since).toBeLessThanOrEqual(after)
+
+    await scheduler.recover()
+    expect(db.query("SELECT quiet_since FROM team_supervision WHERE team_id = 't1'").get()).toEqual(state)
+  })
+
+  test("does not arm zero-worker, busy-worker, or queued-worker teams during maintenance", async () => {
+    db.run("UPDATE team_member SET member_kind = 'supervisor' WHERE team_id = 't1' AND name = 'alice'")
+    insertTeam(db, "t2", "busy-team", "lead-2")
+    insertMember(db, "t2", "bob", "session-b", "busy", "running")
+    insertTeam(db, "t3", "queued-team", "lead-3")
+    insertMember(db, "t3", "carol", "session-c")
+    queueWake(db, {
+      teamId: "t3", memberName: "carol", sessionId: "session-c", agent: "build",
+      reason: "message", coalesceKey: "carol", now: Date.now(),
+    })
+    const scheduler = new DurableScheduler(db, mockClient(), DEFAULT_CONFIG.scheduler, false)
+
+    await scheduler.recover()
+
+    expect(db.query("SELECT team_id, quiet_since FROM team_supervision ORDER BY team_id").all()).toEqual([
+      { team_id: "t1", quiet_since: null },
+      { team_id: "t2", quiet_since: null },
+      { team_id: "t3", quiet_since: null },
+    ])
+  })
+
   test("does not overwrite lifecycle status when a scheduled run goes idle", async () => {
     const wake = queueWake(db, {
       teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
