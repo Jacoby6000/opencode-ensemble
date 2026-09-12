@@ -64,6 +64,7 @@ select{-webkit-appearance:none;appearance:none;background-image:url("data:image/
 <span id="crumb" class="hidden md:inline text-[11px] text-txt-500 font-mono truncate"></span>
 </div>
 <div class="flex items-center gap-2 sm:gap-4 shrink-0">
+<button id="archived-toggle" type="button" hidden onclick="toggleArchived()" aria-pressed="false" aria-controls="team-switcher projects" class="rounded border border-base-700 px-2 py-1 text-[10px] text-txt-400 hover:text-txt-100">Show archived</button>
 <select id="team-switcher" aria-label="Switch team" onchange="selectTeam(this.value)" class="max-w-32 sm:max-w-52 rounded border border-base-700 bg-base-900 py-1 pl-2 text-[11px] font-mono text-txt-200"></select>
 <div id="hring" class="w-6 h-6 rounded-full" title="Team health"></div>
 <div class="flex items-center gap-2">

@@ -72,6 +72,66 @@ describe("dashboard UI contract", () => {
     expect(DASHBOARD_JS_EVENTS).toContain("rTeamSwitcher(t)")
   })
 
+  test("archived teams are hidden by default and can be explicitly revealed", () => {
+    expect(DASHBOARD_HEAD).toContain('id="archived-toggle"')
+    expect(DASHBOARD_JS_CORE).toContain("showArchived=initialQuery.get('archived')==='1'")
+    expect(DASHBOARD_JS_CORE).toContain("function visibleProjectTeams")
+    expect(DASHBOARD_JS_RENDER).toContain("Show archived")
+    expect(DASHBOARD_JS_RENDER).toContain("Hide archived")
+    expect(DASHBOARD_JS_EVENTS).toContain("function toggleArchived")
+    expect(DASHBOARD_JS_EVENTS).toContain("q.set('archived','1')")
+    expect(DASHBOARD_JS_EVENTS).toContain("showArchived=q.get('archived')==='1'")
+  })
+
+  test("archived visibility helpers exclude archived-only projects by default", () => {
+    const evaluate = new Function(
+      "location",
+      "sessionStorage",
+      "history",
+      "localStorage",
+      "Headers",
+      "fetch",
+      "state",
+      `${DASHBOARD_JS_CORE};S=state;return {teams:allTeams(),projects:allProjects(),current:cur(),reveal:function(){showArchived=true;selId=null;return {teams:allTeams(),projects:allProjects(),current:cur()}}}`,
+    )
+    const active = { id: "active", projectId: "p1", status: "active", timeUpdated: 3 }
+    const archived = { id: "archived", projectId: "p1", status: "archived", timeUpdated: 2 }
+    const archivedOnly = { id: "archived-only", projectId: "p2", status: "archived", timeUpdated: 1 }
+    const result = evaluate(
+      { hash: "", pathname: "/", search: "" },
+      { setItem() {}, getItem() { return null } },
+      { replaceState() {} },
+      { getItem() { return null } },
+      Headers,
+      () => Promise.reject(new Error("unexpected fetch")),
+      {
+        teams: [active, archived, archivedOnly],
+        projects: [
+          { id: "p1", teams: [active, archived], timeUpdated: 3 },
+          { id: "p2", teams: [archivedOnly], timeUpdated: 1 },
+        ],
+      },
+    ) as {
+      teams: { active: Array<{ id: string }>; archived: Array<{ id: string }> }
+      projects: Array<{ id: string }>
+      current: { id: string }
+      reveal: () => {
+        teams: { active: Array<{ id: string }>; archived: Array<{ id: string }> }
+        projects: Array<{ id: string }>
+        current: { id: string }
+      }
+    }
+
+    expect(result.teams.active.map(team => team.id)).toEqual(["active"])
+    expect(result.teams.archived).toEqual([])
+    expect(result.projects.map(project => project.id)).toEqual(["p1"])
+    expect(result.current.id).toBe("active")
+
+    const revealed = result.reveal()
+    expect(revealed.teams.archived.map(team => team.id)).toEqual(["archived", "archived-only"])
+    expect(revealed.projects.map(project => project.id)).toEqual(["p1", "p2"])
+  })
+
   test("project navigation can collapse", () => {
     expect(DASHBOARD_HEAD).not.toContain('<button id="nav-toggle"')
     expect(DASHBOARD_HEAD).toContain('id="project-rail"')

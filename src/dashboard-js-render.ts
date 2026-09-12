@@ -3,7 +3,7 @@ export const DASHBOARD_JS_RENDER = `
 function rSel(){
   const el=document.getElementById('projects'),ps=allProjects(),c=cur(),cp=curProject();
   const head=renderProjectNavHeader();
-  if(!ps.length){patch(el,head+'<div class="text-center text-txt-500 text-[12px] py-6">No projects yet</div>');return}
+  if(!ps.length){patch(el,head+'<div class="text-center text-txt-500 text-[12px] py-6">'+(archivedTeamCount()?'Archived teams are hidden':'No projects yet')+'</div>');return}
   let h='<nav class="text-[12px]" aria-label="Projects">'+head+'<div class="space-y-4">';
   ps.forEach(function(p){h+=renderProjectSection(p,cp,c)});
   h+='</div></nav>';
@@ -11,13 +11,13 @@ function rSel(){
 }
 
 function rTeamSwitcher(current){
-  const select=document.getElementById('team-switcher'),projects=allProjects();
-  const html=projects.map(p=>'<optgroup label="'+E(projectLabel(p))+'">'+[...(p.teams||[])].sort((a,b)=>b.timeUpdated-a.timeUpdated).map(t=>'<option value="'+E(t.id)+'" '+(current&&current.id===t.id?'selected':'')+'>'+E(t.name)+(t.status==='active'?'':' · '+E(t.status))+'</option>').join('')+'</optgroup>').join('');
-  patch(select,html);select.disabled=!current;
+  const select=document.getElementById('team-switcher'),toggle=document.getElementById('archived-toggle'),archived=archivedTeamCount(),projects=allProjects();
+  const html=projects.map(p=>'<optgroup label="'+E(projectLabel(p))+'">'+visibleProjectTeams(p).sort((a,b)=>b.timeUpdated-a.timeUpdated).map(t=>'<option value="'+E(t.id)+'" '+(current&&current.id===t.id?'selected':'')+'>'+E(t.name)+(t.status==='active'?'':' · '+E(t.status))+'</option>').join('')+'</optgroup>').join('');
+  patch(select,html);select.disabled=!current;toggle.hidden=!archived;toggle.setAttribute('aria-pressed',String(showArchived));toggle.textContent=(showArchived?'Hide archived':'Show archived')+' ('+archived+')';
 }
 
 function renderProjectNavHeader(){return '<div class="flex items-center justify-between gap-2 mb-3"><div class="text-[10px] uppercase tracking-[.18em] text-txt-500">Projects</div><button id="nav-toggle" type="button" aria-label="Hide project navigation" aria-controls="projects" aria-expanded="true" class="text-[10px] text-txt-500 border border-base-800 rounded px-1.5 py-[2px] hover:text-txt-200 hover:border-base-700 transition-colors">hide</button></div>'}
-function renderProjectSection(p,cp,c){const teams=p.teams||[];return '<section>'+renderProjectButton(p,cp)+'<div class="mt-2 ml-[7px] border-l border-base-800/80">'+[...teams].sort((a,b)=>b.timeUpdated-a.timeUpdated).map(t=>renderTeamLink(t,c)).join('')+'</div></section>'}
+function renderProjectSection(p,cp,c){const teams=visibleProjectTeams(p);return '<section>'+renderProjectButton(p,cp)+'<div class="mt-2 ml-[7px] border-l border-base-800/80">'+[...teams].sort((a,b)=>b.timeUpdated-a.timeUpdated).map(t=>renderTeamLink(t,c)).join('')+'</div></section>'}
 function renderProjectButton(p,cp){const teams=p.teams||[],active=teams.filter(t=>t.status==='active').length,sel=cp&&cp.id===p.id,pss=projectStatus(p);return '<button type="button" aria-current="'+(sel?'true':'false')+'" title="'+E(statusTitleProject(p))+'" class="project-link group w-full text-left text-txt-300 hover:text-txt-100 transition-colors" data-project="'+E(p.id)+'" onclick="selectProject(this.dataset.project)"><div class="flex items-center gap-2 min-w-0"><span class="w-[5px] h-[5px] rounded-full '+pss.dot+(pss.label==='working'?' pulse':'')+' shrink-0"></span><span class="font-mono font-semibold truncate">'+E(projectLabel(p))+'</span>'+chip(pss.label,pss.color)+'</div><div class="mt-1 ml-3 text-[10px] text-txt-500">'+active+' team'+(active!==1?'s':'')+'</div></button>'}
 function renderTeamLink(t,c){const ss=coarseTeamStatus(t),tsel=c&&c.id===t.id;return '<button type="button" title="'+E(statusTitleTeam(t))+'" class="team-link block w-full text-left border-l-2 border-transparent -ml-px py-1.5 pl-3 pr-2 text-[11px] text-txt-500 hover:text-txt-200 hover:bg-base-900/70 transition-colors" aria-current="'+(tsel?'true':'false')+'" data-team="'+E(t.id)+'" onclick="selectTeam(this.dataset.team)"><div class="flex items-center gap-2 min-w-0"><span class="w-[5px] h-[5px] rounded-full '+ss.dot+(ss.label==='working'?' pulse':'')+' shrink-0"></span><span class="truncate font-mono">'+E(t.name)+'</span><span class="ml-auto text-[9px] uppercase tracking-wide text-txt-500">'+E(ss.label)+'</span></div></button>'}
 
