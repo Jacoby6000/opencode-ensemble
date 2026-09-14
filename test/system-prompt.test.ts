@@ -2,6 +2,7 @@ import { describe, test, expect, beforeEach } from "bun:test"
 import { setupDb, insertTeam, insertMember } from "./helpers"
 import { buildLeadSystemPrompt, buildTeammateSystemPrompt, buildTeamCompactionContext } from "../src/system-prompt"
 import type { Database } from "../src/db"
+import { queueWake } from "../src/scheduler"
 
 function insertTask(db: Database, teamId: string, id: string, status: string, priority = "medium") {
   db.run(
@@ -238,6 +239,18 @@ describe("buildTeammateSystemPrompt peer messages", () => {
 
     const result = buildTeammateSystemPrompt(db, "t1", "alice")
     expect(result).not.toContain("Already delivered")
+  })
+
+  test("does not steal messages owned by a durable scheduler wake", () => {
+    db.run("INSERT INTO team_message (id, team_id, from_name, to_name, content, delivered, time_created) VALUES ('msg-1', 't1', 'bob', 'alice', 'Scheduled message', 0, 1)")
+    queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "sess-alice", agent: "build",
+      reason: "message", coalesceKey: "member:alice", messageId: "msg-1", now: 2,
+    })
+
+    const result = buildTeammateSystemPrompt(db, "t1", "alice")
+    expect(result).not.toContain("Scheduled message")
+    expect(db.query("SELECT delivered FROM team_message WHERE id = 'msg-1'").get()).toEqual({ delivered: 0 })
   })
 
   test("marks messages as delivered after injection", () => {

@@ -6,7 +6,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@hueyexe/opencode-ensemble.svg)](https://www.npmjs.com/package/@hueyexe/opencode-ensemble)
 [![npm downloads](https://img.shields.io/npm/dm/@hueyexe/opencode-ensemble.svg)](https://www.npmjs.com/package/@hueyexe/opencode-ensemble)
-[![tests](https://img.shields.io/badge/tests-666%20passing-brightgreen.svg)]()
+[![tests](https://img.shields.io/badge/tests-878%20passing-brightgreen.svg)]()
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue.svg)]()
 [![OpenCode SDK](https://img.shields.io/badge/deps-OpenCode%20SDK%20only-blue.svg)]()
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -120,7 +120,7 @@ team_merge({ member: "qa" })
 team_spawn({ name: "reviewer", agent: "explore", worktree: false, claim_task: "task_jkl012", prompt: "Review the merged diff for correctness, missed tests, and risky behavior. Do not edit files." })
 ```
 
-The lead runs the repository verification commands, summarizes the result, and only then cleans up the team. All merged teammate changes remain in your working directory as unstaged changes for review with `git diff`.
+The lead runs the repository verification commands, summarizes the result, and only then cleans up the team. All merged teammate changes remain in your working directory as unstaged changes for review with `git diff`. Whenever a shared task is marked complete, Ensemble also invokes a hidden Annalist to preserve durable decisions and outcomes in the repository's `annals/` history.
 
 ## Agent Skill
 
@@ -140,7 +140,7 @@ Good team shapes:
 
 ## Dashboard
 
-A real-time mission control dashboard runs at `http://localhost:4747` while OpenCode is active.
+A real-time mission control dashboard runs at `http://127.0.0.1:4747` while OpenCode is active. Open it initially as `http://127.0.0.1:4747/#token=TOKEN`, using the token described below.
 
 ![Ensemble Dashboard](docs/dashboard.png)
 
@@ -153,16 +153,21 @@ A real-time mission control dashboard runs at `http://localhost:4747` while Open
 - **Keyboard shortcuts** — `j/k` navigate agents, `Enter` opens drawer, `Esc` closes, `?` shows help
 - **Live clock** — current time + team session duration
 - **Project outline** — collapsible per-project grouping when teams span multiple working directories
+- **Scheduler pressure** — queued wakes, active runs, and fenced leases surfaced without prompt or tool payloads
 
 Configure the port in `.opencode/ensemble.json`:
 
 ```json
 {
-  "dashboardPort": 4747
+  "dashboard": {
+    "port": 4747
+  }
 }
 ```
 
 Set to `0` to disable. The dashboard starts automatically when OpenCode loads the plugin.
+
+Dashboard APIs require the bearer token stored in `~/.config/opencode/ensemble-dashboard.token` with owner-only permissions. Supply it in the URL fragment as `http://127.0.0.1:4747/#token=TOKEN`; the dashboard moves it to browser session storage and removes the fragment before making API requests.
 
 ## Install
 
@@ -239,7 +244,7 @@ Build with `bun run build`, then restart OpenCode to pick up changes.
 
 ## Tools
 
-14 tools. The lead has all of them. Teammates get 6 (messaging + tasks).
+14 tools. The lead has all of them. Teammates get 7 (messaging, group inspection, and tasks).
 
 **Team lifecycle** (lead only, except archived-team purge may also be run from the main session)
 
@@ -260,8 +265,10 @@ Archived-team purge is intentionally two-step. First call `team_cleanup` with `p
 | Tool | What it does |
 |------|-------------|
 | `team_message` | Send a direct message to a teammate or the lead. Also handles plan approval/rejection. |
-| `team_broadcast` | Message everyone on the team. |
-| `team_results` | Retrieve full message content (messages to lead are truncated on delivery). |
+| `team_broadcast` | Message everyone, atomically create a named group with immutable participants and its first message, or send to an existing group as a participant. |
+| `team_results` | Retrieve unread ordinary messages, list all team groups, or inspect any group history without changing delivery/read state. The hidden Annalist can also inspect any direct or broadcast mailbox non-destructively. |
+
+Named group inboxes are team-scoped routing controls, not private archives. Only participants can send and only active participants receive proactive delivery, while every active ordinary teammate and the lead can inspect group history. The dashboard shows group channels to authenticated users and keeps the composer read-only when the lead is not a participant.
 
 **Task board** (everyone)
 
@@ -269,12 +276,12 @@ Archived-team purge is intentionally two-step. First call `team_cleanup` with `p
 |------|-------------|
 | `team_tasks_list` | See all tasks with status and assignee. |
 | `team_tasks_add` | Add tasks to the shared board. |
-| `team_tasks_complete` | Mark a task done. Unblocks dependents. |
+| `team_tasks_complete` | Mark a task done, unblock dependents, and durably queue its Annalist record. |
 | `team_claim` | Claim a pending task. Atomic, prevents double-claims. |
 
 ## What you see in the TUI
 
-The plugin works within OpenCode's existing TUI. For deeper visibility, open the [dashboard](#dashboard) at `http://localhost:4747`.
+The plugin works within OpenCode's existing TUI. For deeper visibility, open the authenticated [dashboard](#dashboard) at `http://127.0.0.1:4747/#token=TOKEN`.
 
 What you get:
 
@@ -296,6 +303,7 @@ Teammate messages arrive in the lead's session as `[Team message from alice]: ..
 - **Shell environment**: teammate shells get `ENSEMBLE_TEAM`, `ENSEMBLE_MEMBER`, `ENSEMBLE_ROLE`, and `ENSEMBLE_BRANCH` variables
 - **Sub-agent isolation**: teammates' sub-agents can't use team tools (parent chain tracking, max depth 10)
 - **Crash recovery**: stale busy members marked as errored on restart, orphaned sessions aborted, orphaned worktrees cleaned up, undelivered messages redelivered
+- **Automatic decision history**: one hidden Annalist invocation is durably queued for every completed task. It can inspect all direct, broadcast, and group mailbox history before updating repository annals.
 - **Spawn rollback**: if the initial prompt fails, the member, session, and worktree are all cleaned up
 - **Timeout watchdog**: teammates stuck busy beyond the TTL are automatically timed out and aborted
 - **Stall detection**: detects teammates making no progress (low output tokens or no communication) and escalates to the lead
@@ -366,13 +374,29 @@ Configure via JSON files, environment variables, or both. Project config overrid
 
 ```json
 {
-  "mergeOnCleanup": true,
+  "mergeOnCleanup": false,
+  "readOnlyAgents": ["Shit Tester"],
   "stallThresholdMs": 300000,
   "stallMinSteps": 5,
   "stallTokenThreshold": 200,
   "timeoutMs": 1800000,
   "rateLimitCapacity": 10,
-  "dashboardPort": 4747,
+  "dashboard": {
+    "port": 4747
+  },
+  "scheduler": {
+    "identityLimits": {
+      "global": 32,
+      "perAgent": {}
+    },
+    "runLimits": {
+      "global": 4,
+      "perAgent": {}
+    },
+    "reservationTtlMs": 600000,
+    "leaseTtlMs": 60000,
+    "pumpIntervalMs": 1000
+  },
   "defaultModel": "anthropic/claude-sonnet-4-6",
   "modelPool": ["anthropic/claude-opus-4-7", "anthropic/claude-sonnet-4-6", "openai/gpt-5.4"],
   "modelsByAgent": {},
@@ -387,13 +411,21 @@ All fields are optional. Missing fields use defaults.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `mergeOnCleanup` | `true` | Auto-merge worktree branches on cleanup (squash + unstage) |
+| `mergeOnCleanup` | `false` | Auto-merge worktree branches on cleanup (squash + unstage) |
+| `readOnlyAgents` | `[]` | Custom agent names that run without edit, shell, or worktree access. `plan` and `explore` are always read-only. |
 | `stallThresholdMs` | `300000` (5 min) | Time without communication before stall escalation. `0` disables. |
 | `stallMinSteps` | `5` | Min model steps before token-based stall check kicks in |
 | `stallTokenThreshold` | `200` | Output tokens per step below which the agent is considered stalled |
 | `timeoutMs` | `1800000` (30 min) | Hard timeout for busy teammates. `0` disables. |
 | `rateLimitCapacity` | `10` | Token bucket capacity for team tool calls. `0` disables. |
-| `dashboardPort` | `4747` | Dashboard server port. `0` disables. |
+| `dashboard.port` | `4747` | Dashboard server port. `0` disables. The legacy `dashboardPort` alias remains accepted. |
+| `scheduler.identityLimits.global` | `32` | Maximum reserved or active worker and hidden internal-agent identities across teams. Lead sessions are not counted. |
+| `scheduler.identityLimits.perAgent` | `{}` | Optional per-agent identity limits, for example `{"build": 8}`. |
+| `scheduler.runLimits.global` | `4` | Maximum concurrent teammate runs across teams. |
+| `scheduler.runLimits.perAgent` | `{}` | Optional per-agent concurrent run limits. |
+| `scheduler.reservationTtlMs` | `600000` (10 min) | How long an unactivated spawn reservation holds identity capacity. |
+| `scheduler.leaseTtlMs` | `60000` (1 min) | Run lease duration. Expired leases remain capacity-fencing until session reconciliation. |
+| `scheduler.pumpIntervalMs` | `1000` (1 sec) | Durable queue maintenance and retry interval. |
 | `defaultModel` | `""` | Default model for all agents (e.g. `"anthropic/claude-sonnet-4-6"`). Empty = OpenCode's default. |
 | `modelPool` | `[]` | List of models for rotation/random assignment. |
 | `modelsByAgent` | `{}` | Map agent type to model (e.g. `{"build": "anthropic/claude-opus-4-7"}`). |
@@ -455,7 +487,7 @@ Same coordination model (shared tasks, peer messaging, lead coordination) with s
 ```bash
 bun install
 bun run typecheck
-bun test             # 623 tests
+bun test             # 878 tests
 bun run build
 ```
 

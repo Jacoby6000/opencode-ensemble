@@ -97,7 +97,7 @@ export class ProgressTracker {
   /** Latest activity timestamp across all tracked signals (0 when nothing recorded). */
   lastActivityAt(sessionId: string): number {
     const records = this.steps.get(sessionId)
-    const lastStepAt = records && records.length > 0 ? records[records.length - 1]!.timestamp : 0
+    const lastStepAt = records?.at(-1)?.timestamp ?? 0
     return Math.max(
       this.lastMessageAt.get(sessionId) ?? 0,
       this.lastTaskAt.get(sessionId) ?? 0,

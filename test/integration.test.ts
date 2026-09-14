@@ -39,7 +39,7 @@ describe("integration: full team lifecycle", () => {
     // Verify: 4 members in DB
     const members = deps.db.query("SELECT name, status FROM team_member WHERE team_id = ?").all(team.id) as Array<{ name: string; status: string }>
     expect(members).toHaveLength(4)
-    for (const m of members) expect(m.status).toBe("busy")
+    for (const m of members) expect(m.status).toBe("ready")
 
     // Verify: 4 session.create + 4 promptAsync (fire-and-forget spawn prompts)
     expect(deps.client.calls.filter(c => c.method === "session.create")).toHaveLength(4)
@@ -168,7 +168,7 @@ describe("integration: worktree instance skips recovery (deadlock prevention)", 
   })
 })
 
-describe("integration: spawn rollback notifies lead on failure", () => {
+describe("integration: spawn failures", () => {
   let deps: Deps
   const leadSession = "lead-sess"
 
@@ -189,7 +189,7 @@ describe("integration: spawn rollback notifies lead on failure", () => {
     expect(members).toHaveLength(0)
   })
 
-  test("promptAsync failure triggers async rollback with lead notification", async () => {
+  test("promptAsync failure preserves the member and requeues durable work", async () => {
     await executeTeamCreate(deps, { name: "rollback-team" }, leadSession)
     const team = deps.db.query("SELECT id FROM team WHERE name = 'rollback-team'").get() as { id: string }
 
@@ -200,18 +200,15 @@ describe("integration: spawn rollback notifies lead on failure", () => {
     expect(result).toContain("ghost")
     expect(result).toContain("spawned")
 
-    // Wait for async rollback
+    // Wait for asynchronous dispatch rejection handling.
     await new Promise(resolve => setTimeout(resolve, 50))
 
-    // Member cleaned up from DB
     const member = deps.db.query("SELECT * FROM team_member WHERE name = 'ghost'").get()
-    expect(member).toBeNull()
+    expect(member).toBeTruthy()
+    expect(deps.db.query("SELECT state FROM scheduler_wake WHERE member_name = 'ghost'").get()).toEqual({ state: "queued" })
 
-    // System message sent to lead about the failure
     const msg = deps.db.query("SELECT content FROM team_message WHERE team_id = ? AND to_name = 'lead' AND from_name = 'system'").get(team.id) as { content: string } | null
-    expect(msg).toBeTruthy()
-    expect(msg!.content).toContain("ghost")
-    expect(msg!.content).toContain("failed")
+    expect(msg).toBeNull()
   })
 })
 
@@ -286,9 +283,12 @@ describe("integration: message delivery pipeline end-to-end", () => {
 
     const aliceSession = (deps.db.query("SELECT session_id FROM team_member WHERE name = 'alice'").get() as { session_id: string }).session_id
     const bobSession = (deps.db.query("SELECT session_id FROM team_member WHERE name = 'bob'").get() as { session_id: string }).session_id
+    deps.scheduler.onSessionStatus(bobSession, "busy")
+    deps.scheduler.onSessionStatus(bobSession, "idle")
     deps.client.calls.length = 0
 
     await executeTeamMessage(deps, { to: "bob", text: "can you check the tests?" }, aliceSession)
+    await Bun.sleep(0)
 
     // promptAsync delivers full content to bob's session
     const promptCalls = deps.client.calls.filter(c => c.method === "session.promptAsync")

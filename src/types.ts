@@ -1,7 +1,8 @@
 import type { Database } from "./db"
 import type { MemberRegistry, DescendantTracker, PendingPurgeApprovals } from "./state"
-import type { EnsembleConfig } from "./config"
+import type { ResolvedEnsembleConfig } from "./config"
 import type { ProgressTracker } from "./progress"
+import type { SchedulerController } from "./scheduler-runtime"
 
 /**
  * Shared dependencies injected into every tool's execute function.
@@ -17,9 +18,11 @@ export interface ToolDeps {
   /** The project root directory — used for reading AGENTS.md and other project files. */
   directory: string
   /** Plugin configuration. */
-  config: Required<EnsembleConfig>
+  config: ResolvedEnsembleConfig
   /** Stall/activity tracker — shared with the Watchdog. */
   progressTracker: ProgressTracker
+  /** Durable teammate wake scheduler. */
+  scheduler: SchedulerController
 }
 
 /** A single permission rule for session-level enforcement. */
@@ -39,6 +42,8 @@ export interface PluginClient {
     create(options: {
       parentID?: string
       title?: string
+      agent?: string
+      model?: { providerID: string; id: string; variant?: string }
       permission?: PermissionRule[]
       workspaceID?: string
       directory?: string

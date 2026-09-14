@@ -5,6 +5,7 @@ import { getTeamResourceParts, preserveBranch, preservedBranchName } from "./mer
 import type { PreserveBranchFn } from "./merge-helper"
 import { releaseMemberTasks } from "../tasks"
 import { log } from "../log"
+import { getMemberPromptOptions } from "../member-model"
 
 /**
  * Execute the team_shutdown tool. Requests a teammate to shut down.
@@ -22,7 +23,7 @@ export async function executeTeamShutdown(
 ): Promise<string> {
   const teamInfo = requireLead(deps, sessionId)
 
-  const member = deps.db.query("SELECT session_id, status, worktree_branch, worktree_dir FROM team_member WHERE team_id = ? AND name = ?")
+  const member = deps.db.query("SELECT session_id, status, worktree_branch, worktree_dir FROM team_member WHERE team_id = ? AND name = ? AND member_kind = 'worker'")
     .get(teamInfo.teamId, args.member) as { session_id: string; status: string; worktree_branch: string | null; worktree_dir: string | null } | null
   if (!member) throw new Error(`Teammate "${args.member}" not found in team "${teamInfo.teamName}"`)
   if (member.status === "shutdown") throw new Error(`Teammate "${args.member}" is already shut down`)
@@ -75,6 +76,7 @@ export async function executeTeamShutdown(
         type: "text",
         text: `[Shutdown requested]: The lead has requested you shut down. Finish your current task, send your final findings to the lead via team_message, then stop.`,
       }],
+      ...getMemberPromptOptions(deps.db, teamInfo.teamId, args.member),
     }).catch(() => { /* fire-and-forget */ })
   } catch {
     // promptAsync failed — best effort
@@ -118,6 +120,7 @@ async function preserveAndAbort(
   }
 
   // Now safe to abort — the branch is preserved
+  deps.scheduler.terminateMember(teamId, memberName, "shutdown")
   try {
     await deps.client.session.abort({ sessionID: sessionId })
   } catch {

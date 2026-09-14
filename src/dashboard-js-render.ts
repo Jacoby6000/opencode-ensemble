@@ -3,15 +3,21 @@ export const DASHBOARD_JS_RENDER = `
 function rSel(){
   const el=document.getElementById('projects'),ps=allProjects(),c=cur(),cp=curProject();
   const head=renderProjectNavHeader();
-  if(!ps.length){patch(el,head+'<div class="text-center text-txt-500 text-[12px] py-6">No projects yet</div>');return}
+  if(!ps.length){patch(el,head+'<div class="text-center text-txt-500 text-[12px] py-6">'+(archivedTeamCount()?'Archived teams are hidden':'No projects yet')+'</div>');return}
   let h='<nav class="text-[12px]" aria-label="Projects">'+head+'<div class="space-y-4">';
   ps.forEach(function(p){h+=renderProjectSection(p,cp,c)});
   h+='</div></nav>';
   patch(el,h);
 }
 
+function rTeamSwitcher(current){
+  const select=document.getElementById('team-switcher'),toggle=document.getElementById('archived-toggle'),archived=archivedTeamCount(),projects=allProjects();
+  const html=projects.map(p=>'<optgroup label="'+E(projectLabel(p))+'">'+visibleProjectTeams(p).sort((a,b)=>b.timeUpdated-a.timeUpdated).map(t=>'<option value="'+E(t.id)+'" '+(current&&current.id===t.id?'selected':'')+'>'+E(t.name)+(t.status==='active'?'':' · '+E(t.status))+'</option>').join('')+'</optgroup>').join('');
+  patch(select,html);select.disabled=!current;toggle.hidden=!archived;toggle.setAttribute('aria-pressed',String(showArchived));toggle.textContent=(showArchived?'Hide archived':'Show archived')+' ('+archived+')';
+}
+
 function renderProjectNavHeader(){return '<div class="flex items-center justify-between gap-2 mb-3"><div class="text-[10px] uppercase tracking-[.18em] text-txt-500">Projects</div><button id="nav-toggle" type="button" aria-label="Hide project navigation" aria-controls="projects" aria-expanded="true" class="text-[10px] text-txt-500 border border-base-800 rounded px-1.5 py-[2px] hover:text-txt-200 hover:border-base-700 transition-colors">hide</button></div>'}
-function renderProjectSection(p,cp,c){const teams=p.teams||[];return '<section>'+renderProjectButton(p,cp)+'<div class="mt-2 ml-[7px] border-l border-base-800/80">'+[...teams].sort((a,b)=>b.timeUpdated-a.timeUpdated).map(t=>renderTeamLink(t,c)).join('')+'</div></section>'}
+function renderProjectSection(p,cp,c){const teams=visibleProjectTeams(p);return '<section>'+renderProjectButton(p,cp)+'<div class="mt-2 ml-[7px] border-l border-base-800/80">'+[...teams].sort((a,b)=>b.timeUpdated-a.timeUpdated).map(t=>renderTeamLink(t,c)).join('')+'</div></section>'}
 function renderProjectButton(p,cp){const teams=p.teams||[],active=teams.filter(t=>t.status==='active').length,sel=cp&&cp.id===p.id,pss=projectStatus(p);return '<button type="button" aria-current="'+(sel?'true':'false')+'" title="'+E(statusTitleProject(p))+'" class="project-link group w-full text-left text-txt-300 hover:text-txt-100 transition-colors" data-project="'+E(p.id)+'" onclick="selectProject(this.dataset.project)"><div class="flex items-center gap-2 min-w-0"><span class="w-[5px] h-[5px] rounded-full '+pss.dot+(pss.label==='working'?' pulse':'')+' shrink-0"></span><span class="font-mono font-semibold truncate">'+E(projectLabel(p))+'</span>'+chip(pss.label,pss.color)+'</div><div class="mt-1 ml-3 text-[10px] text-txt-500">'+active+' team'+(active!==1?'s':'')+'</div></button>'}
 function renderTeamLink(t,c){const ss=coarseTeamStatus(t),tsel=c&&c.id===t.id;return '<button type="button" title="'+E(statusTitleTeam(t))+'" class="team-link block w-full text-left border-l-2 border-transparent -ml-px py-1.5 pl-3 pr-2 text-[11px] text-txt-500 hover:text-txt-200 hover:bg-base-900/70 transition-colors" aria-current="'+(tsel?'true':'false')+'" data-team="'+E(t.id)+'" onclick="selectTeam(this.dataset.team)"><div class="flex items-center gap-2 min-w-0"><span class="w-[5px] h-[5px] rounded-full '+ss.dot+(ss.label==='working'?' pulse':'')+' shrink-0"></span><span class="truncate font-mono">'+E(t.name)+'</span><span class="ml-auto text-[9px] uppercase tracking-wide text-txt-500">'+E(ss.label)+'</span></div></button>'}
 
@@ -53,10 +59,13 @@ function rSum(t){
 }
 
 function rAttention(t){
-  const el=document.getElementById('attention'),a=deriveAttention(t),h=deriveHealth(t),tk=t.tasks||[];
+  const el=document.getElementById('attention'),a=deriveAttention(t),h=deriveHealth(t),tk=t.tasks||[],sch=t.scheduler||{};
   const tone=a.items.length?'border-amber-500/30 bg-amber-500/[0.05]':'border-emerald-500/20 bg-emerald-500/[0.035]';
   const lead=a.items.length?'Needs attention':'No blockers detected';
   const chips=[chip(h.w+' working','blue'),chip(a.running.length+' active tasks','green'),chip(a.blocked.length+' blocked',a.blocked.length?'amber':'muted'),chip(tk.filter(x=>x.status==='pending').length+' pending','muted')];
+  if(sch.queuedWakes)chips.push(chip(sch.queuedWakes+' scheduler queued','amber'));
+  if(sch.activeRuns)chips.push(chip(sch.activeRuns+' scheduler active','blue'));
+  if(sch.expiredRuns)chips.push(chip(sch.expiredRuns+' scheduler fenced','red'));
   let html='<div class="rounded-lg border '+tone+' px-3 py-2 flex flex-col md:flex-row md:items-center gap-2 md:gap-4">';
   html+='<div class="min-w-[180px]"><div class="text-[10px] uppercase tracking-[.16em] text-txt-500">Team attention</div><div class="text-[14px] font-semibold text-txt-100">'+lead+'</div></div>';
   html+='<div class="flex flex-wrap gap-1.5">'+chips.join('')+'</div>';
@@ -74,7 +83,7 @@ function rAgents(t){
     const s=si(m.status),task=activeTaskFor(m.name,t.tasks||[]),msg=lastMessageFor(m.name,msgs),blocked=blockedTaskFor(m.name,t.tasks||[]);
     const d=D(n-m.timeUpdated),mi=msg?relT(msg.timeCreated):'\\u2014';
     const tt=task?.content,tr=tt&&tt.length>90?tt.slice(0,90)+'\\u2026':tt;
-    const mp=msg?(msg.content.length>90?msg.content.slice(0,90)+'\\u2026':msg.content):'';
+    const mc=msg?messageContent(msg):'',mp=mc?(mc.length>90?mc.slice(0,90)+'\\u2026':mc):'';
     const spark=deriveSparkline(m.name,msgs);
     const isSel=selCard===idx;
     return '<button type="button" class="text-left rounded-lg border '+s.c+' p-3 transition-all duration-300 cursor-pointer hover:border-base-600 focus-visible:border-blue-400'+(isSel?' card-sel':'')+'" data-card="'+E(m.name)+'" onclick="openDrawer(this.dataset.card)" onkeydown="if(event.key===\\'Enter\\'||event.key===\\' \\'){event.preventDefault();openDrawer(this.dataset.card)}">'+
@@ -100,7 +109,9 @@ function rAgents(t){
 function openDrawer(name){
   var t=cur();if(!t)return;
   var m=(t.members||[]).find(x=>x.name===name);if(!m)return;
-  var s=si(m.status),msgs=(t.messages||[]).filter(x=>x.fromName===name);
+  var s=si(m.status),msgs=(t.messages||[]).filter(x=>x.fromName===name),prompt=memberPrompt(t.id,m.name);
+  var needsMessages=(t.messages||[]).some(x=>!fullMessageBodies.has(x.id));
+  var needsPrompt=m.hasPrompt&&!loadedMemberPrompts.has(memberPromptKey(t.id,m.name));
   var h='';
   // Header
   h+='<div class="flex items-center justify-between mb-4">';
@@ -118,10 +129,13 @@ function openDrawer(name){
   if(m.isRetrying)meta.push(chip('retrying'+(m.retryAttempt!=null?' (attempt '+m.retryAttempt+')':'')+(m.retryMessage?': '+E(m.retryMessage):''),'amber'));
   if(m.worktreeBranch)meta.push(chip(E(m.worktreeBranch),'muted'));
   h+='<div class="flex flex-wrap gap-1.5 mb-4 pb-4 border-b border-base-800/50">'+meta.join('')+'</div>';
+  h+='<button type="button" data-conversation="member:'+E(m.name)+'" onclick="closeDrawer();selectConversation(this.dataset.conversation)" class="mb-4 w-full rounded border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-[12px] font-medium text-blue-300 hover:bg-blue-500/15">Open full conversation</button>';
   // Prompt
-  if(m.prompt){
+  if(prompt){
     h+='<div class="mb-4"><div class="text-txt-400 text-[10px] uppercase tracking-wider mb-2">Original Prompt</div>';
-    h+='<div class="text-[13px] text-txt-200 md bg-base-800/20 rounded-lg p-3 border border-base-800/30">'+md(m.prompt)+'</div></div>';
+    h+='<div class="text-[13px] text-txt-200 md bg-base-800/20 rounded-lg p-3 border border-base-800/30">'+md(prompt)+'</div></div>';
+  }else if(needsPrompt){
+    h+='<div class="mb-4 text-[12px] text-txt-500">Loading original prompt...</div>';
   }
   // Chat log
   h+='<div class="text-txt-400 text-[10px] uppercase tracking-wider mb-3">Conversation</div>';
@@ -132,7 +146,7 @@ function openDrawer(name){
     allMsgs.sort(function(a,b){return a.timeCreated-b.timeCreated});
     allMsgs.forEach(function(am){
       var isAgent=am.fromName===name;
-      var p=parseR(am.content);
+      var content=messageContent(am),p=parseR(content);
       var deliv=am.delivered?(am.read?'\\u2713\\u2713':'\\u2713'):'';
       var align=isAgent?'mr-8':'ml-8';
       var bubbleBg=isAgent?'bg-blue-500/[0.07] border-blue-500/20':'bg-base-800/40 border-base-700/30';
@@ -149,7 +163,7 @@ function openDrawer(name){
         h+='<div class="mb-1">'+chip(E(p.status),p.status==='completed'?'green':'red')+' <span class="text-[13px] text-txt-200 font-medium">'+E(p.summary)+'</span></div>';
         if(p.details)h+='<div class="text-[12px] text-txt-300 md mt-2">'+md(p.details)+'</div>';
       }else{
-        h+='<div class="text-[12px] text-txt-300 md">'+md(am.content)+'</div>';
+        h+='<div class="text-[12px] text-txt-300 md">'+md(content)+'</div>';
       }
       h+='</div></div>';
     });
@@ -164,6 +178,7 @@ function openDrawer(name){
   h+='</div>';
   var drawer=document.getElementById('drawer');
   drawer.innerHTML=h;
+  drawer.dataset.member=name;
   drawer.classList.add('open');
   drawer.setAttribute('aria-hidden','false');
   drawer.inert=false;
@@ -174,6 +189,33 @@ function openDrawer(name){
   drawerActivity=null;drawerSession=null;
   if(m.sessionId)fetchActivity(m.sessionId);
   else rDrawerActivityUpdate();
+  if(needsMessages||needsPrompt){
+    const loads=[];if(needsMessages)loads.push(ensureTeamMessages(t.id));if(needsPrompt)loads.push(ensureMemberPrompt(t.id,m.name));
+    Promise.all(loads).then(function(){if(drawer.classList.contains('open')&&drawer.dataset.member===name)openDrawer(name)}).catch(()=>{});
+  }
+}
+
+function rConversations(t){
+  const requested=channelParts(selectedChannel),valid=requested.type==='broadcast'||requested.type==='member'&&(t.members||[]).some(m=>m.name===requested.name)||requested.type==='group'&&(t.groups||[]).some(g=>g.name===requested.name),channel=valid?selectedChannel:'broadcast',cp=channelParts(channel);selectedChannel=channel;
+  const page=conversationPages.get(conversationKey(t.id,channel)),loading=conversationLoads.has(conversationKey(t.id,channel));
+  const channels=document.getElementById('conversation-channels');
+  const channelButton=(id,label,detail)=>'<button type="button" class="block w-full rounded px-2.5 py-2 text-left '+(channel===id?'bg-base-800 text-txt-100':'text-txt-400 hover:bg-base-800/50 hover:text-txt-200')+'" aria-current="'+(channel===id?'true':'false')+'" data-channel="'+E(id)+'" onclick="selectConversation(this.dataset.channel)"><span class="block text-[12px] font-medium">'+E(label)+'</span><span class="block text-[10px] text-txt-500 mt-0.5">'+E(detail)+'</span></button>';
+  patch(channels,'<div class="text-[10px] uppercase tracking-[.16em] text-txt-500 mb-2">Channels</div><div class="space-y-1">'+channelButton('broadcast','Broadcast mailbox','Messages to every agent')+(t.members||[]).map(m=>channelButton('member:'+m.name,m.name,(m.agent||'agent')+' · '+si(m.status).l)).join('')+'</div><div class="text-[10px] uppercase tracking-[.16em] text-txt-500 mb-2 mt-4">Groups</div><div class="space-y-1">'+((t.groups||[]).length?(t.groups||[]).map(g=>channelButton('group:'+g.name,g.name,g.participants.join(', ')+(g.canSend?' · member':' · read-only'))).join(''):'<div class="px-2.5 py-2 text-[11px] text-txt-500">No groups</div>')+'</div>');
+  const selectedGroup=cp.type==='group'?(t.groups||[]).find(g=>g.name===cp.name):null,heading=cp.type==='broadcast'?'Broadcast mailbox':cp.name;
+  patch(document.getElementById('conversation-heading'),'<div class="flex items-center gap-2"><h2 class="font-mono text-[15px] font-semibold text-txt-100">'+E(heading)+'</h2>'+chip(cp.type==='broadcast'?'team-wide':cp.type==='group'?'group':'direct',cp.type==='broadcast'?'amber':cp.type==='group'?'green':'blue')+'</div><div class="mt-1 text-[11px] text-txt-500">'+(cp.type==='broadcast'?'Messages sent to all schedulable agents in this team.':cp.type==='group'?(selectedGroup?.canSend?'Group history. Lead is a participant.':'Group history is visible read-only; lead is not a participant.'):'Complete mailbox history involving this agent.')+'</div>');
+  const history=document.getElementById('conversation-history');
+  if(!page){patch(history,'<div class="flex h-full items-center justify-center text-[12px] text-txt-500">'+(loading?'Loading conversation...':'No messages yet')+'</div>')}
+  else{
+    const ordered=[...page.messages].sort((a,b)=>a.timeCreated-b.timeCreated||String(a.id).localeCompare(String(b.id)));
+    let html=page.nextCursor?'<div class="mb-3 text-center"><button type="button" onclick="loadOlderMessages()" class="rounded border border-base-700 px-2.5 py-1 text-[11px] text-txt-400 hover:text-txt-100">Load older messages</button></div>':'';
+    html+=ordered.length?ordered.map(m=>{const fromLead=m.fromName==='lead',target=m.groupName?' → #'+m.groupName:m.toName?' → '+m.toName:' → all';return '<article class="mb-3 '+(fromLead?'ml-8':'mr-8')+'"><div class="rounded-lg border '+(fromLead?'border-emerald-500/20 bg-emerald-500/[0.05]':'border-blue-500/20 bg-blue-500/[0.05]')+' p-3"><div class="mb-2 flex items-center gap-2 text-[10px]"><span class="font-medium '+(fromLead?'text-emerald-400':'text-blue-400')+'">'+E(m.fromName)+'</span><span class="text-txt-500">'+E(target)+'</span><span class="ml-auto text-txt-500">'+relT(m.timeCreated)+'</span></div><div class="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-txt-200">'+E(m.content)+'</div></div></article>'}).join(''):'<div class="flex h-full items-center justify-center text-[12px] text-txt-500">No messages in this channel</div>';
+    patch(history,html);
+  }
+  const selectedMember=cp.type==='member'?(t.members||[]).find(m=>m.name===cp.name):null,hasRecipients=(t.members||[]).some(m=>m.status==='ready'||m.status==='busy'),unavailable=t.status!=='active'||(cp.type==='broadcast'?!hasRecipients:cp.type==='group'?!selectedGroup?.canSend:!selectedMember||!['ready','busy'].includes(selectedMember.status));
+  const send=document.getElementById('conversation-send'),text=document.getElementById('conversation-text');send.disabled=conversationSending||unavailable;text.disabled=unavailable;send.textContent=conversationSending?'Sending...':(cp.type==='broadcast'?'Send broadcast':cp.type==='group'?'Send to group':'Send message');
+  const status=document.getElementById('conversation-status');status.textContent=conversationError;status.className='text-[11px] '+(conversationError?'text-red-400':'text-txt-400');
+  if(unavailable&&!conversationError)status.textContent=t.status!=='active'?'Archived teams are read-only.':cp.type==='group'&&!selectedGroup?.canSend?'Read-only: lead is not a group participant.':'This channel has no available recipient.';
+  if(!page&&!loading)ensureConversation(t.id,channel,false).then(rConversations.bind(null,t)).catch(err=>{conversationError=err.message;rConversations(t)});
 }
 
 function rDrawerActivityUpdate(){
@@ -315,7 +357,7 @@ function rActivity(t){
   msgs.slice(0,30).forEach(function(m,mi){
     const isNew=hasNew&&mi<(newCount-prevMC);
     const isExp=expMsgs.has(m.id);
-    const p=parseR(m.content);
+    const content=messageContent(m),p=parseR(content);
     const deliv=m.delivered?(m.read?'\\u2713\\u2713':'\\u2713'):'';
     const isFromAgent=m.fromName!=='lead'&&m.fromName!=='system';
     const isPeer=isFromAgent&&m.toName&&m.toName!=='lead'&&m.toName!=='all';
@@ -338,8 +380,8 @@ function rActivity(t){
       if(isExp&&p.details)html+='<div class="mt-2 text-[12px] text-txt-300 md">'+md(p.details)+'</div>';
       if(!isExp&&p.details)html+='<div class="mt-1 text-[10px] text-txt-500">Click to expand details</div>';
     }else{
-      if(isExp){html+='<div class="text-[12px] text-txt-300 md">'+md(m.content)+'</div>'}
-      else{const preview=m.content.length>120?m.content.slice(0,120)+'\\u2026':m.content;html+='<div class="text-[13px] text-txt-300 truncate">'+E(preview)+'</div>'}
+      if(isExp){html+='<div class="text-[12px] text-txt-300 md">'+md(content)+'</div>'}
+      else{const preview=content.length>120?content.slice(0,120)+'\\u2026':content;html+='<div class="text-[13px] text-txt-300 truncate">'+E(preview)+'</div>'}
     }
     html+='</div></div></div>';
   });

@@ -27,6 +27,18 @@ describe("team_create", () => {
     expect(project.name).not.toBe("test-project")
   })
 
+  test("persists the lead prompt identity for future wake-ups", async () => {
+    await executeTeamCreate(deps, { name: "my-team" }, "lead-sess", {
+      agent: "solutions-architect",
+      model: { providerID: "openrouter", modelID: "anthropic/claude-sonnet" },
+    })
+
+    expect(deps.db.query("SELECT lead_agent, lead_model FROM team WHERE name = ?").get("my-team")).toEqual({
+      lead_agent: "solutions-architect",
+      lead_model: "openrouter/anthropic/claude-sonnet",
+    })
+  })
+
   test("uses explicit project name on first team in a project", async () => {
     await executeTeamCreate(deps, { name: "my-team", project_name: "silver-river" }, "lead-sess")
 

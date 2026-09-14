@@ -1,13 +1,14 @@
 import { describe, expect, test } from "bun:test"
-import { DASHBOARD_HEAD } from "../src/dashboard-html"
+import { DASHBOARD_COLORS, DASHBOARD_HEAD } from "../src/dashboard-html"
 import { DASHBOARD_JS_CORE } from "../src/dashboard-js-core"
 import { DASHBOARD_JS_EVENTS } from "../src/dashboard-js-events"
 import { DASHBOARD_JS_RENDER } from "../src/dashboard-js-render"
 
 function colorToken(group: string, key: string): string {
-  const match = DASHBOARD_HEAD.match(new RegExp(`${group}:\\{[^}]*${key}:'#([0-9a-f]{6})'`))
-  if (!match?.[1]) throw new Error(`Missing color token ${group}.${key}`)
-  return match[1]
+  const groupColors = DASHBOARD_COLORS[group as keyof typeof DASHBOARD_COLORS] as Record<string, string> | undefined
+  const color = groupColors?.[key]
+  if (!color) throw new Error(`Missing color token ${group}.${key}`)
+  return color
 }
 
 function contrastRatio(foreground: string, background: string): number {
@@ -30,6 +31,13 @@ describe("dashboard UI contract", () => {
     expect(DASHBOARD_HEAD).toContain('aria-label="Event timeline"')
     expect(DASHBOARD_HEAD).toContain('id="drawer-title"')
     expect(DASHBOARD_HEAD).toContain('id="drawer" class="scroll p-4" tabindex="-1" inert')
+  })
+
+  test("dashboard shell has no third-party runtime resources", () => {
+    expect(DASHBOARD_HEAD).not.toContain('src="https://')
+    expect(DASHBOARD_HEAD).not.toContain('href="https://')
+    expect(DASHBOARD_HEAD).not.toContain("cdn.tailwindcss.com")
+    expect(DASHBOARD_HEAD).not.toContain("fonts.googleapis.com")
   })
 
   test("fixed dashboard chrome is constrained on narrow viewports", () => {
@@ -55,6 +63,75 @@ describe("dashboard UI contract", () => {
     expect(DASHBOARD_JS_EVENTS).toContain("function selectTeam")
   })
 
+  test("header exposes a project-grouped team switcher", () => {
+    expect(DASHBOARD_HEAD).toContain('id="team-switcher"')
+    expect(DASHBOARD_HEAD).toContain('aria-label="Switch team"')
+    expect(DASHBOARD_HEAD).toContain('onchange="selectTeam(this.value)"')
+    expect(DASHBOARD_JS_RENDER).toContain("function rTeamSwitcher")
+    expect(DASHBOARD_JS_RENDER).toContain("<optgroup")
+    expect(DASHBOARD_JS_EVENTS).toContain("rTeamSwitcher(t)")
+  })
+
+  test("archived teams are hidden by default and can be explicitly revealed", () => {
+    expect(DASHBOARD_HEAD).toContain('id="archived-toggle"')
+    expect(DASHBOARD_JS_CORE).toContain("showArchived=initialQuery.get('archived')==='1'")
+    expect(DASHBOARD_JS_CORE).toContain("function visibleProjectTeams")
+    expect(DASHBOARD_JS_RENDER).toContain("Show archived")
+    expect(DASHBOARD_JS_RENDER).toContain("Hide archived")
+    expect(DASHBOARD_JS_EVENTS).toContain("function toggleArchived")
+    expect(DASHBOARD_JS_EVENTS).toContain("q.set('archived','1')")
+    expect(DASHBOARD_JS_EVENTS).toContain("showArchived=q.get('archived')==='1'")
+  })
+
+  test("archived visibility helpers exclude archived-only projects by default", () => {
+    const evaluate = new Function(
+      "location",
+      "sessionStorage",
+      "history",
+      "localStorage",
+      "Headers",
+      "fetch",
+      "state",
+      `${DASHBOARD_JS_CORE};S=state;return {teams:allTeams(),projects:allProjects(),current:cur(),reveal:function(){showArchived=true;selId=null;return {teams:allTeams(),projects:allProjects(),current:cur()}}}`,
+    )
+    const active = { id: "active", projectId: "p1", status: "active", timeUpdated: 3 }
+    const archived = { id: "archived", projectId: "p1", status: "archived", timeUpdated: 2 }
+    const archivedOnly = { id: "archived-only", projectId: "p2", status: "archived", timeUpdated: 1 }
+    const result = evaluate(
+      { hash: "", pathname: "/", search: "" },
+      { setItem() {}, getItem() { return null } },
+      { replaceState() {} },
+      { getItem() { return null } },
+      Headers,
+      () => Promise.reject(new Error("unexpected fetch")),
+      {
+        teams: [active, archived, archivedOnly],
+        projects: [
+          { id: "p1", teams: [active, archived], timeUpdated: 3 },
+          { id: "p2", teams: [archivedOnly], timeUpdated: 1 },
+        ],
+      },
+    ) as {
+      teams: { active: Array<{ id: string }>; archived: Array<{ id: string }> }
+      projects: Array<{ id: string }>
+      current: { id: string }
+      reveal: () => {
+        teams: { active: Array<{ id: string }>; archived: Array<{ id: string }> }
+        projects: Array<{ id: string }>
+        current: { id: string }
+      }
+    }
+
+    expect(result.teams.active.map(team => team.id)).toEqual(["active"])
+    expect(result.teams.archived).toEqual([])
+    expect(result.projects.map(project => project.id)).toEqual(["p1"])
+    expect(result.current.id).toBe("active")
+
+    const revealed = result.reveal()
+    expect(revealed.teams.archived.map(team => team.id)).toEqual(["archived", "archived-only"])
+    expect(revealed.projects.map(project => project.id)).toEqual(["p1", "p2"])
+  })
+
   test("project navigation can collapse", () => {
     expect(DASHBOARD_HEAD).not.toContain('<button id="nav-toggle"')
     expect(DASHBOARD_HEAD).toContain('id="project-rail"')
@@ -75,8 +152,59 @@ describe("dashboard UI contract", () => {
   })
 
   test("dashboard polls state relative to the served page", () => {
-    expect(DASHBOARD_JS_EVENTS).toContain("fetch('api/state')")
+    expect(DASHBOARD_JS_EVENTS).toContain("apiFetch('api/state')")
     expect(DASHBOARD_JS_EVENTS).not.toContain("fetch('/api/state')")
+  })
+
+  test("dashboard API requests use a fragment-supplied bearer token", () => {
+    expect(DASHBOARD_JS_CORE).toContain("location.hash")
+    expect(DASHBOARD_JS_CORE).toContain("sessionStorage")
+    expect(DASHBOARD_JS_CORE).toContain("history.replaceState")
+    expect(DASHBOARD_JS_CORE).toContain("Authorization")
+    expect(DASHBOARD_JS_CORE).toContain("Bearer ")
+  })
+
+  test("group channels are collision-safe and nonmember lead composition is read-only", () => {
+    expect(DASHBOARD_JS_CORE).toContain("function channelParts")
+    expect(DASHBOARD_JS_RENDER).toContain("'member:'+m.name")
+    expect(DASHBOARD_JS_RENDER).toContain("'group:'+g.name")
+    expect(DASHBOARD_JS_RENDER).toContain("Groups")
+    expect(DASHBOARD_JS_RENDER).toContain("Read-only: lead is not a group participant.")
+    expect(DASHBOARD_JS_RENDER).toContain("text.disabled=unavailable")
+    expect(DASHBOARD_JS_EVENTS).toContain("{group:cp.name,content:content}")
+  })
+
+  test("clears a fragment token even when session storage is unavailable", () => {
+    const replacements: string[] = []
+    const evaluate = new Function(
+      "location",
+      "sessionStorage",
+      "history",
+      "localStorage",
+      "Headers",
+      "fetch",
+      `${DASHBOARD_JS_CORE};return dashboardToken`,
+    )
+    const token = evaluate(
+      { hash: "#token=fragment-token", pathname: "/", search: "?view=team" },
+      { setItem() { throw new Error("storage disabled") }, getItem() { return null } },
+      { replaceState(_state: unknown, _title: string, url: string) { replacements.push(url) } },
+      { getItem() { return null } },
+      Headers,
+      () => Promise.reject(new Error("unexpected fetch")),
+    )
+
+    expect(token).toBe("fragment-token")
+    expect(replacements).toEqual(["/?view=team"])
+  })
+
+  test("full prompts and message bodies are fetched only for expanded details", () => {
+    expect(DASHBOARD_JS_CORE).toContain("function ensureTeamMessages")
+    expect(DASHBOARD_JS_CORE).toContain("function ensureMemberPrompt")
+    expect(DASHBOARD_JS_CORE).toContain("api/teams/")
+    expect(DASHBOARD_JS_RENDER).toContain("messageContent(")
+    expect(DASHBOARD_JS_RENDER).toContain("memberPrompt(")
+    expect(DASHBOARD_JS_EVENTS).toContain("ensureTeamMessages(t.id)")
   })
 
   test("agent prioritization helpers are defined", () => {
@@ -87,6 +215,13 @@ describe("dashboard UI contract", () => {
   test("attention renderer exposes urgent triage copy", () => {
     expect(DASHBOARD_JS_RENDER).toContain("function rAttention")
     expect(DASHBOARD_JS_RENDER).toContain("Needs attention")
+  })
+
+  test("attention renderer exposes durable scheduler pressure", () => {
+    expect(DASHBOARD_JS_RENDER).toContain("queuedWakes")
+    expect(DASHBOARD_JS_RENDER).toContain("activeRuns")
+    expect(DASHBOARD_JS_RENDER).toContain("expiredRuns")
+    expect(DASHBOARD_JS_RENDER).toContain("scheduler queued")
   })
 
   test("keyboard and accessibility hooks are present", () => {
@@ -160,7 +295,7 @@ describe("dashboard UI contract", () => {
   })
 
   test("activity fetch uses relative path", () => {
-    expect(DASHBOARD_JS_EVENTS).toContain("fetch('api/session/'")
+    expect(DASHBOARD_JS_EVENTS).toContain("apiFetch('api/session/'")
     expect(DASHBOARD_JS_EVENTS).not.toContain("fetch('/api/session/'")
   })
 
@@ -193,5 +328,34 @@ describe("dashboard UI contract", () => {
     expect(DASHBOARD_JS_RENDER).toContain("text")
     expect(DASHBOARD_JS_RENDER).toContain("prompt")
     expect(DASHBOARD_JS_RENDER).toContain("response")
+  })
+
+  test("exposes overview and comprehensive conversation views", () => {
+    expect(DASHBOARD_HEAD).toContain('data-view="overview"')
+    expect(DASHBOARD_HEAD).toContain('data-view="conversations"')
+    expect(DASHBOARD_HEAD).toContain('id="conversation-view"')
+    expect(DASHBOARD_HEAD).toContain('id="conversation-channels"')
+    expect(DASHBOARD_HEAD).toContain('id="conversation-history"')
+    expect(DASHBOARD_HEAD).toContain('id="conversation-compose"')
+    expect(DASHBOARD_JS_RENDER).toContain("function rConversations")
+    expect(DASHBOARD_JS_EVENTS).toContain("function selectView")
+  })
+
+  test("supports direct and broadcast channels with authenticated composition", () => {
+    expect(DASHBOARD_JS_RENDER).toContain("Broadcast mailbox")
+    expect(DASHBOARD_JS_RENDER).toContain("Send broadcast")
+    expect(DASHBOARD_JS_RENDER).toContain("Send message")
+    expect(DASHBOARD_JS_EVENTS).toContain("function sendConversationMessage")
+    expect(DASHBOARD_JS_EVENTS).toContain("method:'POST'")
+    expect(DASHBOARD_JS_EVENTS).toContain("apiFetch('api/teams/'")
+  })
+
+  test("persists deep-linkable team, member, and view state", () => {
+    expect(DASHBOARD_JS_CORE).toContain("URLSearchParams(location.search)")
+    expect(DASHBOARD_JS_EVENTS).toContain("function syncLocation")
+    expect(DASHBOARD_JS_EVENTS).toContain("popstate")
+    expect(DASHBOARD_JS_EVENTS).toContain("view")
+    expect(DASHBOARD_JS_EVENTS).toContain("team")
+    expect(DASHBOARD_JS_EVENTS).toContain("member")
   })
 })

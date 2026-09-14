@@ -1,7 +1,36 @@
 /** Dashboard JS — utilities, data helpers, and state management. */
 export const DASHBOARD_JS_CORE = `
-let S=null,selId=null,selProjectId=null,fails=0,pollT=Date.now(),prevMC=0,selCard=-1,navCollapsed=false,verbose=(function(){try{return localStorage.getItem('ensemble-verbose')==='1'}catch(e){return false}})(),drawerActivity=null,drawerSession=null;
+const initialQuery=new URLSearchParams(location.search);
+let S=null,selId=initialQuery.get('team'),selProjectId=initialQuery.get('project'),selectedView=initialQuery.get('view')==='conversations'?'conversations':'overview',selectedChannel=initialQuery.get('channel')||(initialQuery.get('member')?'member:'+initialQuery.get('member'):'broadcast'),fails=0,pollT=Date.now(),prevMC=0,selCard=-1,navCollapsed=false,showArchived=initialQuery.get('archived')==='1',verbose=(function(){try{return localStorage.getItem('ensemble-verbose')==='1'}catch(e){return false}})(),drawerActivity=null,drawerSession=null,conversationSending=false,conversationError='';
 const expCards=new Set(),expMsgs=new Set();
+const dashboardToken=(function(){let t='';try{t=new URLSearchParams(location.hash.slice(1)).get('token')||''}catch(e){}if(t){try{sessionStorage.setItem('ensemble-dashboard-token',t)}catch(e){}try{history.replaceState(null,'',location.pathname+location.search)}catch(e){}return t}try{return sessionStorage.getItem('ensemble-dashboard-token')||''}catch(e){return ''}})();
+function apiFetch(url,options){const o=options||{},h=new Headers(o.headers||{});if(dashboardToken)h.set('Authorization','Bearer '+dashboardToken);return fetch(url,{...o,headers:h}).then(function(r){if(!r.ok)throw new Error('Dashboard API request failed: '+r.status);return r})}
+const fullMessageBodies=new Map(),teamMessageLoads=new Map(),fullMemberPrompts=new Map(),loadedMemberPrompts=new Set(),memberPromptLoads=new Map();
+const conversationPages=new Map(),conversationLoads=new Map();
+function messageContent(m){return fullMessageBodies.get(m.id)||m.preview||''}
+function memberPromptKey(teamId,memberName){return teamId+'\\n'+memberName}
+function memberPrompt(teamId,memberName){return fullMemberPrompts.get(memberPromptKey(teamId,memberName))||''}
+async function ensureTeamMessages(teamId){
+  if(teamMessageLoads.has(teamId))return teamMessageLoads.get(teamId);
+  const request=apiFetch('api/teams/'+encodeURIComponent(teamId)+'/messages?limit=50').then(r=>r.json()).then(data=>{(data.messages||[]).forEach(m=>fullMessageBodies.set(m.id,m.content||''))}).finally(()=>teamMessageLoads.delete(teamId));
+  teamMessageLoads.set(teamId,request);return request;
+}
+async function ensureMemberPrompt(teamId,memberName){
+  const key=memberPromptKey(teamId,memberName);if(loadedMemberPrompts.has(key))return;
+  if(memberPromptLoads.has(key))return memberPromptLoads.get(key);
+  const request=apiFetch('api/teams/'+encodeURIComponent(teamId)+'/members/'+encodeURIComponent(memberName)).then(r=>r.json()).then(data=>{fullMemberPrompts.set(key,data.prompt||'');loadedMemberPrompts.add(key)}).finally(()=>memberPromptLoads.delete(key));
+  memberPromptLoads.set(key,request);return request;
+}
+function conversationKey(teamId,channel){return teamId+'\\n'+channel}
+function channelParts(channel){if(channel==='broadcast')return{type:'broadcast',name:null};const cut=channel.indexOf(':');if(cut<1)return{type:'member',name:channel};return{type:channel.slice(0,cut),name:channel.slice(cut+1)}}
+async function ensureConversation(teamId,channel,older){
+  const key=conversationKey(teamId,channel),current=conversationPages.get(key),cursor=older&&current?current.nextCursor:null;
+  if(current&&!older)return current;if(conversationLoads.has(key))return conversationLoads.get(key);
+  var cp=channelParts(channel),url='api/teams/'+encodeURIComponent(teamId)+'/messages?limit=50&'+(cp.type==='broadcast'?'channelType=broadcast':cp.type==='group'?'channelType=group&group='+encodeURIComponent(cp.name):'channel='+encodeURIComponent(cp.name));
+  if(cursor)url+='&cursor='+encodeURIComponent(cursor);
+  const request=apiFetch(url).then(r=>r.json()).then(data=>{const prior=older&&current?current.messages:[];const seen=new Set(prior.map(m=>m.id));const messages=prior.concat((data.messages||[]).filter(m=>!seen.has(m.id)));const page={messages:messages,nextCursor:data.nextCursor||null};conversationPages.set(key,page);messages.forEach(m=>fullMessageBodies.set(m.id,m.content||''));return page}).finally(()=>conversationLoads.delete(key));
+  conversationLoads.set(key,request);return request;
+}
 const E=s=>s?String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):'';
 const D=ms=>{const s=Math.floor(Math.abs(ms)/1000);return s<60?s+'s':s<3600?Math.floor(s/60)+'m':Math.floor(s/3600)+'h'};
 const T=e=>new Date(e).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
@@ -60,13 +89,15 @@ function parseR(c){const m=c.match(/<task-result>([\\s\\S]*?)<\\/task-result>/);
 function allTeams(){
   if(!S?.teams)return{active:[],archived:[]};
   const active=[...S.teams.filter(t=>t.status==='active')].sort((a,b)=>b.timeUpdated-a.timeUpdated);
-  const archived=[...S.teams.filter(t=>t.status!=='active')].sort((a,b)=>b.timeUpdated-a.timeUpdated);
+  const archived=showArchived?[...S.teams.filter(t=>t.status!=='active')].sort((a,b)=>b.timeUpdated-a.timeUpdated):[];
   return{active,archived};
 }
-function allProjects(){return S?.projects?[...S.projects].sort((a,b)=>b.timeUpdated-a.timeUpdated):[]}
+function archivedTeamCount(){return S?.teams?.filter(t=>t.status!=='active').length||0}
+function visibleProjectTeams(p){return[...(p?.teams||[])].filter(t=>showArchived||t.status==='active')}
+function allProjects(){return S?.projects?[...S.projects].filter(p=>visibleProjectTeams(p).length).sort((a,b)=>b.timeUpdated-a.timeUpdated):[]}
 function projectLabel(p){return p?(p.name||p.path||p.id):''}
 function curProject(){const ps=allProjects();if(!ps.length)return null;if(selProjectId){const p=ps.find(p=>p.id===selProjectId);if(p)return p}var t=cur();return t?ps.find(p=>p.id===t.projectId)||ps[0]:ps[0]}
-function cur(){const{active,archived}=allTeams(),all=[...active,...archived];if(!all.length)return null;if(selId){const t=all.find(t=>t.id===selId);if(t){selProjectId=t.projectId;return t}}const p=selProjectId&&S?.projects?.find(p=>p.id===selProjectId);const pt=p?[...(p.teams||[])].filter(t=>t.status==='active'):[ ];const t=pt.sort((a,b)=>b.timeUpdated-a.timeUpdated)[0]||active[0]||all[0];if(t){selId=t.id;selProjectId=t.projectId}return t}
+function cur(){const{active,archived}=allTeams(),all=[...active,...archived];if(!all.length)return null;if(selId){const t=all.find(t=>t.id===selId);if(t){selProjectId=t.projectId;return t}}const p=selProjectId&&allProjects().find(p=>p.id===selProjectId);const pt=p?visibleProjectTeams(p):[];const t=pt.sort((a,b)=>b.timeUpdated-a.timeUpdated)[0]||active[0]||all[0];if(t){selId=t.id;selProjectId=t.projectId}return t}
 
 function deriveHealth(t){
   const mm=t.members||[];if(!mm.length)return{w:0,i:0,e:0,d:0,total:0};
@@ -74,8 +105,8 @@ function deriveHealth(t){
 }
 
 function coarseTeamStatus(t){const h=deriveHealth(t),blocked=(t.tasks||[]).filter(x=>x.status==='blocked').length;if(h.e)return{label:'error',color:'red',dot:'bg-red-500'};if(blocked)return{label:'blocked',color:'amber',dot:'bg-amber-500'};if(h.w)return{label:'working',color:'blue',dot:'bg-blue-500'};if(h.i)return{label:'idle',color:'muted',dot:'bg-txt-500'};return{label:t.status==='active'?'empty':t.status,color:'muted',dot:'bg-base-600'}}
-function projectStatus(p){const teams=p.teams||[],counts={working:0,blocked:0,error:0,idle:0,done:0};teams.forEach(t=>{const s=coarseTeamStatus(t).label;if(s==='working')counts.working++;else if(s==='blocked')counts.blocked++;else if(s==='error')counts.error++;else if(s==='idle'||s==='empty')counts.idle++;else counts.done++});if(counts.error)return{label:'error',color:'red',dot:'bg-red-500',counts};if(counts.blocked)return{label:'blocked',color:'amber',dot:'bg-amber-500',counts};if(counts.working)return{label:'working',color:'blue',dot:'bg-blue-500',counts};return{label:'idle',color:'muted',dot:'bg-txt-500',counts}}
-function statusTitleProject(p){const s=projectStatus(p),teams=p.teams||[];return projectLabel(p)+'\\nStatus: '+s.label+'\\nTeams: '+teams.length+'\\nWorking: '+s.counts.working+' · Blocked: '+s.counts.blocked+' · Error: '+s.counts.error+' · Idle: '+s.counts.idle}
+function projectStatus(p){const teams=visibleProjectTeams(p),counts={working:0,blocked:0,error:0,idle:0,done:0};teams.forEach(t=>{const s=coarseTeamStatus(t).label;if(s==='working')counts.working++;else if(s==='blocked')counts.blocked++;else if(s==='error')counts.error++;else if(s==='idle'||s==='empty')counts.idle++;else counts.done++});if(counts.error)return{label:'error',color:'red',dot:'bg-red-500',counts};if(counts.blocked)return{label:'blocked',color:'amber',dot:'bg-amber-500',counts};if(counts.working)return{label:'working',color:'blue',dot:'bg-blue-500',counts};return{label:'idle',color:'muted',dot:'bg-txt-500',counts}}
+function statusTitleProject(p){const s=projectStatus(p),teams=visibleProjectTeams(p);return projectLabel(p)+'\\nStatus: '+s.label+'\\nTeams: '+teams.length+'\\nWorking: '+s.counts.working+' · Blocked: '+s.counts.blocked+' · Error: '+s.counts.error+' · Idle: '+s.counts.idle}
 function statusTitleTeam(t){const h=deriveHealth(t),tasks=t.tasks||[],blocked=tasks.filter(x=>x.status==='blocked').length,active=tasks.filter(x=>x.status==='in_progress').length,pending=tasks.filter(x=>x.status==='pending').length,done=tasks.filter(x=>x.status==='completed').length;return t.name+'\\nStatus: '+coarseTeamStatus(t).label+'\\nAgents: '+h.total+' total, '+h.w+' working, '+h.i+' idle, '+h.e+' error\\nTasks: '+active+' active, '+blocked+' blocked, '+pending+' pending, '+done+' done'}
 
 function lastMessageFor(name,msgs){return msgs.filter(m=>m.fromName===name||m.toName===name).sort((a,b)=>b.timeCreated-a.timeCreated)[0]||null}
@@ -126,7 +157,7 @@ function deriveSparkline(name,msgs){
 function deriveTimeline(t){
   const ev=[];
   (t.members||[]).forEach(m=>{ev.push({t:m.timeCreated,type:'spawn',label:E(m.name)+' spawned',c:'bg-blue-400'});if(m.status==='shutdown')ev.push({t:m.timeUpdated,type:'off',label:E(m.name)+' shut down',c:'bg-txt-500'});if(m.status==='error')ev.push({t:m.timeUpdated,type:'err',label:E(m.name)+' error',c:'bg-red-500'})});
-  (t.messages||[]).forEach(m=>{const p=parseR(m.content);ev.push({t:m.timeCreated,type:'msg',label:E(m.fromName)+' \\u2192 '+(E(m.toName)||'all'),c:p?'bg-emerald-500':'bg-blue-400'})});
+  (t.messages||[]).forEach(m=>{const p=parseR(messageContent(m));ev.push({t:m.timeCreated,type:'msg',label:E(m.fromName)+' \\u2192 '+(E(m.toName)||'all'),c:p?'bg-emerald-500':'bg-blue-400'})});
   (t.tasks||[]).filter(x=>x.status==='completed').forEach(x=>{ev.push({t:x.timeUpdated,type:'done',label:'Task done',c:'bg-emerald-500'})});
   return ev.sort((a,b)=>a.t-b.t).slice(-50);
 }

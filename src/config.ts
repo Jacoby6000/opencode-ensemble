@@ -1,10 +1,33 @@
 import { readFileSync } from "node:fs"
 import path from "node:path"
+import type { SchedulerIdentityLimits, SchedulerRunLimits } from "./scheduler"
+
+/** Dashboard listener configuration. */
+export interface DashboardConfig {
+  port?: number
+}
+
+/** Partially specified scheduler capacity limits. */
+export interface SchedulerLimitsConfig {
+  global?: number
+  perAgent?: Record<string, number>
+}
+
+/** Durable scheduler configuration. */
+export interface SchedulerConfig {
+  identityLimits?: SchedulerLimitsConfig
+  runLimits?: SchedulerLimitsConfig
+  reservationTtlMs?: number
+  leaseTtlMs?: number
+  pumpIntervalMs?: number
+}
 
 /** Plugin configuration shape. All fields optional — defaults applied. */
 export interface EnsembleConfig {
-  /** Auto-merge worktree branches on cleanup (default: true) */
+  /** Auto-merge worktree branches on cleanup (default: false) */
   mergeOnCleanup?: boolean
+  /** Custom agent names that must run without write or shell permissions. */
+  readOnlyAgents?: string[]
   /** Stall detection threshold in ms (default: 180000 = 3 min, 0 to disable) */
   stallThresholdMs?: number
   /** Min steps before token-based stall check (default: 3) */
@@ -15,8 +38,12 @@ export interface EnsembleConfig {
   timeoutMs?: number
   /** Rate limit capacity (default: 10, 0 to disable) */
   rateLimitCapacity?: number
-  /** Dashboard server port (default: 4747, 0 to disable) */
+  /** Dashboard listener. */
+  dashboard?: DashboardConfig
+  /** Deprecated dashboard port alias retained for existing config files. */
   dashboardPort?: number
+  /** Durable scheduler capacity and timing controls. */
+  scheduler?: SchedulerConfig
   /** Max peer messages per agent per window before nudge (default: 5, 0 to disable) */
   peerMessageLimit?: number
   /** Time window for peer message rate limiting in ms (default: 300000 = 5 min) */
@@ -33,15 +60,35 @@ export interface EnsembleConfig {
   promptForModels?: boolean
 }
 
+/** Fully resolved plugin configuration used by production code. */
+export interface ResolvedEnsembleConfig extends Required<Omit<EnsembleConfig, "dashboard" | "dashboardPort" | "scheduler">> {
+  dashboard: { port: number }
+  scheduler: {
+    identityLimits: SchedulerIdentityLimits
+    runLimits: SchedulerRunLimits
+    reservationTtlMs: number
+    leaseTtlMs: number
+    pumpIntervalMs: number
+  }
+}
+
 /** Default configuration values. */
-export const DEFAULT_CONFIG: Required<EnsembleConfig> = {
-  mergeOnCleanup: true,
+export const DEFAULT_CONFIG: ResolvedEnsembleConfig = {
+  mergeOnCleanup: false,
+  readOnlyAgents: [],
   stallThresholdMs: 300_000,
   stallMinSteps: 5,
   stallTokenThreshold: 200,
   timeoutMs: 30 * 60 * 1000,
   rateLimitCapacity: 10,
-  dashboardPort: 4747,
+  dashboard: { port: 4747 },
+  scheduler: {
+    identityLimits: { global: 32, perAgent: {} },
+    runLimits: { global: 4, perAgent: {} },
+    reservationTtlMs: 10 * 60 * 1000,
+    leaseTtlMs: 60 * 1000,
+    pumpIntervalMs: 1000,
+  },
   peerMessageLimit: 5,
   peerMessageWindowMs: 300_000,
   defaultModel: "",
@@ -49,6 +96,24 @@ export const DEFAULT_CONFIG: Required<EnsembleConfig> = {
   modelsByAgent: {},
   modelAssignment: "default",
   promptForModels: false,
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+}
+
+function readLimits(value: unknown): SchedulerLimitsConfig | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined
+  const raw = value as Record<string, unknown>
+  const result: SchedulerLimitsConfig = {}
+  if (isPositiveSafeInteger(raw.global)) result.global = raw.global
+  if (typeof raw.perAgent === "object" && raw.perAgent !== null && !Array.isArray(raw.perAgent)) {
+    const entries = Object.entries(raw.perAgent as Record<string, unknown>)
+    if (entries.every(([agent, limit]) => agent.trim().length > 0 && isPositiveSafeInteger(limit))) {
+      result.perAgent = Object.fromEntries(entries) as Record<string, number>
+    }
+  }
+  return result
 }
 
 /** Read a JSON config file, returning an empty object on missing/invalid. */
@@ -59,12 +124,33 @@ function readConfigFile(filePath: string): Partial<EnsembleConfig> {
     // Validate types — only accept numbers for numeric fields, booleans for boolean fields
     const result: Partial<EnsembleConfig> = {}
     if (typeof raw.mergeOnCleanup === "boolean") result.mergeOnCleanup = raw.mergeOnCleanup
+    if (Array.isArray(raw.readOnlyAgents) && raw.readOnlyAgents.every((agent: unknown) => typeof agent === "string")) {
+      result.readOnlyAgents = raw.readOnlyAgents as string[]
+    }
     if (typeof raw.stallThresholdMs === "number") result.stallThresholdMs = raw.stallThresholdMs
     if (typeof raw.stallMinSteps === "number") result.stallMinSteps = raw.stallMinSteps
     if (typeof raw.stallTokenThreshold === "number") result.stallTokenThreshold = raw.stallTokenThreshold
     if (typeof raw.timeoutMs === "number") result.timeoutMs = raw.timeoutMs
     if (typeof raw.rateLimitCapacity === "number") result.rateLimitCapacity = raw.rateLimitCapacity
-    if (typeof raw.dashboardPort === "number") result.dashboardPort = raw.dashboardPort
+    if (typeof raw.dashboardPort === "number" && Number.isInteger(raw.dashboardPort) && raw.dashboardPort >= 0 && raw.dashboardPort <= 65_535) {
+      result.dashboard = { port: raw.dashboardPort }
+    }
+    if (typeof raw.dashboard === "object" && raw.dashboard !== null && !Array.isArray(raw.dashboard)) {
+      const port = (raw.dashboard as Record<string, unknown>).port
+      if (typeof port === "number" && Number.isInteger(port) && port >= 0 && port <= 65_535) result.dashboard = { port }
+    }
+    if (typeof raw.scheduler === "object" && raw.scheduler !== null && !Array.isArray(raw.scheduler)) {
+      const scheduler = raw.scheduler as Record<string, unknown>
+      const parsed: SchedulerConfig = {}
+      const identityLimits = readLimits(scheduler.identityLimits)
+      const runLimits = readLimits(scheduler.runLimits)
+      if (identityLimits) parsed.identityLimits = identityLimits
+      if (runLimits) parsed.runLimits = runLimits
+      if (isPositiveSafeInteger(scheduler.reservationTtlMs)) parsed.reservationTtlMs = scheduler.reservationTtlMs
+      if (isPositiveSafeInteger(scheduler.leaseTtlMs)) parsed.leaseTtlMs = scheduler.leaseTtlMs
+      if (isPositiveSafeInteger(scheduler.pumpIntervalMs)) parsed.pumpIntervalMs = scheduler.pumpIntervalMs
+      result.scheduler = parsed
+    }
     if (typeof raw.peerMessageLimit === "number") result.peerMessageLimit = raw.peerMessageLimit
     if (typeof raw.peerMessageWindowMs === "number") result.peerMessageWindowMs = raw.peerMessageWindowMs
     if (typeof raw.defaultModel === "string") result.defaultModel = raw.defaultModel
@@ -83,18 +169,40 @@ function readConfigFile(filePath: string): Partial<EnsembleConfig> {
   }
 }
 
+function mergeConfig(base: ResolvedEnsembleConfig, override: Partial<EnsembleConfig>): ResolvedEnsembleConfig {
+  const { dashboard, scheduler, dashboardPort: _dashboardPort, ...flat } = override
+  return {
+    ...base,
+    ...flat,
+    dashboard: { port: dashboard?.port ?? base.dashboard.port },
+    scheduler: {
+      identityLimits: {
+        global: scheduler?.identityLimits?.global ?? base.scheduler.identityLimits.global,
+        perAgent: scheduler?.identityLimits?.perAgent ?? base.scheduler.identityLimits.perAgent,
+      },
+      runLimits: {
+        global: scheduler?.runLimits?.global ?? base.scheduler.runLimits.global,
+        perAgent: scheduler?.runLimits?.perAgent ?? base.scheduler.runLimits.perAgent,
+      },
+      reservationTtlMs: scheduler?.reservationTtlMs ?? base.scheduler.reservationTtlMs,
+      leaseTtlMs: scheduler?.leaseTtlMs ?? base.scheduler.leaseTtlMs,
+      pumpIntervalMs: scheduler?.pumpIntervalMs ?? base.scheduler.pumpIntervalMs,
+    },
+  }
+}
+
 /**
  * Load plugin configuration. Merges global → project → env vars.
  * Missing files are silently skipped. Invalid JSON logs a warning.
  */
-export function loadConfig(projectDir: string): Required<EnsembleConfig> {
+export function loadConfig(projectDir: string): ResolvedEnsembleConfig {
   const homeDir = process.env.HOME ?? process.env.USERPROFILE ?? ""
   const globalPath = path.join(homeDir, ".config", "opencode", "ensemble.json")
   const projectPath = path.join(projectDir, ".opencode", "ensemble.json")
 
   const global = readConfigFile(globalPath)
   const project = readConfigFile(projectPath)
-  const merged = { ...DEFAULT_CONFIG, ...global, ...project }
+  const merged = mergeConfig(mergeConfig(DEFAULT_CONFIG, global), project)
 
   // Env vars override everything
   const timeout = process.env.OPENCODE_ENSEMBLE_TIMEOUT

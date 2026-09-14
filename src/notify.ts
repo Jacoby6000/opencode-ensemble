@@ -2,6 +2,7 @@ import type { Database } from "./db"
 import type { PluginClient } from "./types"
 import { sendMessage } from "./messaging"
 import { log } from "./log"
+import { getLeadPromptOptions } from "./member-model"
 
 type TeamEventType = "spawn" | "message" | "completed" | "error" | "shutdown"
 
@@ -56,7 +57,7 @@ export async function notifyWorkingProgress(
   teamId: string,
 ): Promise<void> {
   const members = db.query(
-    "SELECT name, status FROM team_member WHERE team_id = ? ORDER BY time_created ASC"
+    "SELECT name, status FROM team_member WHERE team_id = ? AND member_kind = 'worker' ORDER BY time_created ASC"
   ).all(teamId) as Array<{ name: string; status: string }>
 
   if (members.length === 0) return
@@ -120,6 +121,7 @@ export function notifyLead(
   client.session.promptAsync({
     sessionID: team.lead_session_id,
     parts: [{ type: "text", text: "[System: New team message from system]" }],
+    ...getLeadPromptOptions(db, teamId),
   }).catch((err) => {
     log(`notifyLead:wake:failed team=${teamId} err=${err instanceof Error ? err.message : String(err)}`)
   })

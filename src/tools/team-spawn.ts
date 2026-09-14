@@ -2,12 +2,12 @@ import type { ToolDeps, PermissionRule } from "../types"
 import { validateMemberName } from "../util"
 import { requireLead } from "./shared"
 import { claimTask } from "./team-claim"
-import { notifyLead } from "../notify"
-import { releaseMemberTasks } from "../tasks"
 import { parseModelId } from "../member-model"
 import { log } from "../log"
-import type { EnsembleConfig } from "../config"
-import { getTeamResourceParts, teamWorktreeName } from "./merge-helper"
+import type { ResolvedEnsembleConfig } from "../config"
+import { getTeamResourceParts, preserveBranch, preservedBranchName, teamWorktreeName } from "./merge-helper"
+import { activateIdentityAndQueue, queueWake, releaseIdentity, tryReserveIdentity } from "../scheduler"
+import { releaseMemberTasks } from "../tasks"
 
 /** Tracks consecutive spawn failures per team for circuit breaker. */
 export const spawnFailures = new Map<string, { count: number; lastError: string }>()
@@ -20,7 +20,7 @@ export function resolveModel(
   explicitModel: string | undefined,
   agentType: string,
   teamMemberCount: number,
-  config: Required<EnsembleConfig>,
+  config: ResolvedEnsembleConfig,
 ): string | undefined {
   if (explicitModel) return explicitModel
   if (config.modelsByAgent[agentType]) return config.modelsByAgent[agentType]
@@ -86,17 +86,34 @@ export async function executeTeamSpawn(
   const existing = deps.db.query("SELECT name FROM team_member WHERE team_id = ? AND name = ?")
     .get(teamInfo.teamId, args.name)
   if (existing) throw new Error(`Teammate "${args.name}" already exists in team "${teamInfo.teamName}"`)
+  const groupCollision = deps.db.query("SELECT name FROM team_group WHERE team_id = ? AND name = ?").get(teamInfo.teamId, args.name)
+  if (groupCollision) throw new Error(`Teammate name "${args.name}" collides with group inbox "${args.name}"`)
 
-  const isReadOnly = agent === "plan" || agent === "explore"
+  const reservation = tryReserveIdentity(deps.db, {
+    teamId: teamInfo.teamId,
+    memberName: args.name,
+    agent,
+    limits: deps.config.scheduler.identityLimits,
+    reservationTtlMs: deps.config.scheduler.reservationTtlMs,
+  })
+  if (!reservation.reserved) {
+    throw new Error(`Cannot spawn teammate "${args.name}": identity capacity unavailable (${reservation.reason}).`)
+  }
+  let identityCommitted = false
+  let worktreeDir: string | null = null
+  let worktreeBranch: string | null = null
+  let workspaceId: string | null = null
+  let childSessionId: string | undefined
+  let memberPersisted = false
+  try {
+
+  const isReadOnly = agent === "plan" || agent === "explore" || deps.config.readOnlyAgents.includes(agent)
   const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory)
   const usePlanApproval = args.plan_approval === true
 
   log(`spawn:start name=${args.name} agent=${agent} worktree=${useWorktree}`)
 
   // Create worktree if enabled
-  let worktreeDir: string | null = null
-  let worktreeBranch: string | null = null
-
   if (useWorktree) {
     const resource = getTeamResourceParts(deps.db, teamInfo.teamId)
     const worktreeName = teamWorktreeName(resource.projectName, resource.teamName, resource.teamId, args.name)
@@ -106,27 +123,27 @@ export async function executeTeamSpawn(
         deps.client.worktree.create({ worktreeCreateInput: { name: worktreeName } }),
         getSpawnTimeout(), `worktree.create for "${args.name}"`
       )
-      if (result.data) {
-        worktreeDir = result.data.directory
-        worktreeBranch = result.data.branch
-      }
+      if (!result.data) throw new Error("worktree.create returned no worktree")
+      worktreeDir = result.data.directory
+      worktreeBranch = result.data.branch
       log(`spawn:worktree:done name=${args.name} dir=${worktreeDir}`)
     } catch (err) {
-      log(`spawn:worktree:failed name=${args.name} err=${err instanceof Error ? err.message : String(err)}`)
+      const message = err instanceof Error ? err.message : String(err)
+      log(`spawn:worktree:failed name=${args.name} err=${message}`)
       try {
         await deps.client.tui.showToast({
           title: "Team",
-          message: `Worktree creation failed for ${args.name}, using shared directory`,
-          variant: "warning",
+          message: `Worktree creation failed for ${args.name}; spawn cancelled`,
+          variant: "error",
           duration: 4000,
         })
       } catch { /* TUI may not be available */ }
+      throw new Error(`Failed to create isolated worktree for teammate "${args.name}": ${message}`)
     }
   }
 
   // Create workspace from worktree branch — links session to worktree directory.
   // OQ-workspace: assumes workspace.create({ branch }) auto-links to the worktree at that branch.
-  let workspaceId: string | null = null
   if (worktreeDir && worktreeBranch) {
     try {
       log(`spawn:workspace:start name=${args.name}`)
@@ -147,7 +164,7 @@ export async function executeTeamSpawn(
   // Permission rules on session.create are the hard gate (server-enforced).
   // For read-only agents, deny write tools and explicitly allow team tools.
   // For all agents with worktrees, allowlist the worktree path for edit/bash.
-  const TEAM_TOOLS = ["team_message", "team_broadcast", "team_tasks_list", "team_tasks_add", "team_tasks_complete", "team_claim"] as const
+  const TEAM_TOOLS = ["team_message", "team_broadcast", "team_results", "team_tasks_list", "team_tasks_add", "team_tasks_complete", "team_claim"] as const
   const permission: PermissionRule[] = []
 
   if (worktreeDir) {
@@ -170,17 +187,30 @@ export async function executeTeamSpawn(
     ...TEAM_TOOLS.map(t => ({ permission: t, pattern: "*", action: "allow" as const })),
   )
 
-  // Create child session — bind to workspace if available (server-enforced CWD isolation).
-  // Falls back to no workspace binding if workspace.create failed.
-  let childSessionId: string | undefined
+  // Resolve identity before session creation so both SDK calls start with the
+  // same agent and model. Invalid model strings retain the agent and fall back.
+  const memberCount = (deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND member_kind = 'worker'").get(teamInfo.teamId) as { c: number }).c
+  const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config)
+  const modelParam = resolvedModel ? parseModelId(resolvedModel) : undefined
+  if (resolvedModel && !modelParam) {
+    log(`spawn:model:invalid name=${args.name} model=${resolvedModel} — expected "provider/model" format, falling back to default`)
+  } else if (resolvedModel) {
+    log(`spawn:model name=${args.name} model=${resolvedModel}`)
+  }
+
+  // Create child session with server-enforced CWD isolation. Prefer a workspace
+  // binding and fall back to the concrete worktree directory if workspace.create
+  // is unavailable; never fall back to the lead's shared directory implicitly.
   try {
     log(`spawn:session:start name=${args.name}`)
     const createResult = await withTimeout(
       deps.client.session.create({
         parentID: sessionId,
         title: `${args.name} (@${agent} teammate)`,
+        agent,
+        ...(modelParam ? { model: { providerID: modelParam.providerID, id: modelParam.modelID } } : {}),
         permission,
-        ...(workspaceId ? { workspaceID: workspaceId } : {}),
+        ...(workspaceId ? { workspaceID: workspaceId } : worktreeDir ? { directory: worktreeDir } : {}),
       }),
       getSpawnTimeout(), `session.create for "${args.name}"`
     )
@@ -211,29 +241,20 @@ export async function executeTeamSpawn(
     }
     throw new Error("Failed to create teammate session")
   }
+  const spawnedSessionId = childSessionId
 
   // Register in DB
   const planApproval = usePlanApproval ? "pending" : "none"
   const now = Date.now()
-  // Resolve model before DB insert so the stored value matches what promptAsync uses
-  const memberCount = (deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(teamInfo.teamId) as { c: number }).c
-  const resolvedModel = resolveModel(args.model, agent, memberCount, deps.config)
-  if (resolvedModel) log(`spawn:model name=${args.name} model=${resolvedModel}`)
-
   deps.db.run(
     `INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, model, prompt, worktree_dir, worktree_branch, workspace_id, plan_approval, time_created, time_updated)
-     VALUES (?, ?, ?, ?, 'busy', 'starting', ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [teamInfo.teamId, args.name, childSessionId, agent, resolvedModel ?? null, args.prompt, worktreeDir, worktreeBranch, workspaceId, planApproval, now, now]
+     VALUES (?, ?, ?, ?, 'ready', 'idle', ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [teamInfo.teamId, args.name, spawnedSessionId, agent, resolvedModel ?? null, args.prompt, worktreeDir, worktreeBranch, workspaceId, planApproval, now, now]
   )
-
-  // Row is inserted as 'busy' directly -- there is no ready->busy status-event
-  // transition for a fresh spawn, so the watchdog's usual hook point never fires.
-  // Record the baseline here instead, or a member stalled on its first action
-  // is invisible to checkStalled() until its first step-finish event lands.
-  deps.progressTracker.recordBusyStart(childSessionId)
+  memberPersisted = true
 
   // Register in memory
-  deps.registry.register(teamInfo.teamId, args.name, childSessionId)
+  deps.registry.register(teamInfo.teamId, args.name, spawnedSessionId)
 
   // Auto-claim a task for this teammate when claim_task is provided (issue #27).
   // Claims atomically so a task is never double-assigned when the lead hands out
@@ -258,7 +279,7 @@ export async function executeTeamSpawn(
 
   // Show other teammates so this agent knows who to message
   const otherMembers = deps.db.query(
-    "SELECT name FROM team_member WHERE team_id = ? AND name != ? AND status NOT IN ('shutdown', 'error')"
+    "SELECT name FROM team_member WHERE team_id = ? AND member_kind = 'worker' AND name != ? AND status NOT IN ('shutdown', 'error')"
   ).all(teamInfo.teamId, args.name) as Array<{ name: string }>
   if (otherMembers.length > 0) {
     context.push(`Other teammates: ${otherMembers.map(m => m.name).join(", ")}`)
@@ -298,6 +319,7 @@ export async function executeTeamSpawn(
       "", "Tools available to you:",
       "- team_message: send a message to the lead or another teammate",
       "- team_broadcast: send a message to all team members",
+      "- team_results: list or inspect group inboxes and retrieve unread messages",
       "- team_tasks_list: view the shared team task board",
     )
   } else {
@@ -305,6 +327,7 @@ export async function executeTeamSpawn(
       "", "Tools available to you:",
       "- team_message: send a message to the lead or another teammate",
       "- team_broadcast: send a message to all team members",
+      "- team_results: list or inspect group inboxes and retrieve unread messages",
       "- team_tasks_list: view the shared team task board",
       "- team_tasks_add: add tasks to the shared board",
       "- team_tasks_complete: mark a task complete on the shared board",
@@ -375,54 +398,32 @@ export async function executeTeamSpawn(
 
   const contextStr = context.join("\n")
 
-  // Model was already resolved before DB insert — just parse for promptAsync
-  const modelParam = resolvedModel ? parseModelId(resolvedModel) : undefined
-  if (resolvedModel && !modelParam) {
-    log(`spawn:model:invalid name=${args.name} model=${resolvedModel} — expected "provider/model" format, falling back to default`)
-  }
-
-  // Fire-and-forget: send prompt to teammate session.
-  log(`spawn:promptAsync:fire name=${args.name} sessionId=${childSessionId}`)
-  deps.client.session.promptAsync({
-    sessionID: childSessionId,
-    parts: [{ type: "text", text: contextStr }],
+  const initialWake = activateIdentityAndQueue(deps.db, reservation.reservationId, {
+    teamId: teamInfo.teamId,
+    memberName: args.name,
+    sessionId: spawnedSessionId,
     agent,
-    ...(modelParam ? { model: modelParam } : {}),
-  }).catch((err) => {
-    const errMsg = err instanceof Error ? err.message : String(err)
-    log(`spawn:promptAsync:failed name=${args.name} err=${errMsg} — rolling back`)
-    try {
-      deps.db.run("DELETE FROM team_member WHERE team_id = ? AND session_id = ?", [teamInfo.teamId, childSessionId])
-      deps.registry.unregister(childSessionId)
-      // Release any task auto-claimed for this teammate so it returns to the pool.
-      if (claimedTaskContent) {
-        deps.db.run(
-          "UPDATE team_task SET status = 'pending', assignee = NULL, time_updated = ? WHERE id = ? AND assignee = ? AND status = 'in_progress'",
-          [Date.now(), args.claim_task, args.name]
-        )
-      }
-      deps.client.session.abort({ sessionID: childSessionId }).catch(() => { /* best effort */ })
-      if (workspaceId) {
-        deps.client.workspace.remove({ id: workspaceId }).catch(() => { /* best effort */ })
-      }
-      if (worktreeDir) {
-        deps.client.worktree.remove({ worktreeRemoveInput: { directory: worktreeDir } }).catch(() => { /* best effort */ })
-      }
-      const modelInfo = resolvedModel ? ` (model: ${resolvedModel})` : ""
-      deps.client.tui.showToast({
-        title: "Team",
-        message: `Teammate "${args.name}" failed to start${modelInfo}: ${errMsg}`,
-        variant: "error",
-        duration: 8000,
-      }).catch(() => { /* TUI may not be available */ })
-      notifyLead(
-        deps.client,
-        deps.db,
-        teamInfo.teamId,
-        `Teammate "${args.name}" failed to start and was removed${modelInfo}. Error: ${errMsg}. You may retry the spawn.`,
-      )
-    } catch { /* rollback failed — watchdog will clean up stale member */ }
+    reason: "spawn",
+    coalesceKey: `member:${args.name}`,
+    prompt: contextStr,
   })
+  if (!initialWake) throw new Error(`Failed to activate scheduler identity for teammate "${args.name}"`)
+  const queuedMessages = deps.db.query(
+    "SELECT id FROM team_message WHERE team_id = ? AND to_name = ? AND delivery_state = 'queued' ORDER BY time_created ASC",
+  ).all(teamInfo.teamId, args.name) as Array<{ id: string }>
+  queuedMessages.forEach(message => {
+    queueWake(deps.db, {
+      teamId: teamInfo.teamId,
+      memberName: args.name,
+      sessionId: spawnedSessionId,
+      agent,
+      reason: "message",
+      coalesceKey: `member:${args.name}`,
+      messageId: message.id,
+    })
+  })
+  identityCommitted = true
+  deps.scheduler.kick()
 
   const branchInfo = worktreeBranch ? ` (branch: ${worktreeBranch})` : ""
   const planInfo = usePlanApproval ? " [plan mode — will send plan for approval]" : ""
@@ -431,6 +432,29 @@ export async function executeTeamSpawn(
     : claimWarning ? ` (could not claim task: ${claimWarning})` : ""
   // Reset circuit breaker on success
   spawnFailures.delete(teamInfo.teamId)
-  log(`spawn:done name=${args.name} sessionId=${childSessionId}`)
+  log(`spawn:done name=${args.name} sessionId=${spawnedSessionId}`)
   return `Teammate "${args.name}" spawned (agent: ${agent})${branchInfo}${planInfo}${claimInfo}. They are working on: ${args.prompt.slice(0, 120)}${args.prompt.length > 120 ? "..." : ""}`
+  } finally {
+    if (!identityCommitted) {
+      releaseIdentity(deps.db, reservation.reservationId)
+      if (memberPersisted) {
+        releaseMemberTasks(deps.db, teamInfo.teamId, args.name)
+        deps.db.run("DELETE FROM team_member WHERE team_id = ? AND name = ?", [teamInfo.teamId, args.name])
+        if (childSessionId) deps.registry.unregister(childSessionId)
+      }
+      if (childSessionId) {
+        if (worktreeBranch && !worktreeBranch.startsWith("ensemble/preserved/")) {
+          const resource = getTeamResourceParts(deps.db, teamInfo.teamId)
+          await preserveBranch(worktreeBranch, preservedBranchName(resource.projectName, resource.teamName, resource.teamId, args.name), deps.directory)
+        }
+        try { await deps.client.session.abort({ sessionID: childSessionId }) } catch { /* best effort */ }
+        if (workspaceId) {
+          try { await deps.client.workspace.remove({ id: workspaceId }) } catch { /* best effort */ }
+        }
+        if (worktreeDir) {
+          try { await deps.client.worktree.remove({ worktreeRemoveInput: { directory: worktreeDir } }) } catch { /* best effort */ }
+        }
+      }
+    }
+  }
 }

@@ -5,9 +5,10 @@ import type { ProgressTracker } from "./progress"
 import { preserveBranch, preservedBranchName } from "./tools/merge-helper"
 import { releaseMemberTasks } from "./tasks"
 import { hasReportedCompletion } from "./messaging"
-import { getMemberModel } from "./member-model"
+import { getMemberPromptOptions } from "./member-model"
 import { notifyLead } from "./notify"
 import { log } from "./log"
+import type { SchedulerController } from "./scheduler-runtime"
 
 interface WatchdogOpts {
   db: Database
@@ -31,6 +32,7 @@ interface WatchdogOpts {
   peerMessageLimit?: number
   /** Time window for peer message rate limiting in ms. */
   peerMessageWindowMs?: number
+  scheduler?: SchedulerController
 }
 
 /**
@@ -50,6 +52,7 @@ export class Watchdog {
   private readonly cwd?: string
   private readonly peerMessageLimit: number
   private readonly peerMessageWindowMs: number
+  private readonly scheduler?: SchedulerController
   private timer: ReturnType<typeof setInterval> | undefined
 
   constructor(opts: WatchdogOpts) {
@@ -65,6 +68,7 @@ export class Watchdog {
     this.cwd = opts.cwd
     this.peerMessageLimit = opts.peerMessageLimit ?? 0
     this.peerMessageWindowMs = opts.peerMessageWindowMs ?? 300_000
+    this.scheduler = opts.scheduler
   }
 
   private static STALE_THRESHOLD_MS = Number(process.env.STALE_WORKTREE_THRESHOLD_MS) || 300_000
@@ -104,7 +108,7 @@ export class Watchdog {
       `SELECT tm.team_id, tm.name, tm.session_id
        FROM team_member tm
        JOIN team t ON tm.team_id = t.id
-       WHERE t.status = 'active' AND tm.status = 'busy'`
+        WHERE t.status = 'active' AND tm.member_kind = 'worker' AND tm.status = 'busy'`
     ).all() as Array<{ team_id: string; name: string; session_id: string }>
 
     for (const member of busy) {
@@ -160,13 +164,12 @@ export class Watchdog {
       // confirmed — marking it before delivery is known would permanently and silently
       // orphan the stall state if promptAsync throws (aborted session, invalid ID),
       // since ProgressTracker.reported is in-memory and only cleared by new activity.
-      const stallModel = getMemberModel(this.db, member.team_id, member.name)
       this.client.session.promptAsync({
         sessionID: member.session_id,
         parts: [{ type: "text", text: "[System]: You appear stalled — no progress detected. Report your current status to the lead via team_message, or wrap up your work." }],
-        ...(stallModel ? { model: stallModel } : {}),
+        ...getMemberPromptOptions(this.db, member.team_id, member.name),
       }).then(() => {
-        this.progressTracker!.markReported(member.session_id)
+        this.progressTracker?.markReported(member.session_id)
       }).catch((err) => {
         log(`watchdog:stall:nudge-failed member=${member.name} team=${member.team_id} session=${member.session_id} err=${err instanceof Error ? err.message : String(err)}`)
       })
@@ -199,7 +202,7 @@ export class Watchdog {
       `SELECT tm.team_id, tm.name, tm.session_id
        FROM team_member tm
        JOIN team t ON tm.team_id = t.id
-       WHERE t.status = 'active' AND tm.status = 'busy'`
+        WHERE t.status = 'active' AND tm.member_kind = 'worker' AND tm.status = 'busy'`
     ).all() as Array<{ team_id: string; name: string; session_id: string }>
 
     for (const member of busy) {
@@ -215,11 +218,10 @@ export class Watchdog {
       this.progressTracker.markChattyReported(member.session_id)
 
       // Nudge the agent
-      const chattyModel = getMemberModel(this.db, member.team_id, member.name)
       this.client.session.promptAsync({
         sessionID: member.session_id,
         parts: [{ type: "text", text: "[System]: You've sent several messages to teammates. Focus on completing your task and send your results to the lead via team_message." }],
-        ...(chattyModel ? { model: chattyModel } : {}),
+        ...getMemberPromptOptions(this.db, member.team_id, member.name),
       }).catch((err) => {
         log(`watchdog:chatty:nudge-failed member=${member.name} team=${member.team_id} session=${member.session_id} err=${err instanceof Error ? err.message : String(err)}`)
       })
@@ -250,7 +252,8 @@ export class Watchdog {
        JOIN team t ON tm.team_id = t.id
        JOIN project p ON t.project_id = p.id
        WHERE t.status = 'active'
-         AND tm.status = 'busy'
+          AND tm.member_kind = 'worker'
+          AND tm.status = 'busy'
          AND tm.time_updated < ?`
     ).all(cutoff) as Array<{ team_id: string; name: string; session_id: string; worktree_branch: string | null; team_name: string; project_name: string }>
 
@@ -287,6 +290,7 @@ export class Watchdog {
       )
 
       // Abort session (best effort)
+      this.scheduler?.terminateMember(member.team_id, member.name, "watchdog timeout")
       try {
         await this.client.session.abort({ sessionID: member.session_id })
       } catch { /* best effort */ }

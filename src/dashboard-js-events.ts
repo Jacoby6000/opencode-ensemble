@@ -1,6 +1,6 @@
 /** Dashboard JS — interaction handlers, keyboard, polling. */
 export const DASHBOARD_JS_EVENTS = `
-function toggleMsg(id){if(expMsgs.has(id))expMsgs.delete(id);else expMsgs.add(id);render()}
+function toggleMsg(id){if(expMsgs.has(id)){expMsgs.delete(id);render();return}expMsgs.add(id);const t=cur();render();if(t&&!fullMessageBodies.has(id))ensureTeamMessages(t.id).then(render).catch(()=>{})}
 
 function toggleVerbose(){
   verbose=!verbose;
@@ -18,7 +18,7 @@ var fetchActivityGen=0;
 async function fetchActivity(sessionId){
   var gen=++fetchActivityGen;
   try{
-    var res=await fetch('api/session/'+encodeURIComponent(sessionId)+'/activity');
+    var res=await apiFetch('api/session/'+encodeURIComponent(sessionId)+'/activity');
     var data=await res.json();
     if(gen!==fetchActivityGen)return;
     drawerActivity=data.activity||[];
@@ -41,23 +41,33 @@ function applyNavCollapse(){
 
 function render(){
   rSel();const t=cur();
+  rTeamSwitcher(t);
   const empty=document.getElementById('empty'),content=document.getElementById('content');
   if(!t){empty.classList.remove('hidden');empty.classList.add('flex');content.classList.add('hidden');document.getElementById('tl').classList.add('hidden');return}
   empty.classList.add('hidden');empty.classList.remove('flex');content.classList.remove('hidden');
   applyNavCollapse();
   const p=curProject();document.getElementById('crumb').textContent=p?' / '+projectLabel(p)+' / '+t.name:'';
-  rHealth(t);rSum(t);rAttention(t);rAgents(t);rTasks(t);rActivity(t);rTimeline(t);
+  document.querySelectorAll('.view-link').forEach(el=>el.setAttribute('aria-current',String(el.dataset.view===selectedView)));
+  document.getElementById('overview-view').classList.toggle('hidden',selectedView!=='overview');
+  document.getElementById('conversation-view').classList.toggle('hidden',selectedView!=='conversations');
+  if(selectedView==='overview'){rHealth(t);rSum(t);rAttention(t);rAgents(t);rTasks(t);rActivity(t);rTimeline(t)}else{rHealth(t);rSum(t);document.getElementById('tl').classList.add('hidden');rConversations(t)}
 }
 
-function selectProject(id){selProjectId=id;const p=S?.projects?.find(p=>p.id===id);const t=(p?.teams||[]).filter(t=>t.status==='active').sort((a,b)=>b.timeUpdated-a.timeUpdated)[0]||(p?.teams||[])[0];if(t)selId=t.id;selCard=-1;render()}
-function selectTeam(id){selId=id;selCard=-1;render()}
+function syncLocation(replace){const q=new URLSearchParams();if(selectedView!=='overview')q.set('view',selectedView);if(showArchived)q.set('archived','1');if(selProjectId)q.set('project',selProjectId);if(selId)q.set('team',selId);if(selectedView==='conversations'&&selectedChannel)q.set('channel',selectedChannel);const url=location.pathname+(q.toString()?'?'+q.toString():'');history[replace?'replaceState':'pushState'](null,'',url)}
+function selectView(view){selectedView=view==='conversations'?'conversations':'overview';conversationError='';syncLocation(false);render()}
+function selectProject(id){selProjectId=id;const p=S?.projects?.find(p=>p.id===id),t=p?visibleProjectTeams(p).sort((a,b)=>b.timeUpdated-a.timeUpdated)[0]:null;if(t)selId=t.id;selectedChannel='broadcast';selCard=-1;syncLocation(false);render()}
+function selectTeam(id){selId=id;const t=cur();selProjectId=t?.projectId||selProjectId;const cp=channelParts(selectedChannel),valid=cp.type==='broadcast'||cp.type==='member'&&(t?.members||[]).some(m=>m.name===cp.name)||cp.type==='group'&&(t?.groups||[]).some(g=>g.name===cp.name);if(!valid)selectedChannel='broadcast';selCard=-1;conversationError='';syncLocation(false);render()}
+function toggleArchived(){showArchived=!showArchived;if(!showArchived){const selected=S?.teams?.find(t=>t.id===selId);if(selected&&selected.status!=='active'){selId=null;selectedChannel='broadcast'}}render();syncLocation(false)}
+function selectConversation(channel){selectedView='conversations';selectedChannel=channel||'broadcast';conversationError='';syncLocation(false);render()}
+function loadOlderMessages(){const t=cur();if(!t)return;ensureConversation(t.id,selectedChannel,true).then(()=>render()).catch(err=>{conversationError=err.message;render()})}
+async function sendConversationMessage(event){event.preventDefault();if(conversationSending)return;const t=cur(),text=document.getElementById('conversation-text'),cp=channelParts(selectedChannel);if(!t||!text)return;const content=text.value.trim();if(!content){conversationError='Enter a message first.';render();return}conversationSending=true;conversationError='';render();try{const destination=cp.type==='group'?{group:cp.name,content:content}:{to:cp.type==='broadcast'?null:cp.name,content:content};await apiFetch('api/teams/'+encodeURIComponent(t.id)+'/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(destination)});text.value='';conversationPages.delete(conversationKey(t.id,selectedChannel));await ensureConversation(t.id,selectedChannel,false);conversationError='';}catch(err){conversationError=err.message||'Message could not be queued.'}finally{conversationSending=false;render();document.getElementById('conversation-text')?.focus()}}
 
 function conn(ok){
   document.getElementById('cd').className='w-[7px] h-[7px] rounded-full '+(ok?'bg-emerald-500 pulse':'bg-red-500');
   document.getElementById('ct').textContent=ok?D(Date.now()-pollT)+' ago':'reconnecting to dashboard state';
 }
 
-async function poll(){try{S=await(await fetch('api/state')).json();fails=0;pollT=Date.now();conn(true);render()}catch{if(++fails>=3)conn(false)}}
+async function poll(){try{const previous=cur(),previousLatest=previous?.messages?.[0]?.id||null;S=await(await apiFetch('api/state')).json();const current=cur(),currentLatest=current?.messages?.[0]?.id||null;if(selectedView==='conversations'&&previousLatest!==currentLatest&&current)conversationPages.delete(conversationKey(current.id,selectedChannel));fails=0;pollT=Date.now();conn(true);render()}catch{if(++fails>=3)conn(false)}}
 
 function setBackgroundInert(locked){
   document.querySelectorAll('header,main,#sum,#tl').forEach(function(el){
@@ -104,6 +114,8 @@ document.addEventListener('click',function(e){
   navCollapsed=id==='nav-toggle';
   applyNavCollapse();
 });
+
+addEventListener('popstate',function(){const q=new URLSearchParams(location.search);selectedView=q.get('view')==='conversations'?'conversations':'overview';showArchived=q.get('archived')==='1';selProjectId=q.get('project');selId=q.get('team');selectedChannel=q.get('channel')||(q.get('member')?'member:'+q.get('member'):'broadcast');conversationError='';render()});
 
 // Keyboard shortcuts
 document.addEventListener('keydown',function(e){

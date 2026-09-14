@@ -1,0 +1,245 @@
+import { beforeEach, describe, expect, test } from "bun:test"
+import { DEFAULT_CONFIG } from "../src/config"
+import type { Database } from "../src/db"
+import { DurableScheduler } from "../src/scheduler-runtime"
+import { findRunBySession, markRunInjected, queueWake, tryAcquireRun } from "../src/scheduler"
+import { insertMember, insertTeam, mockClient, setupDb } from "./helpers"
+
+describe("durable scheduler runtime", () => {
+  let db: Database
+
+  beforeEach(() => {
+    db = setupDb()
+    insertTeam(db, "t1", "alpha", "lead-1")
+    insertMember(db, "t1", "alice", "session-a")
+  })
+
+  test("dispatches a queued wake without awaiting prompt completion", async () => {
+    const client = mockClient()
+    client.session.promptAsync = async options => {
+      client.calls.push({ method: "session.promptAsync", args: [options] })
+      return new Promise(() => {})
+    }
+    queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
+      reason: "spawn", coalesceKey: "member", prompt: "initial context", now: 10,
+    })
+    const scheduler = new DurableScheduler(db, client, DEFAULT_CONFIG.scheduler)
+
+    scheduler.kick()
+    await Bun.sleep(0)
+
+    expect(client.calls.filter(call => call.method === "session.promptAsync")).toHaveLength(1)
+    expect(findRunBySession(db, "session-a")?.state).toBe("active")
+  })
+
+  test("marks accepted delivery injected and finishes it on idle", async () => {
+    const client = mockClient()
+    const wake = queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
+      reason: "spawn", coalesceKey: "member", prompt: "initial context", now: Date.now(),
+    })
+    const scheduler = new DurableScheduler(db, client, DEFAULT_CONFIG.scheduler)
+
+    scheduler.kick()
+    await Bun.sleep(0)
+    await Bun.sleep(0)
+    expect(findRunBySession(db, "session-a")?.injectedAt).not.toBeNull()
+
+    scheduler.onSessionStatus("session-a", "idle")
+    expect(findRunBySession(db, "session-a")).toBeUndefined()
+    expect(db.query("SELECT state FROM scheduler_wake WHERE id = ?").get(wake.wakeId)).toEqual({ state: "completed" })
+  })
+
+  test("ignores idle evidence that predates injection acknowledgement", async () => {
+    const client = mockClient()
+    client.session.promptAsync = () => new Promise(() => {})
+    const wake = queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
+      reason: "spawn", coalesceKey: "member", prompt: "initial context", now: Date.now(),
+    })
+    const scheduler = new DurableScheduler(db, client, DEFAULT_CONFIG.scheduler)
+
+    scheduler.kick()
+    await Bun.sleep(0)
+    scheduler.onSessionStatus("session-a", "idle")
+
+    expect(findRunBySession(db, "session-a")?.injectedAt).toBeNull()
+    expect(db.query("SELECT state FROM scheduler_wake WHERE id = ?").get(wake.wakeId)).toEqual({ state: "leased" })
+  })
+
+  test("requeues a wake when prompt dispatch rejects", async () => {
+    const client = mockClient()
+    client.session.promptAsync = async () => { throw new Error("offline") }
+    const wake = queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
+      reason: "message", coalesceKey: "member", prompt: "work", now: Date.now(),
+    })
+    const scheduler = new DurableScheduler(db, client, DEFAULT_CONFIG.scheduler)
+
+    scheduler.kick()
+    await Bun.sleep(0)
+    await Bun.sleep(0)
+
+    expect(findRunBySession(db, "session-a")).toBeUndefined()
+    expect(db.query("SELECT state, last_error FROM scheduler_wake WHERE id = ?").get(wake.wakeId)).toEqual({ state: "queued", last_error: "offline" })
+  })
+
+  test("does not dispatch beyond configured run capacity", async () => {
+    insertMember(db, "t1", "bob", "session-b")
+    const client = mockClient()
+    client.session.promptAsync = async options => {
+      client.calls.push({ method: "session.promptAsync", args: [options] })
+      return new Promise(() => {})
+    }
+    const now = Date.now()
+    const first = queueWake(db, { teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build", reason: "message", coalesceKey: "alice", now })
+    queueWake(db, { teamId: "t1", memberName: "bob", sessionId: "session-b", agent: "build", reason: "message", coalesceKey: "bob", now })
+    expect(tryAcquireRun(db, first.wakeId, { global: 1, perAgent: {} }, 60_000, now).acquired).toBe(true)
+    const scheduler = new DurableScheduler(db, client, { ...DEFAULT_CONFIG.scheduler, runLimits: { global: 1, perAgent: {} } })
+
+    scheduler.kick()
+    await Bun.sleep(0)
+    expect(client.calls.filter(call => call.method === "session.promptAsync")).toHaveLength(0)
+  })
+
+  test("bounds startup reconciliation when session status never settles", async () => {
+    const client = mockClient()
+    client.session.status = () => new Promise(() => {})
+    const now = Date.now()
+    const wake = queueWake(db, { teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build", reason: "message", coalesceKey: "alice", now })
+    const acquired = tryAcquireRun(db, wake.wakeId, DEFAULT_CONFIG.scheduler.runLimits, 1, now)
+    if (!acquired.acquired) throw new Error("expected lease")
+    const scheduler = new DurableScheduler(db, client, { ...DEFAULT_CONFIG.scheduler, leaseTtlMs: 10 })
+
+    await scheduler.recover()
+
+    expect(findRunBySession(db, "session-a")?.state).toBe("expired")
+  })
+
+  test("keeps a fenced run when session lookup times out", async () => {
+    const client = mockClient()
+    client.session.get = () => new Promise(() => {})
+    const now = Date.now()
+    const wake = queueWake(db, { teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build", reason: "message", coalesceKey: "alice", now })
+    const acquired = tryAcquireRun(db, wake.wakeId, DEFAULT_CONFIG.scheduler.runLimits, 1, now)
+    if (!acquired.acquired) throw new Error("expected lease")
+    const scheduler = new DurableScheduler(db, client, { ...DEFAULT_CONFIG.scheduler, leaseTtlMs: 10 })
+
+    await Bun.sleep(2)
+    await scheduler.recover()
+
+    expect(findRunBySession(db, "session-a")?.state).toBe("expired")
+    expect(db.query("SELECT status FROM team_member WHERE name = 'alice'").get()).toEqual({ status: "ready" })
+  })
+
+  test("does not requeue an unexpired in-flight dispatch during maintenance", async () => {
+    const client = mockClient()
+    client.session.promptAsync = options => {
+      client.calls.push({ method: "session.promptAsync", args: [options] })
+      return new Promise(() => {})
+    }
+    const wake = queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
+      reason: "spawn", coalesceKey: "member", prompt: "initial context",
+    })
+    const scheduler = new DurableScheduler(db, client, DEFAULT_CONFIG.scheduler)
+    scheduler.kick()
+    await Bun.sleep(0)
+
+    await scheduler.recover()
+    await Bun.sleep(0)
+
+    expect(client.calls.filter(call => call.method === "session.promptAsync")).toHaveLength(1)
+    expect(db.query("SELECT state FROM scheduler_wake WHERE id = ?").get(wake.wakeId)).toEqual({ state: "leased" })
+  })
+
+  test("arms a missed idle epoch only during maintenance and preserves its timestamp", async () => {
+    const scheduler = new DurableScheduler(db, mockClient(), DEFAULT_CONFIG.scheduler)
+
+    scheduler.kick()
+    await Bun.sleep(0)
+    expect(db.query("SELECT quiet_since FROM team_supervision WHERE team_id = 't1'").get()).toEqual({ quiet_since: null })
+
+    const before = Date.now()
+    await scheduler.recover()
+    const after = Date.now()
+    const state = db.query("SELECT quiet_since FROM team_supervision WHERE team_id = 't1'").get() as { quiet_since: number }
+    expect(state.quiet_since).toBeGreaterThanOrEqual(before)
+    expect(state.quiet_since).toBeLessThanOrEqual(after)
+
+    await scheduler.recover()
+    expect(db.query("SELECT quiet_since FROM team_supervision WHERE team_id = 't1'").get()).toEqual(state)
+  })
+
+  test("does not arm zero-worker, busy-worker, or queued-worker teams during maintenance", async () => {
+    db.run("UPDATE team_member SET member_kind = 'supervisor' WHERE team_id = 't1' AND name = 'alice'")
+    insertTeam(db, "t2", "busy-team", "lead-2")
+    insertMember(db, "t2", "bob", "session-b", "busy", "running")
+    insertTeam(db, "t3", "queued-team", "lead-3")
+    insertMember(db, "t3", "carol", "session-c")
+    queueWake(db, {
+      teamId: "t3", memberName: "carol", sessionId: "session-c", agent: "build",
+      reason: "message", coalesceKey: "carol", now: Date.now(),
+    })
+    const scheduler = new DurableScheduler(db, mockClient(), DEFAULT_CONFIG.scheduler, false)
+
+    await scheduler.recover()
+
+    expect(db.query("SELECT team_id, quiet_since FROM team_supervision ORDER BY team_id").all()).toEqual([
+      { team_id: "t1", quiet_since: null },
+      { team_id: "t2", quiet_since: null },
+      { team_id: "t3", quiet_since: null },
+    ])
+  })
+
+  test("does not overwrite lifecycle status when a scheduled run goes idle", async () => {
+    const wake = queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
+      reason: "message", coalesceKey: "member",
+    })
+    const acquired = tryAcquireRun(db, wake.wakeId, DEFAULT_CONFIG.scheduler.runLimits, 60_000)
+    if (!acquired.acquired) throw new Error("expected lease")
+    markRunInjected(db, acquired.leaseId)
+    db.run("UPDATE team_member SET status = 'shutdown_requested' WHERE name = 'alice'")
+    const scheduler = new DurableScheduler(db, mockClient(), DEFAULT_CONFIG.scheduler)
+
+    scheduler.onSessionStatus("session-a", "idle")
+
+    expect(db.query("SELECT status FROM team_member WHERE name = 'alice'").get()).toEqual({ status: "shutdown_requested" })
+  })
+
+  test("only dispatches wakes owned by its project", async () => {
+    db.run(
+      "INSERT INTO project (id, name, path, status, time_created, time_updated) VALUES (?, ?, ?, 'active', ?, ?)",
+      ["/tmp/other-project", "other-project", "/tmp/other-project", Date.now(), Date.now()],
+    )
+    db.run(
+      "INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)",
+      ["t2", "beta", "/tmp/other-project", "lead-2", Date.now(), Date.now()],
+    )
+    insertMember(db, "t2", "bob", "session-b")
+    queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
+      reason: "message", coalesceKey: "alice", prompt: "project A",
+    })
+    const otherWake = queueWake(db, {
+      teamId: "t2", memberName: "bob", sessionId: "session-b", agent: "build",
+      reason: "message", coalesceKey: "bob", prompt: "project B", now: Date.now() - 100,
+    })
+    const otherLease = tryAcquireRun(db, otherWake.wakeId, DEFAULT_CONFIG.scheduler.runLimits, 1, Date.now() - 100)
+    if (!otherLease.acquired) throw new Error("expected other-project lease")
+    const client = mockClient()
+    const scheduler = new DurableScheduler(db, client, DEFAULT_CONFIG.scheduler, true, "/tmp/test-project")
+
+    scheduler.kick()
+    await Bun.sleep(0)
+
+    const prompts = client.calls
+      .filter(call => call.method === "session.promptAsync")
+      .map(call => (call.args[0] as { sessionID: string }).sessionID)
+    expect(prompts).toEqual(["session-a"])
+    expect(db.query("SELECT state FROM scheduler_wake WHERE team_id = 't2'").get()).toEqual({ state: "leased" })
+    expect(db.query("SELECT state FROM scheduler_run_lease WHERE id = ?").get(otherLease.leaseId)).toEqual({ state: "active" })
+  })
+})

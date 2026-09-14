@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach } from "bun:test"
 import { setupDb, insertTeam, insertMember } from "./helpers"
 import type { Database } from "../src/db"
-import { parseModelId, getMemberModel } from "../src/member-model"
+import { parseModelId, getMemberModel, getMemberPromptOptions } from "../src/member-model"
 
 describe("parseModelId", () => {
   test("parses a valid provider/model string", () => {
@@ -57,5 +57,43 @@ describe("getMemberModel", () => {
 
   test("returns undefined for an unknown member", () => {
     expect(getMemberModel(db, "t1", "nobody")).toBeUndefined()
+  })
+})
+
+describe("getMemberPromptOptions", () => {
+  let db: Database
+
+  beforeEach(() => {
+    db = setupDb()
+    insertTeam(db, "t1", "my-team", "lead-sess")
+    insertMember(db, "t1", "alice", "sess-alice")
+  })
+
+  test("returns the stored custom agent and parsed model", () => {
+    db.run(
+      "UPDATE team_member SET agent = ?, model = ? WHERE team_id = ? AND name = ?",
+      ["qa-specialist", "openrouter/anthropic/claude-sonnet", "t1", "alice"],
+    )
+
+    expect(getMemberPromptOptions(db, "t1", "alice")).toEqual({
+      agent: "qa-specialist",
+      model: { providerID: "openrouter", modelID: "anthropic/claude-sonnet" },
+    })
+  })
+
+  test("preserves the stored agent when no model is set", () => {
+    db.run("UPDATE team_member SET agent = 'qa-specialist' WHERE team_id = 't1' AND name = 'alice'")
+
+    expect(getMemberPromptOptions(db, "t1", "alice")).toEqual({ agent: "qa-specialist" })
+  })
+
+  test("preserves the stored agent and omits a malformed model", () => {
+    db.run("UPDATE team_member SET agent = 'qa-specialist', model = 'garbage' WHERE team_id = 't1' AND name = 'alice'")
+
+    expect(getMemberPromptOptions(db, "t1", "alice")).toEqual({ agent: "qa-specialist" })
+  })
+
+  test("returns empty options for an unknown member", () => {
+    expect(getMemberPromptOptions(db, "t1", "nobody")).toEqual({})
   })
 })

@@ -2,6 +2,8 @@ import { describe, test, expect, beforeEach } from "bun:test"
 import { setupDeps, insertTeam, insertMember } from "../helpers"
 import { executeTeamResults } from "../../src/tools/team-results"
 import { sendMessage } from "../../src/messaging"
+import { ANNALIST_AGENT, ANNALIST_MEMBER_NAME } from "../../src/annalist"
+import { sendGroupMessage } from "../../src/groups"
 
 describe("team_results", () => {
   let deps: ReturnType<typeof setupDeps>
@@ -86,5 +88,44 @@ describe("team_results", () => {
   test("rejects if session is not in a team", async () => {
     await expect(executeTeamResults(deps, {}, "random-sess"))
       .rejects.toThrow("not in a team")
+  })
+
+  test("lets the Annalist inspect any direct or broadcast mailbox without consuming read state", async () => {
+    deps.db.run(
+      "INSERT INTO team_member (team_id, name, session_id, agent, member_kind, status, execution_status, time_created, time_updated) VALUES ('t1', ?, 'annalist-session', ?, 'annalist', 'ready', 'idle', 1, 1)",
+      [ANNALIST_MEMBER_NAME, ANNALIST_AGENT],
+    )
+    deps.registry.register("t1", ANNALIST_MEMBER_NAME, "annalist-session")
+    const direct = sendMessage(deps.db, { teamId: "t1", from: "alice", to: "bob", content: "cross-agent context" })
+    deps.db.run(
+      "INSERT INTO team_message (id, team_id, from_name, to_name, content, delivered, read, delivery_state, time_created) VALUES ('broadcast-1', 't1', 'lead', NULL, 'whole-team context', 1, 0, 'injected', 2)",
+    )
+    sendGroupMessage(deps.db, {
+      teamId: "t1",
+      sender: "alice",
+      group: "builders",
+      members: ["alice", "bob"],
+      content: "group-only context",
+      now: 3,
+    })
+
+    const mailbox = await executeTeamResults(deps, { mailbox: "bob", limit: 20 }, "annalist-session")
+    const broadcast = await executeTeamResults(deps, { mailbox: "broadcast", limit: 20 }, "annalist-session")
+    const groups = await executeTeamResults(deps, { list_groups: true }, "annalist-session")
+    const group = await executeTeamResults(deps, { group: "builders", limit: 20 }, "annalist-session")
+
+    expect(mailbox).toContain("alice -> bob")
+    expect(mailbox).toContain("cross-agent context")
+    expect(broadcast).toContain("whole-team context")
+    expect(groups).toContain("builders")
+    expect(groups).toContain("canSend: false")
+    expect(group).toContain("group-only context")
+    expect(deps.db.query("SELECT read FROM team_message WHERE id = ?").get(direct)).toEqual({ read: 0 })
+    expect(deps.db.query("SELECT read FROM team_message WHERE id = 'broadcast-1'").get()).toEqual({ read: 0 })
+  })
+
+  test("rejects arbitrary mailbox inspection by ordinary teammates", async () => {
+    await expect(executeTeamResults(deps, { mailbox: "bob" }, "sess-alice"))
+      .rejects.toThrow("Annalist")
   })
 })

@@ -3,6 +3,7 @@ import { setupDeps, insertTeam, insertMember } from "../helpers"
 import { executeTeamSpawn } from "../../src/tools/team-spawn"
 import { executeTeamTasksAdd } from "../../src/tools/team-tasks-add"
 import type { ToolDeps } from "../../src/types"
+import { tryReserveIdentity } from "../../src/scheduler"
 
 describe("team_spawn", () => {
   let deps: ReturnType<typeof setupDeps>
@@ -26,8 +27,8 @@ describe("team_spawn", () => {
     const row = deps.db.query("SELECT * FROM team_member WHERE name = ?").get("alice") as Record<string, unknown>
     expect(row).toBeTruthy()
     expect(row.agent).toBe("build")
-    expect(row.status).toBe("busy")
-    expect(row.execution_status).toBe("starting")
+    expect(row.status).toBe("ready")
+    expect(row.execution_status).toBe("idle")
 
     // Check registry
     expect(deps.registry.isTeamSession(row.session_id as string)).toBe(true)
@@ -37,6 +38,43 @@ describe("team_spawn", () => {
     expect(createCalls).toHaveLength(1)
     const promptCalls = deps.client.calls.filter(c => c.method === "session.promptAsync")
     expect(promptCalls).toHaveLength(1)
+    expect(deps.db.query("SELECT state FROM scheduler_identity WHERE team_id = 't1' AND member_name = 'alice'").get()).toEqual({ state: "active" })
+    expect(deps.db.query("SELECT COUNT(*) AS count FROM scheduler_wake WHERE team_id = 't1' AND member_name = 'alice'").get()).toEqual({ count: 1 })
+  })
+
+  test("rejects capacity before provisioning external resources", async () => {
+    deps.config.scheduler.identityLimits = { global: 1, perAgent: {} }
+    expect(tryReserveIdentity(deps.db, {
+      teamId: "t1", memberName: "reserved", agent: "build",
+      limits: deps.config.scheduler.identityLimits,
+      reservationTtlMs: deps.config.scheduler.reservationTtlMs,
+    }).reserved).toBe(true)
+
+    await expect(executeTeamSpawn(deps, {
+      name: "alice", agent: "build", prompt: "Fix the tests",
+    }, "lead-sess")).rejects.toThrow(/identity capacity/)
+    expect(deps.client.calls.some(call => call.method === "worktree.create" || call.method === "session.create")).toBe(false)
+  })
+
+  test("cleans up the child, member, and claimed task if identity activation expires", async () => {
+    deps.config.scheduler.reservationTtlMs = 1
+    deps.db.run(
+      "INSERT INTO team_task (id, team_id, content, status, priority, time_created, time_updated) VALUES ('task-expiring', 't1', 'Do work', 'pending', 'medium', ?, ?)",
+      [Date.now(), Date.now()],
+    )
+    const originalCreate = deps.client.session.create.bind(deps.client.session)
+    deps.client.session.create = async options => {
+      await Bun.sleep(5)
+      return originalCreate(options)
+    }
+
+    await expect(executeTeamSpawn(deps, {
+      name: "alice", agent: "build", prompt: "Fix tests", claim_task: "task-expiring", worktree: false,
+    }, "lead-sess")).rejects.toThrow(/activate scheduler identity/)
+
+    expect(deps.db.query("SELECT name FROM team_member WHERE name = 'alice'").get()).toBeNull()
+    expect(deps.db.query("SELECT status, assignee FROM team_task WHERE id = 'task-expiring'").get()).toEqual({ status: "pending", assignee: null })
+    expect(deps.client.calls.filter(call => call.method === "session.abort")).toHaveLength(1)
   })
 
   test("agent: null defaults to 'build' instead of hitting the NOT NULL constraint (issue #28)", async () => {
@@ -70,7 +108,72 @@ describe("team_spawn", () => {
     expect(row.agent).toBe("build")
   })
 
-  test("records a busy-start baseline on spawn (regression: fresh member inserted directly as busy, never fires a ready->busy transition event)", async () => {
+  test("passes a custom agent and resolved model to session.create and the initial prompt", async () => {
+    await executeTeamSpawn(deps, {
+      name: "alice",
+      agent: "qa-specialist",
+      model: "openrouter/anthropic/claude-sonnet",
+      prompt: "Validate the change",
+      worktree: false,
+    }, "lead-sess")
+
+    const createCall = deps.client.calls.find(c => c.method === "session.create")
+    const createOptions = createCall!.args[0] as {
+      agent?: string
+      model?: { providerID: string; id: string }
+    }
+    expect(createOptions.agent).toBe("qa-specialist")
+    expect(createOptions.model).toEqual({
+      providerID: "openrouter",
+      id: "anthropic/claude-sonnet",
+    })
+
+    const promptCall = deps.client.calls.find(c => c.method === "session.promptAsync")
+    const promptOptions = promptCall!.args[0] as {
+      agent?: string
+      model?: { providerID: string; modelID: string }
+    }
+    expect(promptOptions.agent).toBe("qa-specialist")
+    expect(promptOptions.model).toEqual({
+      providerID: "openrouter",
+      modelID: "anthropic/claude-sonnet",
+    })
+  })
+
+  test("passes the custom agent and omits malformed model options on spawn", async () => {
+    await executeTeamSpawn(deps, {
+      name: "alice",
+      agent: "qa-specialist",
+      model: "malformed",
+      prompt: "Validate the change",
+      worktree: false,
+    }, "lead-sess")
+
+    const createOptions = deps.client.calls.find(c => c.method === "session.create")!.args[0] as { agent?: string; model?: unknown }
+    const promptOptions = deps.client.calls.find(c => c.method === "session.promptAsync")!.args[0] as { agent?: string; model?: unknown }
+    expect(createOptions).toMatchObject({ agent: "qa-specialist" })
+    expect(createOptions.model).toBeUndefined()
+    expect(promptOptions).toMatchObject({ agent: "qa-specialist" })
+    expect(promptOptions.model).toBeUndefined()
+  })
+
+  test("passes the custom agent and omits model options when no model resolves", async () => {
+    await executeTeamSpawn(deps, {
+      name: "alice",
+      agent: "qa-specialist",
+      prompt: "Validate the change",
+      worktree: false,
+    }, "lead-sess")
+
+    const createOptions = deps.client.calls.find(c => c.method === "session.create")!.args[0] as { agent?: string; model?: unknown }
+    const promptOptions = deps.client.calls.find(c => c.method === "session.promptAsync")!.args[0] as { agent?: string; model?: unknown }
+    expect(createOptions).toMatchObject({ agent: "qa-specialist" })
+    expect(createOptions.model).toBeUndefined()
+    expect(promptOptions).toMatchObject({ agent: "qa-specialist" })
+    expect(promptOptions.model).toBeUndefined()
+  })
+
+  test("persists scheduler ownership before dispatching the initial prompt", async () => {
     const result = await executeTeamSpawn(deps, {
       name: "alice",
       agent: "build",
@@ -78,12 +181,8 @@ describe("team_spawn", () => {
     }, "lead-sess")
     expect(result).toContain("spawned")
 
-    const row = deps.db.query("SELECT session_id FROM team_member WHERE name = ?").get("alice") as { session_id: string }
-    // team-spawn.ts inserts the row with status='busy' directly -- there is no
-    // status-event transition for the watchdog to hook. isTimeStalled must still
-    // see a baseline from the moment of spawn, or a teammate stalled on its very
-    // first action (the exact pattern this checklist item tests) is invisible.
-    expect(deps.progressTracker.isTimeStalled(row.session_id, 0)).toBe(true)
+    expect(deps.db.query("SELECT state FROM scheduler_identity WHERE member_name = ?").get("alice")).toEqual({ state: "active" })
+    expect(deps.db.query("SELECT COUNT(*) AS count FROM scheduler_wake WHERE member_name = ?").get("alice")).toEqual({ count: 1 })
   })
 
   test("rejects if caller is not the lead", async () => {
@@ -239,7 +338,7 @@ describe("team_spawn", () => {
     expect(row.assignee).toBe("bob")
   })
 
-  test("releases the claimed task if the spawn rolls back on delivery failure", async () => {
+  test("retains a claimed task while durable delivery retries", async () => {
     deps.db.run(
       "INSERT INTO team_task (id, team_id, content, status, priority, time_created, time_updated) VALUES ('task_real', 't1', 'Do work', 'pending', 'medium', ?, ?)",
       [Date.now(), Date.now()],
@@ -253,12 +352,12 @@ describe("team_spawn", () => {
       claim_task: "task_real",
     }, "lead-sess")
 
-    // Give the microtask queue time to process the async .catch() rollback
     await new Promise(resolve => setTimeout(resolve, 10))
 
     const row = deps.db.query("SELECT status, assignee FROM team_task WHERE id = ?").get("task_real") as { status: string; assignee: string | null }
-    expect(row.status).toBe("pending")
-    expect(row.assignee).toBeNull()
+    expect(row.status).toBe("in_progress")
+    expect(row.assignee).toBe("alice")
+    expect(deps.db.query("SELECT state FROM scheduler_wake WHERE member_name = ?").get("alice")).toEqual({ state: "queued" })
   })
 
   test("response includes task summary without LLM instructions", async () => {
@@ -275,7 +374,7 @@ describe("team_spawn", () => {
     expect(result).not.toContain("woken automatically")
   })
 
-  test("rolls back DB, registry, and aborts session if promptAsync fails asynchronously", async () => {
+  test("retains DB and registry state when durable prompt delivery fails asynchronously", async () => {
     // Make promptAsync throw after session.create succeeds
     deps.client.session.promptAsync = async () => { throw new Error("promptAsync failed") }
 
@@ -288,20 +387,15 @@ describe("team_spawn", () => {
 
     expect(result).toContain("alice")
 
-    // Give the microtask queue time to process the async .catch() rollback
     await new Promise(resolve => setTimeout(resolve, 10))
 
-    // DB should have no member
     const row = deps.db.query("SELECT * FROM team_member WHERE name = 'alice'").get()
-    expect(row).toBeNull()
-
-    // Registry should be clean
+    expect(row).toBeTruthy()
     const members = deps.registry.listByTeam("t1")
-    expect(members).toHaveLength(0)
-
-    // session.abort should have been called
+    expect(members).toHaveLength(1)
     const abortCalls = deps.client.calls.filter(c => c.method === "session.abort")
-    expect(abortCalls).toHaveLength(1)
+    expect(abortCalls).toHaveLength(0)
+    expect(deps.db.query("SELECT state FROM scheduler_wake WHERE member_name = ?").get("alice")).toEqual({ state: "queued" })
   })
 
   test("response is clean without LLM instructions", async () => {
@@ -316,7 +410,7 @@ describe("team_spawn", () => {
     expect(result).not.toContain("STOP")
   })
 
-  test("rolls back cleanly even if session.abort fails during promptAsync rollback", async () => {
+  test("does not abort the session when durable prompt delivery fails", async () => {
     deps.client.session.promptAsync = async () => { throw new Error("promptAsync failed") }
     deps.client.session.abort = async () => { throw new Error("abort also failed") }
 
@@ -332,10 +426,10 @@ describe("team_spawn", () => {
     // Give the microtask queue time to process the async .catch() rollback
     await new Promise(resolve => setTimeout(resolve, 10))
 
-    // DB and registry should still be cleaned up
     const row = deps.db.query("SELECT * FROM team_member WHERE name = 'alice'").get()
-    expect(row).toBeNull()
-    expect(deps.registry.listByTeam("t1")).toHaveLength(0)
+    expect(row).toBeTruthy()
+    expect(deps.registry.listByTeam("t1")).toHaveLength(1)
+    expect(deps.client.calls.filter(c => c.method === "session.abort")).toHaveLength(0)
   })
 
   test("context message includes structured completion format", async () => {
@@ -473,30 +567,35 @@ describe("team_spawn", () => {
     expect(result).not.toContain("branch:")
   })
 
-  test("falls back to shared directory if worktree creation fails", async () => {
+  test("fails closed if writable-agent worktree creation fails", async () => {
     deps.client.worktree.create = async () => { throw new Error("worktree failed") }
 
-    const result = await executeTeamSpawn(deps, {
+    await expect(executeTeamSpawn(deps, {
       name: "alice",
       agent: "build",
       prompt: "Fix the tests",
-    }, "lead-sess")
+    }, "lead-sess")).rejects.toThrow(/worktree failed/i)
 
-    // Should still succeed — just without worktree
-    expect(result).toContain("alice")
-    expect(result).toContain("spawned")
+    expect(deps.db.query("SELECT name FROM team_member WHERE name = ?").get("alice")).toBeNull()
+    expect(deps.client.calls.filter(c => c.method === "session.create")).toHaveLength(0)
 
-    // DB should have null worktree columns
-    const row = deps.db.query("SELECT worktree_dir, worktree_branch FROM team_member WHERE name = ?").get("alice") as Record<string, string | null>
-    expect(row.worktree_dir).toBeNull()
-    expect(row.worktree_branch).toBeNull()
-
-    // Toast warning should have been fired
     const toasts = deps.client.calls.filter(c => c.method === "tui.showToast")
     expect(toasts.length).toBeGreaterThan(0)
   })
 
-  test("rolls back member asynchronously if promptAsync fails (fire-and-forget)", async () => {
+  test("fails closed if worktree creation returns no data", async () => {
+    deps.client.worktree.create = async () => ({})
+
+    await expect(executeTeamSpawn(deps, {
+      name: "alice",
+      agent: "build",
+      prompt: "Fix the tests",
+    }, "lead-sess")).rejects.toThrow(/worktree/i)
+
+    expect(deps.client.calls.filter(c => c.method === "session.create")).toHaveLength(0)
+  })
+
+  test("keeps the member and worktree while durable delivery retries", async () => {
     deps.client.session.promptAsync = async () => { throw new Error("promptAsync failed") }
 
     // Spawn returns immediately — does NOT throw
@@ -512,13 +611,11 @@ describe("team_spawn", () => {
     // Give the microtask queue time to process the async .catch() rollback
     await new Promise(resolve => setTimeout(resolve, 10))
 
-    // Member should be cleaned up from DB
     const row = deps.db.query("SELECT name FROM team_member WHERE name = ?").get("alice")
-    expect(row).toBeNull()
+    expect(row).toBeTruthy()
 
-    // Worktree should have been removed during rollback
     const removeCalls = deps.client.calls.filter(c => c.method === "worktree.remove")
-    expect(removeCalls).toHaveLength(1)
+    expect(removeCalls).toHaveLength(0)
   })
 
   test("context message mentions branch when worktree is active", async () => {
@@ -630,7 +727,7 @@ describe("team_spawn", () => {
     expect(row.workspace_id).toBeTruthy()
   })
 
-  test("workspace.create failure is non-fatal — spawn still succeeds", async () => {
+  test("workspace.create failure binds session directly to the worktree directory", async () => {
     deps.client.workspace.create = async () => { throw new Error("workspace failed") }
 
     const result = await executeTeamSpawn(deps, {
@@ -642,10 +739,11 @@ describe("team_spawn", () => {
     expect(result).toContain("alice")
     expect(result).toContain("spawned")
 
-    // session.create should NOT have workspaceID (fallback)
+    // session.create should use directory binding when workspace binding is unavailable
     const createCall = deps.client.calls.find(c => c.method === "session.create")
-    const createArgs = createCall!.args[0] as { workspaceID?: string }
+    const createArgs = createCall!.args[0] as { workspaceID?: string; directory?: string }
     expect(createArgs.workspaceID).toBeUndefined()
+    expect(createArgs.directory).toContain("/tmp/worktree-")
   })
 
   test("skips workspace.create when worktree: false", async () => {
@@ -673,7 +771,7 @@ describe("team_spawn", () => {
     expect(wsRemoveCalls).toHaveLength(1)
   })
 
-  test("rolls back workspace in promptAsync catch handler", async () => {
+  test("retains workspace when scheduler retries prompt delivery", async () => {
     deps.client.session.promptAsync = async () => { throw new Error("delivery failed") }
 
     await executeTeamSpawn(deps, {
@@ -686,7 +784,7 @@ describe("team_spawn", () => {
     await new Promise(resolve => setTimeout(resolve, 10))
 
     const wsRemoveCalls = deps.client.calls.filter(c => c.method === "workspace.remove")
-    expect(wsRemoveCalls).toHaveLength(1)
+    expect(wsRemoveCalls).toHaveLength(0)
   })
 })
 
@@ -773,6 +871,7 @@ describe("team_spawn — agent mode enforcement", () => {
   const TEAM_TOOL_PERMISSIONS = [
     { permission: "team_message", pattern: "*", action: "allow" },
     { permission: "team_broadcast", pattern: "*", action: "allow" },
+    { permission: "team_results", pattern: "*", action: "allow" },
     { permission: "team_tasks_list", pattern: "*", action: "allow" },
     { permission: "team_tasks_add", pattern: "*", action: "allow" },
     { permission: "team_tasks_complete", pattern: "*", action: "allow" },
@@ -794,6 +893,21 @@ describe("team_spawn — agent mode enforcement", () => {
   test("explore agent gets deny rules + team tool allow (no worktree) on session.create", async () => {
     await executeTeamSpawn(deps, { name: "explorer", agent: "explore", prompt: "Explore it" }, "lead-sess")
 
+    const createCall = deps.client.calls.find(c => c.method === "session.create")
+    const opts = createCall!.args[0] as { permission?: Array<{ permission: string; pattern: string; action: string }> }
+    expect(opts.permission).toEqual([
+      { permission: "edit", pattern: "*", action: "deny" },
+      { permission: "bash", pattern: "*", action: "deny" },
+      ...TEAM_TOOL_PERMISSIONS,
+    ])
+  })
+
+  test("configured custom read-only agent gets hard denials and no worktree", async () => {
+    deps.config.readOnlyAgents = ["Shit Tester"]
+
+    await executeTeamSpawn(deps, { name: "reviewer", agent: "Shit Tester", prompt: "Review it" }, "lead-sess")
+
+    expect(deps.client.calls.filter(c => c.method === "worktree.create")).toHaveLength(0)
     const createCall = deps.client.calls.find(c => c.method === "session.create")
     const opts = createCall!.args[0] as { permission?: Array<{ permission: string; pattern: string; action: string }> }
     expect(opts.permission).toEqual([
@@ -876,7 +990,7 @@ describe("team_spawn — AGENTS.md NOT loaded into context", () => {
   })
 })
 
-describe("team_spawn — fire-and-forget promptAsync", () => {
+describe("team_spawn — durable initial delivery", () => {
   let deps: ReturnType<typeof setupDeps>
 
   beforeEach(() => {
@@ -899,10 +1013,11 @@ describe("team_spawn — fire-and-forget promptAsync", () => {
 
     // Member should be registered in DB
     const row = deps.db.query("SELECT status FROM team_member WHERE name = ?").get("alice") as { status: string }
-    expect(row.status).toBe("busy")
+    expect(row.status).toBe("ready")
+    expect(deps.db.query("SELECT state FROM scheduler_run_lease WHERE session_id = (SELECT session_id FROM team_member WHERE name = ?)").get("alice")).toEqual({ state: "active" })
   })
 
-  test("cleans up member if promptAsync rejects asynchronously", async () => {
+  test("requeues the wake if promptAsync rejects asynchronously", async () => {
     let rejectFn: (err: Error) => void
     deps.client.session.promptAsync = () => new Promise((_resolve, reject) => {
       rejectFn = reject
@@ -920,16 +1035,15 @@ describe("team_spawn — fire-and-forget promptAsync", () => {
     const before = deps.db.query("SELECT name FROM team_member WHERE name = ?").get("bob")
     expect(before).toBeTruthy()
 
-    // Now reject the promise — async rollback should clean up
     rejectFn!(new Error("delivery failed"))
-    // Give the microtask queue time to process the .catch()
     await new Promise(resolve => setTimeout(resolve, 10))
 
     const after = deps.db.query("SELECT name FROM team_member WHERE name = ?").get("bob")
-    expect(after).toBeNull()
+    expect(after).toBeTruthy()
+    expect(deps.db.query("SELECT state FROM scheduler_wake WHERE member_name = ?").get("bob")).toEqual({ state: "queued" })
   })
 
-  test("notifies lead via team_message when promptAsync fails", async () => {
+  test("does not report a terminal failure while prompt delivery can retry", async () => {
     deps.client.session.promptAsync = async () => { throw new Error("delivery failed") }
 
     await executeTeamSpawn(deps, {
@@ -941,13 +1055,11 @@ describe("team_spawn — fire-and-forget promptAsync", () => {
     // Give the microtask queue time to process the .catch()
     await new Promise(resolve => setTimeout(resolve, 10))
 
-    // A message to the lead should be in the DB
     const msg = deps.db.query(
       "SELECT * FROM team_message WHERE team_id = ? AND to_name = 'lead' AND from_name = 'system'"
     ).get("t1") as Record<string, unknown> | null
-    expect(msg).toBeTruthy()
-    expect(msg!.content).toContain("charlie")
-    expect(msg!.content).toContain("failed")
+    expect(msg).toBeNull()
+    expect(deps.db.query("SELECT state FROM scheduler_wake WHERE member_name = ?").get("charlie")).toEqual({ state: "queued" })
   })
 })
 
@@ -977,20 +1089,17 @@ describe("team_spawn — timeout on session.create / worktree.create", () => {
     }, "lead-sess")).rejects.toThrow(/timed out/i)
   }, 10000)
 
-  test("falls back to shared directory if worktree.create hangs beyond SPAWN_TIMEOUT_MS", async () => {
+  test("fails closed if worktree.create hangs beyond SPAWN_TIMEOUT_MS", async () => {
     // Mock worktree.create to never resolve
     deps.client.worktree.create = () => new Promise(() => { /* never resolves */ })
 
-    const result = await executeTeamSpawn(deps, {
+    await expect(executeTeamSpawn(deps, {
       name: "bob",
       agent: "build",
       prompt: "Fix tests",
       worktree: true,
-    }, "lead-sess")
+    }, "lead-sess")).rejects.toThrow(/timed out/i)
 
-    // Should succeed with fallback — no worktree branch in output
-    expect(result).toContain("bob")
-    expect(result).toContain("spawned")
-    expect(result).not.toContain("branch:")
+    expect(deps.client.calls.filter(c => c.method === "session.create")).toHaveLength(0)
   }, 10000)
 })

@@ -4,8 +4,22 @@ import type { PluginClient } from "./types"
 import { notifyLead } from "./notify"
 import { releaseMemberTasks } from "./tasks"
 import { findTeamBySession } from "./types"
+import { SUPERVISOR_MEMBER_NAME } from "./supervisor"
+import { invalidateTeamSupervision } from "./supervision-state"
+import { ANNALIST_MEMBER_NAME } from "./annalist"
 
 const TEAM_TOOL_PREFIX = "team_"
+const SUPERVISOR_TEAM_TOOLS = new Set(["team_status", "team_tasks_list", "team_message", "team_broadcast"])
+const ANNALIST_TEAM_TOOLS = new Set(["team_results"])
+
+function requireInternalToolPermission(memberName: string, toolName: string): void {
+  if (memberName === SUPERVISOR_MEMBER_NAME && !SUPERVISOR_TEAM_TOOLS.has(toolName)) {
+    throw new Error(`Supervisor cannot use ${toolName}; it is restricted to read-only coordination.`)
+  }
+  if (memberName === ANNALIST_MEMBER_NAME && !ANNALIST_TEAM_TOOLS.has(toolName)) {
+    throw new Error(`Annalist cannot use ${toolName}; it is restricted to coordination history inspection.`)
+  }
+}
 
 /**
  * Retry-specific payload carried by a `session.status` event when
@@ -41,6 +55,10 @@ export interface StatusTransition {
   to: string
 }
 
+function ordinaryTransition(memberKind: string, transition: StatusTransition): StatusTransition | undefined {
+  return memberKind === "worker" ? transition : undefined
+}
+
 /**
  * Handle a session.status event. Updates member status and execution_status
  * in SQLite based on the new session status.
@@ -65,8 +83,8 @@ export function handleSessionStatusEvent(
   const team = db.query("SELECT status FROM team WHERE id = ?").get(entry.teamId) as { status: string } | null
   if (!team || team.status === "archived") return undefined
 
-  const member = db.query("SELECT status, execution_status FROM team_member WHERE team_id = ? AND name = ?")
-    .get(entry.teamId, entry.memberName) as { status: string; execution_status: string } | null
+  const member = db.query("SELECT status, execution_status, member_kind FROM team_member WHERE team_id = ? AND name = ?")
+    .get(entry.teamId, entry.memberName) as { status: string; execution_status: string; member_kind: string } | null
   if (!member) return undefined
 
   if (status === "idle") {
@@ -94,8 +112,9 @@ export function handleSessionStatusEvent(
         )
       }
     }
-    return { memberName: entry.memberName, teamId: entry.teamId, from: member.status, to: newStatus }
+    return ordinaryTransition(member.member_kind, { memberName: entry.memberName, teamId: entry.teamId, from: member.status, to: newStatus })
   } else if (status === "busy") {
+    if (member.member_kind === "worker") invalidateTeamSupervision(db, entry.teamId)
     if (member.status === "ready" || member.status === "error") {
       // Reset reported_to_lead so re-activated teammates can receive messages again (issue #3).
       // INVARIANT: every promptAsync delivery path must check hasReportedCompletion() to prevent loops.
@@ -103,7 +122,7 @@ export function handleSessionStatusEvent(
         "UPDATE team_member SET status = 'busy', execution_status = 'running', reported_to_lead = 0, time_updated = ? WHERE team_id = ? AND name = ?",
         [Date.now(), entry.teamId, entry.memberName]
       )
-      return { memberName: entry.memberName, teamId: entry.teamId, from: member.status, to: "busy" }
+      return ordinaryTransition(member.member_kind, { memberName: entry.memberName, teamId: entry.teamId, from: member.status, to: "busy" })
     }
     // Freshly-spawned member: inserted as busy/starting before the session's
     // first busy event. Advance execution_status to running and refresh
@@ -115,11 +134,11 @@ export function handleSessionStatusEvent(
         "UPDATE team_member SET execution_status = 'running', time_updated = ? WHERE team_id = ? AND name = ?",
         [Date.now(), entry.teamId, entry.memberName]
       )
-      return { memberName: entry.memberName, teamId: entry.teamId, from: member.status, to: "busy" }
+      return ordinaryTransition(member.member_kind, { memberName: entry.memberName, teamId: entry.teamId, from: member.status, to: "busy" })
     }
     // Session went busy while shutdown was requested — signal for re-abort
     if (member.status === "shutdown_requested") {
-      return { memberName: entry.memberName, teamId: entry.teamId, from: "shutdown_requested", to: "busy_while_shutdown" }
+      return ordinaryTransition(member.member_kind, { memberName: entry.memberName, teamId: entry.teamId, from: "shutdown_requested", to: "busy_while_shutdown" })
     }
   } else if (status === "retry") {
     // Session is being rate-limited — signal for toast but don't change state.
@@ -145,7 +164,7 @@ export function handleSessionStatusEvent(
         ]
       )
     }
-    return { memberName: entry.memberName, teamId: entry.teamId, from: member.status, to: "retry" }
+    return ordinaryTransition(member.member_kind, { memberName: entry.memberName, teamId: entry.teamId, from: member.status, to: "retry" })
   }
   return undefined
 }
@@ -194,6 +213,18 @@ export function checkToolIsolation(
 ): void {
   if (!toolName.startsWith(TEAM_TOOL_PREFIX)) return
 
+  const registered = registry.getBySession(sessionId)
+  if (registered) {
+    requireInternalToolPermission(registered.memberName, toolName)
+    return
+  }
+
+  if (db) {
+    const member = db.query("SELECT member_kind FROM team_member WHERE session_id = ?").get(sessionId) as { member_kind: string } | null
+    if (member?.member_kind === "supervisor") requireInternalToolPermission(SUPERVISOR_MEMBER_NAME, toolName)
+    if (member?.member_kind === "annalist") requireInternalToolPermission(ANNALIST_MEMBER_NAME, toolName)
+  }
+
   // Fast path: registry hit on the caller — skip SQL altogether.
   if (registry.isTeamSession(sessionId)) return
 
@@ -226,7 +257,7 @@ export function shouldNudgeIdleMember(db: Database, teamId: string, memberName: 
     .get(teamId, memberName) as { status: string } | null
   if (!member || member.status !== "ready") return false
 
-  const msg = db.query("SELECT id FROM team_message WHERE team_id = ? AND from_name = ? AND (to_name = 'lead' OR to_name IS NULL) LIMIT 1")
+  const msg = db.query("SELECT id FROM team_message WHERE team_id = ? AND from_name = ? AND group_id IS NULL AND (to_name = 'lead' OR to_name IS NULL) LIMIT 1")
     .get(teamId, memberName) as { id: string } | null
   return !msg
 }
@@ -263,6 +294,7 @@ export function handleSessionErrorEvent(
   // scenario — see findTeamBySession in src/types.ts).
   const teamInfo = findTeamBySession(db, registry, sessionId)
   if (!teamInfo || teamInfo.role !== "member" || !teamInfo.memberName) return
+  if (teamInfo.memberName === SUPERVISOR_MEMBER_NAME || teamInfo.memberName === ANNALIST_MEMBER_NAME) return
 
   const errMsg = error?.data?.message ?? error?.name ?? "unknown error"
   notifyLead(

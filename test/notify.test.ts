@@ -148,6 +148,18 @@ describe("notifyLead", () => {
     expect((wakes[0]!.args[0] as { sessionID: string }).sessionID).toBe("lead-sess")
   })
 
+  test("preserves the lead agent and model when waking it", () => {
+    deps.db.run("UPDATE team SET lead_agent = ?, lead_model = ? WHERE id = ?", ["solutions-architect", "openrouter/anthropic/claude-sonnet", "t1"])
+
+    notifyLead(deps.client, deps.db, "t1", "alice failed")
+
+    const wake = deps.client.calls.find(c => c.method === "session.promptAsync")
+    expect(wake?.args[0]).toMatchObject({
+      agent: "solutions-architect",
+      model: { providerID: "openrouter", modelID: "anthropic/claude-sonnet" },
+    })
+  })
+
   test("wakes the lead even when all teammates are terminal (the error/abort case)", () => {
     insertMember(deps.db, "t1", "alice", "sess-a", "error")
     notifyLead(deps.client, deps.db, "t1", "alice hit an error and aborted")

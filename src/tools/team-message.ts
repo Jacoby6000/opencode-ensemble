@@ -1,9 +1,13 @@
 import type { ToolDeps } from "../types"
 import { resolveRecipientSession } from "../types"
 import { requireTeamMember } from "./shared"
-import { sendMessage, markDelivered, hasReportedCompletion } from "../messaging"
-import { parseModelId, getMemberModel } from "../member-model"
+import { sendMessage, hasReportedCompletion } from "../messaging"
+import { getLeadPromptOptions, parseModelId } from "../member-model"
 import { log } from "../log"
+import { generateId } from "../util"
+import { queueMessageWake } from "../scheduler"
+import { requireCurrentSupervisorReview, SUPERVISOR_MEMBER_NAME } from "../supervisor"
+import { ANNALIST_MEMBER_NAME } from "../annalist"
 
 /**
  * Execute the team_message tool. Sends a direct message to a teammate or lead.
@@ -20,6 +24,11 @@ export async function executeTeamMessage(
   sessionId: string,
 ): Promise<string> {
   const teamInfo = requireTeamMember(deps, sessionId)
+  if (args.to === SUPERVISOR_MEMBER_NAME || args.to === ANNALIST_MEMBER_NAME) throw new Error(`Teammate "${args.to}" not found in team "${teamInfo.teamName}".`)
+  if (teamInfo.memberName === SUPERVISOR_MEMBER_NAME) {
+    if (args.to !== "lead") throw new Error("Supervisor can only message the lead with a lead-only blocker.")
+    requireCurrentSupervisorReview(deps.db, sessionId)
+  }
 
   if (args.force && teamInfo.role !== "lead") {
     throw new Error("Only the lead can force-deliver a message to a completed teammate.")
@@ -107,13 +116,6 @@ export async function executeTeamMessage(
     }
   }
 
-  const msgId = sendMessage(deps.db, {
-    teamId: teamInfo.teamId,
-    from: senderName,
-    to: args.to,
-    content: messageText,
-  })
-
   const isToLead = args.to === "lead"
 
   // Lead-bound messages: store in DB, then wake the lead with a minimal promptAsync.
@@ -121,10 +123,17 @@ export async function executeTeamMessage(
   // This runs in the teammate's worktree instance — the event hook can't wake the lead
   // because session.idle events are scoped per-instance.
   if (isToLead) {
+    sendMessage(deps.db, {
+      teamId: teamInfo.teamId,
+      from: senderName,
+      to: args.to,
+      content: messageText,
+    })
     log(`team_message:wake-lead from=${senderName} recipientSession=${recipientSessionId}`)
     deps.client.session.promptAsync({
       sessionID: recipientSessionId,
       parts: [{ type: "text", text: `[System: New team message from ${senderName}]` }],
+      ...getLeadPromptOptions(deps.db, teamInfo.teamId),
     }).catch((err) => {
       log(`team_message:wake-lead:failed from=${senderName} err=${err instanceof Error ? err.message : String(err)}`)
     })
@@ -137,22 +146,32 @@ export async function executeTeamMessage(
   // same reset that already happens for a normal re-activation — this just gives the lead a way
   // to trigger it deliberately instead of it being unreachable once the guard is set.
   if (hasReportedCompletion(deps.db, teamInfo.teamId, args.to) && !args.force) {
+    sendMessage(deps.db, {
+      teamId: teamInfo.teamId,
+      from: senderName,
+      to: args.to,
+      content: messageText,
+    })
     return `Message stored for ${args.to} (teammate has completed their task — message will not wake them). Pass force:true to re-activate them.`
   }
 
-  // For member-to-member messages, fire-and-forget delivery is safe.
-  // Deliver on the recipient's configured model, if any (#26).
-  const deliveryText = `[Team message from ${senderName}]: ${messageText}`
-  const recipientModel = getMemberModel(deps.db, teamInfo.teamId, args.to)
-  deps.client.session.promptAsync({
-    sessionID: recipientSessionId,
-    parts: [{ type: "text", text: deliveryText }],
-    ...(recipientModel ? { model: recipientModel } : {}),
-  }).then(() => {
-    markDelivered(deps.db, msgId)
-  }).catch((err) => {
-    log(`team_message:deliver:failed to=${args.to} err=${err instanceof Error ? err.message : String(err)}`)
+  const recipient = deps.db.query(
+    "SELECT session_id, agent FROM team_member WHERE team_id = ? AND name = ? AND status IN ('ready', 'busy')",
+  ).get(teamInfo.teamId, args.to) as { session_id: string; agent: string } | null
+  if (!recipient) throw new Error(`Recipient "${args.to}" is not schedulable in team "${teamInfo.teamName}"`)
+  queueMessageWake(deps.db, {
+    messageId: generateId("msg"),
+    teamId: teamInfo.teamId,
+    fromName: senderName,
+    toName: args.to,
+    content: messageText,
+    memberName: args.to,
+    sessionId: recipient.session_id,
+    agent: recipient.agent,
+    reason: "message",
+    coalesceKey: `member:${args.to}`,
   })
+  deps.scheduler.kick()
 
   return `Message sent to ${args.to}.`
 }

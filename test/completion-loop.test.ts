@@ -29,7 +29,9 @@ describe("issue #3: completion loop prevention", () => {
 
     // Simulate busy→ready transition (teammate finished work)
     deps.db.run("UPDATE team_member SET status = 'busy' WHERE team_id = ? AND name = ?", [team.id, memberName])
+    deps.scheduler.onSessionStatus(memberSession, "busy")
     handleSessionStatusEvent(deps.db, deps.registry, memberSession, "idle")
+    deps.scheduler.onSessionStatus(memberSession, "idle")
 
     return { teamId: team.id, memberSession }
   }
@@ -135,7 +137,7 @@ describe("issue #3: completion loop prevention", () => {
     expect(frankCalls).toHaveLength(0)
   })
 
-  test("teammate can still receive messages BEFORE going idle (Q&A works)", async () => {
+  test("messages received during an active run dispatch after the teammate goes idle", async () => {
     await executeTeamCreate(deps, { name: "qa-team" }, leadSession)
     const team = deps.db.query("SELECT id FROM team WHERE name = 'qa-team'").get() as { id: string }
     await executeTeamSpawn(deps, { name: "grace", agent: "build", prompt: "task", worktree: false }, leadSession)
@@ -152,8 +154,13 @@ describe("issue #3: completion loop prevention", () => {
     // Lead answers — this SHOULD be delivered (grace hasn't completed)
     const result = await executeTeamMessage(deps, { to: "grace", text: "use the v2 endpoint" }, leadSession)
 
-    // Message was delivered via promptAsync (not blocked)
+    // The answer is accepted but does not create a concurrent run.
     expect(result).toBe("Message sent to grace.")
+    expect(deps.client.calls.filter(c => c.method === "session.promptAsync")).toHaveLength(0)
+
+    deps.scheduler.onSessionStatus(graceSession, "busy")
+    deps.scheduler.onSessionStatus(graceSession, "idle")
+    await Bun.sleep(0)
     const promptCalls = deps.client.calls.filter(c => c.method === "session.promptAsync")
     expect(promptCalls).toHaveLength(1)
   })
@@ -172,6 +179,7 @@ describe("issue #3: completion loop prevention", () => {
     // With force:true, delivery proceeds despite the completion flag
     const forced = await executeTeamMessage(deps, { to: "henry", text: "round 2 debate prompt", force: true }, leadSession)
     expect(forced).toBe("Message sent to henry.")
+    await Bun.sleep(0)
     const promptCalls = deps.client.calls.filter(c => {
       if (c.method !== "session.promptAsync") return false
       const args = c.args[0] as { sessionID: string }

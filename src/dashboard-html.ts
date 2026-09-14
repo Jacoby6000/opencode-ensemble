@@ -1,3 +1,11 @@
+import { DASHBOARD_CSS } from "./dashboard-css.generated"
+
+/** Dashboard color tokens used by accessibility contract tests. */
+export const DASHBOARD_COLORS = {
+  base: { 950: "0c0e14", 900: "141822" },
+  txt: { 400: "8a96aa", 500: "7b879b" },
+} as const
+
 /** Dashboard HTML head and body structure. JS is appended separately. */
 export const DASHBOARD_HEAD = `<!DOCTYPE html>
 <html lang="en">
@@ -6,11 +14,7 @@ export const DASHBOARD_HEAD = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Ensemble</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%2322c55e'/></svg>">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
-<script src="https://cdn.tailwindcss.com"><\/script>
-<script>tailwind.config={theme:{extend:{colors:{base:{950:'#0c0e14',900:'#141822',850:'#1a1f2e',800:'#1e2433',700:'#2a3144',600:'#3a4358'},txt:{100:'#e2e8f0',200:'#c1c9d9',300:'#aab4c6',400:'#8a96aa',500:'#7b879b'}},fontFamily:{sans:['Inter','system-ui','sans-serif'],mono:['JetBrains Mono','monospace']}}}}<\/script>
+<style>${DASHBOARD_CSS}</style>
 <style>
 @media(prefers-reduced-motion:no-preference){
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
@@ -29,6 +33,7 @@ details summary::-webkit-details-marker{display:none}details summary{list-style:
 select{-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%235e6a82' stroke-width='2.5'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 8px center;padding-right:22px}
 .project-link[aria-current="true"]{color:#e2e8f0}
 .team-link[aria-current="true"]{color:#e2e8f0;border-left-color:#22c55e;background:rgba(34,197,94,.06)}
+.view-link[aria-current="true"]{color:#e2e8f0;background:#1a1f2e}
 #content.nav-collapsed{grid-template-columns:2rem minmax(0,1fr)}
 #projects[hidden]{display:none!important}
 #project-rail[hidden]{display:none!important}
@@ -52,15 +57,21 @@ select{-webkit-appearance:none;appearance:none;background-image:url("data:image/
 <header class="fixed top-0 inset-x-0 h-11 bg-base-950/95 backdrop-blur border-b border-base-800 flex items-center justify-between px-3 sm:px-4 z-50">
 <div class="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
 <span class="font-mono font-semibold text-[13px] tracking-[.08em] text-txt-200">ensemble</span>
-<span id="crumb" class="text-[11px] text-txt-500 font-mono truncate"></span>
+<nav aria-label="Dashboard views" class="flex items-center gap-1 ml-1">
+<button type="button" data-view="overview" onclick="selectView(this.dataset.view)" class="view-link rounded px-2 py-1 text-[11px] text-txt-400 hover:text-txt-100" aria-current="true">Overview</button>
+<button type="button" data-view="conversations" onclick="selectView(this.dataset.view)" class="view-link rounded px-2 py-1 text-[11px] text-txt-400 hover:text-txt-100" aria-current="false">Conversations</button>
+</nav>
+<span id="crumb" class="hidden md:inline text-[11px] text-txt-500 font-mono truncate"></span>
 </div>
 <div class="flex items-center gap-2 sm:gap-4 shrink-0">
+<button id="archived-toggle" type="button" hidden onclick="toggleArchived()" aria-pressed="false" aria-controls="team-switcher projects" class="rounded border border-base-700 px-2 py-1 text-[10px] text-txt-400 hover:text-txt-100">Show archived</button>
+<select id="team-switcher" aria-label="Switch team" onchange="selectTeam(this.value)" class="max-w-32 sm:max-w-52 rounded border border-base-700 bg-base-900 py-1 pl-2 text-[11px] font-mono text-txt-200"></select>
 <div id="hring" class="w-6 h-6 rounded-full" title="Team health"></div>
 <div class="flex items-center gap-2">
 <span id="clk" class="text-[11px] text-txt-400 font-mono"></span>
 <span class="text-base-700">·</span>
 <span id="cd" class="w-[7px] h-[7px] rounded-full bg-emerald-500 pulse"></span>
-<span id="ct" class="text-[11px] text-txt-400 font-mono">...</span>
+<span id="ct" class="hidden sm:inline text-[11px] text-txt-400 font-mono">...</span>
 </div>
 </div>
 </header>
@@ -75,6 +86,7 @@ select{-webkit-appearance:none;appearance:none;background-image:url("data:image/
 <div id="project-rail" hidden class="lg:sticky lg:top-[88px]"><button id="nav-expand" type="button" aria-label="Show project navigation" aria-controls="projects" aria-expanded="false" class="h-8 w-8 rounded border border-base-800 text-txt-500 hover:text-txt-200 hover:border-base-700 transition-colors">&gt;</button></div>
 <aside id="projects" aria-label="Project navigation" class="bg-base-950/60 border-r border-base-800/70 pr-3 lg:sticky lg:top-[88px]"></aside>
 <div class="min-w-0">
+<div id="overview-view">
 <section id="attention" aria-label="Team attention" class="mb-3"></section>
 <div class="grid grid-cols-1 xl:grid-cols-[minmax(360px,1.35fr)_minmax(320px,.8fr)] gap-4 items-start">
 <section aria-label="Agent roster"><div id="agents" class="grid gap-2" style="grid-template-columns:repeat(auto-fill,minmax(300px,1fr))"></div></section>
@@ -83,6 +95,21 @@ select{-webkit-appearance:none;appearance:none;background-image:url("data:image/
 <section aria-label="Activity feed"><div id="activity" class="bg-base-900 rounded-lg p-3 border border-base-800/50"></div></section>
 </div>
 </div>
+</div>
+<section id="conversation-view" aria-label="Team conversations" class="hidden min-h-[70vh]">
+<div class="grid grid-cols-1 md:grid-cols-[220px_minmax(0,1fr)] gap-4 items-start">
+<aside id="conversation-channels" aria-label="Conversation channels" class="bg-base-900 rounded-lg border border-base-800/50 p-3 md:sticky md:top-[88px]"></aside>
+<div class="bg-base-900 rounded-lg border border-base-800/50 min-w-0 overflow-hidden">
+<div id="conversation-heading" class="border-b border-base-800/70 px-4 py-3"></div>
+<div id="conversation-history" aria-live="polite" class="scroll h-[55vh] min-h-[360px] overflow-y-auto px-4 py-3"></div>
+<form id="conversation-compose" class="border-t border-base-800/70 p-3" onsubmit="sendConversationMessage(event)">
+<label for="conversation-text" class="sr-only">Message</label>
+<textarea id="conversation-text" rows="3" maxlength="10240" class="w-full resize-y rounded border border-base-700 bg-base-950 px-3 py-2 text-[13px] text-txt-100 placeholder:text-txt-500" placeholder="Write a message"></textarea>
+<div class="mt-2 flex items-center justify-between gap-3"><span id="conversation-status" role="status" class="text-[11px] text-txt-400"></span><button id="conversation-send" type="submit" class="rounded bg-emerald-600 px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50">Send message</button></div>
+</form>
+</div>
+</div>
+</section>
 </div>
 </div>
 </main>

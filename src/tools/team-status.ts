@@ -18,7 +18,7 @@ const RATE_LIMIT_MS = 30_000
 function computeStateMarker(deps: ToolDeps, teamId: string): number {
   const row = deps.db.query(
     `SELECT MAX(x) as marker FROM (
-       SELECT MAX(time_updated) as x FROM team_member WHERE team_id = ?
+       SELECT MAX(time_updated) as x FROM team_member WHERE team_id = ? AND member_kind = 'worker'
        UNION SELECT MAX(time_updated) FROM team_task WHERE team_id = ?
        UNION SELECT MAX(time_created) FROM team_message WHERE team_id = ?
      )`
@@ -54,7 +54,7 @@ export async function executeTeamStatus(
   lastKnownState.set(teamInfo.teamId, currentMarker)
 
   const members = deps.db.query(
-    "SELECT name, session_id, agent, status, execution_status, worktree_branch, worktree_dir, plan_approval, time_updated, last_nudged_at, retry_until, retry_attempt FROM team_member WHERE team_id = ? ORDER BY time_created ASC"
+    "SELECT name, session_id, agent, status, execution_status, worktree_branch, worktree_dir, plan_approval, time_updated, last_nudged_at, retry_until, retry_attempt FROM team_member WHERE team_id = ? AND member_kind = 'worker' ORDER BY time_created ASC"
   ).all(teamInfo.teamId) as Array<{
     name: string; session_id: string; agent: string; status: string; execution_status: string; worktree_branch: string | null; worktree_dir: string | null; plan_approval: string; time_updated: number; last_nudged_at: number | null
     retry_until: number | null; retry_attempt: number | null
@@ -84,8 +84,9 @@ export async function executeTeamStatus(
       // Additive provider-retry annotation (Fix 4) — derived at read time from the
       // retry_until TTL (Fix 3), same annotation pattern as `nudged` above. Generic
       // "retrying" label, no rate-limit-specific wording (Fix 2).
-      const isRetrying = m.retry_until !== null && m.retry_until > now
-      const retrying = isRetrying ? `, retrying (attempt ${m.retry_attempt}, ~${formatDuration(m.retry_until! - now)})` : ""
+      const retryUntil = m.retry_until
+      const isRetrying = retryUntil !== null && retryUntil > now
+      const retrying = isRetrying ? `, retrying (attempt ${m.retry_attempt}, ~${formatDuration(retryUntil - now)})` : ""
 
       // Last message time
       const lastMsg = deps.db.query("SELECT MAX(time_created) as last_msg FROM team_message WHERE team_id = ? AND from_name = ?")

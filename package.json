@@ -27,10 +27,11 @@
     "social-preview.png"
   ],
   "scripts": {
+    "dashboard:css": "bun run generate-dashboard-css.ts",
     "lint": "bunx biome lint src/",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "build": "bun build src/index.ts --outdir dist --target node",
+    "build": "bun run dashboard:css && bun build src/index.ts --outdir dist --target node",
     "prepublishOnly": "bun run typecheck && bun test && bun run build"
   },
   "engines": {
@@ -39,7 +40,8 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.9",
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "tailwindcss": "3.4.17"
   },
   "peerDependencies": {
     "typescript": "^5"

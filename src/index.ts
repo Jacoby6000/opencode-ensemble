@@ -1,6 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { OpencodeClient } from "@opencode-ai/sdk/v2"
+import type { PermissionConfig } from "@opencode-ai/sdk/v2"
 import path from "node:path"
 import { mkdirSync } from "node:fs"
 import { createDb, getDbPath } from "./db"
@@ -11,7 +12,7 @@ import { isWorktreeInstance } from "./util"
 import { handleSessionStatusEvent, handleSessionCreatedEvent, checkToolIsolation, shouldNudgeIdleMember, handleSessionErrorEvent } from "./hooks"
 import { notifyTeamEvent, notifyWorkingProgress, notifyLead } from "./notify"
 import { hasReportedCompletion } from "./messaging"
-import { getMemberModel } from "./member-model"
+import { sendIdleWithoutReportNudge, sendPeerMessageFlush } from "./idle-continuations"
 import { buildLeadSystemPrompt, buildTeammateSystemPrompt, buildTeamCompactionContext } from "./system-prompt"
 import { log, initLog } from "./log"
 import { findTeamBySession } from "./types"
@@ -19,6 +20,7 @@ import { loadConfig } from "./config"
 import { ProgressTracker } from "./progress"
 import { ActivityBuffer, recordFromV2Event, recordFromToolBefore, recordFromToolAfter } from "./activity"
 import { startDashboard } from "./dashboard"
+import { getDashboardTokenPath, loadOrCreateDashboardToken } from "./dashboard-auth"
 import { executeTeamCreate } from "./tools/team-create"
 import { executeTeamSpawn } from "./tools/team-spawn"
 import { executeTeamMessage } from "./tools/team-message"
@@ -36,10 +38,45 @@ import { executeTeamView } from "./tools/team-view"
 import type { ToolDeps, } from "./types"
 import { TokenBucket } from "./rate-limit"
 import { Watchdog } from "./watchdog"
+import { DurableScheduler } from "./scheduler-runtime"
+import { getLeadPromptOptions } from "./member-model"
+import type { MemberPromptOptions } from "./member-model"
+import { provisionSupervisorForTeam, reconcileSupervisors, recordWorkerQuiescenceEvent, SUPERVISOR_AGENT, SUPERVISOR_MEMBER_NAME } from "./supervisor"
+import { ANNALIST_AGENT, ANNALIST_MEMBER_NAME, provisionAnnalistForTeam, reconcileAnnalists } from "./annalist"
 
 const DEFAULT_RATE_LIMIT_REFILL = 2
 const DEFAULT_RATE_LIMIT_INTERVAL_MS = 1000
 const DEFAULT_WATCHDOG_CHECK_MS = 60 * 1000 // 60 seconds
+const SUPERVISOR_AGENT_PERMISSION = {
+  read: "deny",
+  edit: "deny",
+  glob: "deny",
+  grep: "deny",
+  list: "deny",
+  bash: "deny",
+  task: "deny",
+  question: "deny",
+  webfetch: "deny",
+  websearch: "deny",
+  skill: "deny",
+  lsp: "deny",
+  external_directory: "deny",
+  todowrite: "deny",
+  team_create: "deny",
+  team_spawn: "deny",
+  team_tasks_add: "deny",
+  team_tasks_complete: "deny",
+  team_claim: "deny",
+  team_shutdown: "deny",
+  team_merge: "deny",
+  team_cleanup: "deny",
+  team_view: "deny",
+  team_results: "deny",
+  team_status: "allow",
+  team_tasks_list: "allow",
+  team_message: "allow",
+  team_broadcast: "allow",
+} as const satisfies PermissionConfig
 
 /**
  * opencode-ensemble plugin entry point.
@@ -63,6 +100,7 @@ const plugin: Plugin = async (input) => {
   const progressTracker = new ProgressTracker()
   const activityBuffer = new ActivityBuffer()
   const wakeLeadTimestamps = new Map<string, number>()
+  const sessionPromptOptions = new Map<string, MemberPromptOptions>()
   const WAKE_LEAD_COOLDOWN_MS = 5000
 
   // Extract the working HeyAPI transport from the plugin-provided v1 client and pass it
@@ -73,12 +111,24 @@ const plugin: Plugin = async (input) => {
   const rawClient = new OpencodeClient({ client: pluginTransport })
   initLog(rawClient)
   const client = wrapThrowingClient(rawClient)
-  const deps: ToolDeps = { db, registry, tracker, purgeApprovals, client, directory: input.directory, config, progressTracker }
+  const mainInstance = !isWorktreeInstance(input.directory)
+  let internalRecoveryEnabled = false
+  const scheduler = new DurableScheduler(db, client, config.scheduler, mainInstance, input.directory, async () => {
+    if (!internalRecoveryEnabled) return
+    await reconcileSupervisors(db, client, registry, input.directory, config.scheduler)
+    await reconcileAnnalists(db, client, registry, input.directory, config.scheduler)
+  })
+  const deps: ToolDeps = { db, registry, tracker, purgeApprovals, client, directory: input.directory, config, progressTracker, scheduler }
+
+  // Every plugin instance needs local session identity for status/tool hooks.
+  // Only network recovery and dispatch remain restricted to the main instance.
+  const rehydrated = rehydrateRegistry(db, registry)
+  if (rehydrated > 0) log(`init:registry:rehydrated members=${rehydrated}`)
 
   // Recovery only runs for the main project instance — NOT for teammate worktree instances.
   // Worktree instances are created during session.create. Running recovery there makes HTTP
   // calls back to the server, which deadlocks because the server is still handling session.create.
-  if (!isWorktreeInstance(input.directory)) {
+  if (mainInstance) {
     log("init:recovery:start (main instance)")
 
     // Reconciles teams whose lead session was deleted externally (not via
@@ -100,24 +150,27 @@ const plugin: Plugin = async (input) => {
       if (result.archived > 0) log(`init:recovery:orphaned-teams-archived=${result.archived}`)
     }).catch((err) => {
       log(`init:recover-orphaned-teams:failed err=${err instanceof Error ? err.message : String(err)}`)
+    }).then(() => {
+      internalRecoveryEnabled = true
+      return Promise.all([
+        reconcileSupervisors(db, client, registry, input.directory, config.scheduler),
+        reconcileAnnalists(db, client, registry, input.directory, config.scheduler),
+      ])
+    }).then(([supervisors, annalists]) => {
+      if (supervisors > 0) log(`init:supervisors:provisioned=${supervisors}`)
+      if (annalists > 0) log(`init:annalists:provisioned=${annalists}`)
+      scheduler.kick()
+    }).catch(err => {
+      log(`init:internal-agents:failed err=${err instanceof Error ? err.message : String(err)}`)
     })
 
-    const recovery = await recoverStaleMembers(db, client, input.directory)
-    if (recovery.interrupted > 0) {
-      log(`init:recovery:interrupted=${recovery.interrupted}`)
-    }
-
-    // Always rehydrate the in-memory registry from SQLite. The registry is
-    // in-memory only and is wiped on every plugin restart. Without this,
-    // teammates from a previous lifetime become invisible — every team_*
-    // tool call from them throws "This session is not in a team." This is
-    // the bug that surfaced on Desktop, where the Electron sidecar restarts
-    // far more often than the CLI.
-    const rehydrated = rehydrateRegistry(db, registry)
-    if (rehydrated > 0) log(`init:registry:rehydrated members=${rehydrated}`)
-
-    recoverUndeliveredMessages(db, client, registry).catch((err) => {
-      log(`init:recover-messages:failed err=${err instanceof Error ? err.message : String(err)}`)
+    scheduler.recover().then(() => recoverStaleMembers(db, client, input.directory)).then((recovery) => {
+      if (recovery.interrupted > 0) log(`init:recovery:interrupted=${recovery.interrupted}`)
+      return recoverUndeliveredMessages(db, client, registry, scheduler)
+    }).then(() => {
+      scheduler.kick()
+    }).catch((err) => {
+      log(`init:scheduler-recovery:failed err=${err instanceof Error ? err.message : String(err)}`)
     })
     recoverOrphanedWorktrees(db, client).catch((err) => {
       log(`init:recover-worktrees:failed err=${err instanceof Error ? err.message : String(err)}`)
@@ -126,12 +179,20 @@ const plugin: Plugin = async (input) => {
       log(`init:recover-branches:failed err=${err instanceof Error ? err.message : String(err)}`)
     })
     log("init:recovery:done")
+    scheduler.start()
 
     // Start dashboard server (main instance only, not worktree instances)
-    if (config.dashboardPort !== 0) {
-      startDashboard(db, config.dashboardPort, { activityBuffer, client }).catch((err) => {
+    if (config.dashboard.port !== 0) {
+      try {
+        const dashboardTokenPath = getDashboardTokenPath()
+        const dashboardToken = loadOrCreateDashboardToken(dashboardTokenPath)
+        log(`init:dashboard:token-file path=${dashboardTokenPath}`)
+        startDashboard(db, config.dashboard.port, { activityBuffer, client, scheduler, token: dashboardToken }).catch((err) => {
+          log(`init:dashboard:failed err=${err instanceof Error ? err.message : String(err)}`)
+        })
+      } catch (err) {
         log(`init:dashboard:failed err=${err instanceof Error ? err.message : String(err)}`)
-      })
+      }
     }
   } else {
     log(`init:skip-recovery (worktree instance: ${input.directory})`)
@@ -156,24 +217,61 @@ const plugin: Plugin = async (input) => {
     cwd: input.directory,
     peerMessageLimit: config.peerMessageLimit,
     peerMessageWindowMs: config.peerMessageWindowMs,
+    scheduler,
   })
   watchdog.start()
 
   return {
+    async config(config) {
+      config.agent ??= {}
+      config.agent[SUPERVISOR_AGENT] = {
+        mode: "subagent",
+        hidden: true,
+        description: "Internal read-only Ensemble team supervisor",
+        prompt: "Review immutable team snapshots only. Never mutate tasks or use lifecycle tools. Broadcast at most once when specific ownership assignments are needed; otherwise remain silent.",
+        permission: SUPERVISOR_AGENT_PERMISSION,
+      }
+      config.agent[ANNALIST_AGENT] ??= {
+        mode: "subagent",
+        hidden: true,
+        description: "Internal Ensemble task decision historian",
+        prompt: "Preserve dated, Git-pinned decision history for each completed task. Inspect relevant team mailbox and group history before writing repository annals. Never mutate team coordination state.",
+      }
+    },
+
     // Event hook — drives state machine transitions + descendant tracking + toasts
     async event({ event }) {
+      if (event.type === "message.updated") {
+        const info = event.properties.info
+        if (info.role === "user") {
+          const options = { agent: info.agent, model: info.model }
+          sessionPromptOptions.set(info.sessionID, options)
+          db.run(
+            "UPDATE team SET lead_agent = ?, lead_model = ?, time_updated = ? WHERE lead_session_id = ? AND status = 'active'",
+            [options.agent, `${options.model.providerID}/${options.model.modelID}`, Date.now(), info.sessionID],
+          )
+        }
+      }
+
       if (event.type === "session.status") {
         const { sessionID, status } = event.properties
+        const statusTime = Date.now()
         const statusType = status.type as "idle" | "busy" | "retry"
         const retryPayload = statusType === "retry"
           ? (status as { attempt: number; message: string; action?: { reason: string; provider: string; title: string; message: string; label: string; link?: string }; next: number })
           : undefined
         const transition = handleSessionStatusEvent(db, registry, sessionID, statusType, retryPayload)
+        scheduler.onSessionStatus(sessionID, statusType, retryPayload?.next)
+        if (statusType === "idle" && transition) {
+          recordWorkerQuiescenceEvent(db, transition.teamId, transition.memberName, statusTime)
+        }
+        if (transition) scheduler.kick()
 
         // Fire toast notifications for meaningful transitions
-        if (transition) {
-          if (transition.to === "shutdown") {
-            notifyTeamEvent(client, "shutdown", { memberName: transition.memberName })
+          if (transition) {
+            if (transition.to === "shutdown") {
+              scheduler.terminateMember(transition.teamId, transition.memberName, "graceful shutdown completed")
+              notifyTeamEvent(client, "shutdown", { memberName: transition.memberName })
           } else if (transition.to === "ready" && transition.from === "busy") {
             notifyTeamEvent(client, "completed", { memberName: transition.memberName })
 
@@ -215,14 +313,7 @@ const plugin: Plugin = async (input) => {
             if (!nudgedMembers.has(nudgeKey) && shouldNudgeIdleMember(db, transition.teamId, transition.memberName) && !hasReportedCompletion(db, transition.teamId, transition.memberName)) {
               nudgedMembers.add(nudgeKey)
               log(`nudge:idle-without-report name=${transition.memberName}`)
-              const nudgeModel = getMemberModel(db, transition.teamId, transition.memberName)
-              client.session.promptAsync({
-                sessionID,
-                parts: [{ type: "text", text: "[System]: You completed your work but did not report results. Send your findings to the lead via team_message now." }],
-                ...(nudgeModel ? { model: nudgeModel } : {}),
-              }).catch((err) => {
-                log(`nudge:idle-without-report:failed name=${transition.memberName} team=${transition.teamId} err=${err instanceof Error ? err.message : String(err)}`)
-              })
+              sendIdleWithoutReportNudge(scheduler, db, transition.teamId, transition.memberName, sessionID)
             }
           } else if (transition.to === "error") {
             notifyTeamEvent(client, "error", { memberName: transition.memberName })
@@ -261,6 +352,7 @@ const plugin: Plugin = async (input) => {
               }
             }
             try {
+              scheduler.terminateMember(member?.team_id ?? transition.teamId, member?.name ?? transition.memberName, "shutdown re-abort")
               await client.session.abort({ sessionID })
             } catch { /* best effort */ }
           }
@@ -277,7 +369,7 @@ const plugin: Plugin = async (input) => {
             const pending = db.query("SELECT COUNT(*) as c FROM team_message WHERE team_id = ? AND to_name = 'lead' AND delivered = 0").get(team.id) as { c: number }
             // Skip wake if all teammates are done or if we woke recently (issue #3 — breaks completion loop)
             const allDone = (db.query(
-              "SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND status NOT IN ('ready', 'shutdown', 'error')"
+              "SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND member_kind = 'worker' AND status NOT IN ('ready', 'shutdown', 'error')"
             ).get(team.id) as { c: number }).c === 0
             const lastWake = wakeLeadTimestamps.get(team.id) ?? 0
             if (pending.c > 0 && !allDone && Date.now() - lastWake > WAKE_LEAD_COOLDOWN_MS) {
@@ -286,6 +378,7 @@ const plugin: Plugin = async (input) => {
               client.session.promptAsync({
                 sessionID,
                 parts: [{ type: "text", text: `[System: ${pending.c} new team message(s) available]` }],
+                ...getLeadPromptOptions(db, team.id),
               }).catch((err) => {
                 log(`wake-lead:failed err=${err instanceof Error ? err.message : String(err)}`)
               })
@@ -297,23 +390,17 @@ const plugin: Plugin = async (input) => {
           const member = db.query(
             `SELECT tm.team_id, tm.name FROM team_member tm
              JOIN team t ON tm.team_id = t.id
-             WHERE tm.session_id = ? AND t.status = 'active'`
+             WHERE tm.session_id = ? AND tm.member_kind = 'worker' AND t.status = 'active'`
           ).get(sessionID) as { team_id: string; name: string } | null
           if (member && !hasReportedCompletion(db, member.team_id, member.name)) {
             const staleThreshold = Date.now() - 5000
             const peerMsgs = db.query(
-              "SELECT COUNT(*) as c FROM team_message WHERE team_id = ? AND to_name = ? AND delivered = 0 AND time_created < ?"
+              `SELECT COUNT(*) as c FROM team_message m WHERE team_id = ? AND to_name = ? AND delivered = 0 AND time_created < ?
+                 AND NOT EXISTS (SELECT 1 FROM scheduler_message_wake mw WHERE mw.message_id = m.id)`
             ).get(member.team_id, member.name, staleThreshold) as { c: number }
             if (peerMsgs.c > 0) {
               log(`wake-peer: ${member.name} has ${peerMsgs.c} pending peer messages`)
-              const peerModel = getMemberModel(db, member.team_id, member.name)
-              client.session.promptAsync({
-                sessionID,
-                parts: [{ type: "text", text: `[System: ${peerMsgs.c} new message(s) from teammates]` }],
-                ...(peerModel ? { model: peerModel } : {}),
-              }).catch((err) => {
-                log(`wake-peer:failed err=${err instanceof Error ? err.message : String(err)}`)
-              })
+              sendPeerMessageFlush(client, db, member.team_id, member.name, sessionID, peerMsgs.c)
             }
           }
         }
@@ -341,6 +428,7 @@ const plugin: Plugin = async (input) => {
         if (part?.type === "step-finish" && part.sessionID && part.tokens?.output !== undefined) {
           if (registry.getBySession(part.sessionID)) {
             progressTracker.recordStep(part.sessionID, part.tokens.output)
+            scheduler.onSessionStatus(part.sessionID, "busy")
           }
         }
       }
@@ -384,7 +472,11 @@ const plugin: Plugin = async (input) => {
       log(`system-prompt:transform role=${teamInfo.role} session=${input.sessionID}`)
       const prompt = teamInfo.role === "lead"
         ? buildLeadSystemPrompt(db, teamInfo.teamId, config)
-        : buildTeammateSystemPrompt(db, teamInfo.teamId, teamInfo.memberName ?? "unknown")
+        : teamInfo.memberName === SUPERVISOR_MEMBER_NAME
+          ? "You are the hidden read-only Supervisor. Follow only the current generation-fenced review prompt; do not mutate tasks or use lifecycle tools."
+          : teamInfo.memberName === ANNALIST_MEMBER_NAME
+            ? "You are the hidden Annalist. For each task-completion prompt, inspect relevant direct and group mailbox history with team_results, then preserve durable repository decision history. Do not mutate team state."
+          : buildTeammateSystemPrompt(db, teamInfo.teamId, teamInfo.memberName ?? "unknown")
       log(`system-prompt:injected role=${teamInfo.role} len=${prompt.length}`)
       output.system.push(prompt)
     },
@@ -393,7 +485,11 @@ const plugin: Plugin = async (input) => {
     "experimental.session.compacting": async (input, output) => {
       const teamInfo = findTeamBySession(db, registry, input.sessionID)
       if (!teamInfo) return
-      const context = buildTeamCompactionContext(db, teamInfo.teamId, teamInfo.role, teamInfo.memberName)
+      const context = teamInfo.memberName === SUPERVISOR_MEMBER_NAME
+        ? "[Supervisor Context] Remain read-only. Follow only the current generation-fenced review and broadcast at most once."
+        : teamInfo.memberName === ANNALIST_MEMBER_NAME
+          ? "[Annalist Context] Inspect relevant mailbox history with team_results and preserve the current completed task's durable decision record in repository annals. Never mutate team state."
+          : buildTeamCompactionContext(db, teamInfo.teamId, teamInfo.role, teamInfo.memberName)
       output.context.push(context)
     },
 
@@ -426,7 +522,31 @@ const plugin: Plugin = async (input) => {
           project_name: tool.schema.string().optional().describe("Project display name for first use of this working directory. If omitted, a short random name is generated."),
         },
         async execute(args, ctx) {
-          const result = await executeTeamCreate(deps, args, ctx.sessionID)
+          const result = await executeTeamCreate(deps, args, ctx.sessionID, {
+            agent: sessionPromptOptions.get(ctx.sessionID)?.agent ?? ctx.agent,
+            model: sessionPromptOptions.get(ctx.sessionID)?.model,
+          }, async teamId => {
+            const provisioned = await provisionSupervisorForTeam(db, client, registry, teamId, config.scheduler)
+            if (provisioned.status === "capacity_denied") {
+              throw new Error(`identity capacity denied (${provisioned.reason})`)
+            }
+            try {
+              const annalist = await provisionAnnalistForTeam(db, client, registry, teamId, config.scheduler)
+              if (annalist.status === "capacity_denied") {
+                throw new Error(`Annalist identity capacity denied (${annalist.reason})`)
+              }
+            } catch (error) {
+              const supervisor = db.query(
+                "SELECT name, session_id FROM team_member WHERE team_id = ? AND member_kind = 'supervisor' AND status NOT IN ('shutdown', 'error')",
+              ).get(teamId) as { name: string; session_id: string } | undefined
+              if (supervisor) {
+                scheduler.terminateMember(teamId, supervisor.name, "team provisioning rollback")
+                await client.session.abort({ sessionID: supervisor.session_id }).catch(() => {})
+              }
+              throw error
+            }
+          })
+          scheduler.kick()
           ctx.metadata({ title: `Created team: ${args.name}` })
           return result
         },
@@ -476,9 +596,11 @@ const plugin: Plugin = async (input) => {
       }),
 
       team_broadcast: tool({
-        description: "Send a message to all teammates and the lead (excluding yourself).",
+        description: "Send a whole-team broadcast, create a named group with its first message, or send to an existing group. Group membership is immutable and only participants may send.",
         args: {
           text: tool.schema.string().describe("Message content (max 10KB)"),
+          group: tool.schema.string().optional().describe("Group inbox name. With members, atomically creates the group; without members, sends to an existing group."),
+          members: tool.schema.array(tool.schema.string()).optional().describe("Immutable participants for a new group; creator must be included."),
         },
         async execute(args, ctx) {
           const result = await executeTeamBroadcast(deps, args, ctx.sessionID)
@@ -548,9 +670,13 @@ const plugin: Plugin = async (input) => {
       }),
 
       team_results: tool({
-        description: "Retrieve full message content from teammates. Returns unread messages and marks them as read. Use this after receiving a truncated message notification.",
+        description: "Retrieve unread ordinary messages, list all group inboxes, or inspect history without changing group delivery/read state. The hidden Annalist may inspect any direct mailbox.",
         args: {
           from: tool.schema.string().optional().describe("Filter messages by sender name (optional, returns all if omitted)"),
+          list_groups: tool.schema.boolean().optional().describe("List every group inbox in the team"),
+          group: tool.schema.string().optional().describe("Inspect newest-first history for one group as a participant or observer"),
+          mailbox: tool.schema.string().optional().describe("Annalist only: inspect newest-first direct history involving this mailbox, or 'broadcast'"),
+          limit: tool.schema.number().int().min(1).max(50).optional().describe("Group or mailbox history limit (default 20, maximum 50)"),
         },
         async execute(args, ctx) {
           const result = await executeTeamResults(deps, args, ctx.sessionID)
@@ -610,7 +736,7 @@ const plugin: Plugin = async (input) => {
           // Collect member session IDs before cleanup so we can clean up activity buffers after
           const teamInfoForCleanup = findTeamBySession(db, registry, ctx.sessionID)
           const memberSessions = teamInfoForCleanup
-            ? (db.query("SELECT session_id FROM team_member WHERE team_id = ?").all(teamInfoForCleanup.teamId) as Array<{ session_id: string }>).map(m => m.session_id)
+            ? (db.query("SELECT session_id FROM team_member WHERE team_id = ? AND member_kind = 'worker'").all(teamInfoForCleanup.teamId) as Array<{ session_id: string }>).map(m => m.session_id)
             : []
           const result = await executeTeamCleanup(deps, args, ctx.sessionID, undefined, undefined, undefined, config.mergeOnCleanup, undefined, approvePurge)
           // Clean up activity buffers for team members after successful cleanup
@@ -648,7 +774,7 @@ const plugin: Plugin = async (input) => {
         async execute(_args, ctx) {
           const result = await executeTeamStatus(deps, ctx.sessionID)
           const statusMap: Record<string, string> = { busy: "working", ready: "idle", shutdown_requested: "stopping", shutdown: "done", error: "error" }
-          const members = deps.db.query("SELECT name, status FROM team_member WHERE team_id IN (SELECT id FROM team WHERE lead_session_id = ? OR id IN (SELECT team_id FROM team_member WHERE session_id = ?))").all(ctx.sessionID, ctx.sessionID) as Array<{ name: string; status: string }>
+          const members = deps.db.query("SELECT name, status FROM team_member WHERE member_kind = 'worker' AND team_id IN (SELECT id FROM team WHERE lead_session_id = ? OR id IN (SELECT team_id FROM team_member WHERE session_id = ?))").all(ctx.sessionID, ctx.sessionID) as Array<{ name: string; status: string }>
           const summary = members.map(m => `${m.name}: ${statusMap[m.status] ?? m.status}`).join(", ")
           ctx.metadata({ title: summary || "No teammates" })
           return result

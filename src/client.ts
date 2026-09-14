@@ -6,6 +6,13 @@ function extractError(err: unknown): string {
   return String(err)
 }
 
+function extractStatus(value: unknown): number | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const candidate = value as { status?: unknown; response?: { status?: unknown } }
+  if (typeof candidate.status === "number") return candidate.status
+  return typeof candidate.response?.status === "number" ? candidate.response.status : undefined
+}
+
 /** Generic async SDK method type. Actual type safety enforced by PluginClient interface. */
 type SdkMethod = (...args: unknown[]) => Promise<unknown>
 
@@ -14,7 +21,9 @@ function throwing(fn: SdkMethod): SdkMethod {
   return async (...args: unknown[]) => {
     const result = await fn(...args)
     if (result && typeof result === "object" && "error" in result && result.error !== undefined) {
-      throw new Error(extractError(result.error))
+      const error = new Error(extractError(result.error)) as Error & { status?: number }
+      error.status = extractStatus(result) ?? extractStatus(result.error)
+      throw error
     }
     return result
   }

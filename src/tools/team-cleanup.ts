@@ -3,7 +3,7 @@ import { requireLead, requireCanPurgeArchivedTeams, checkWorktreeDirty } from ".
 import type { IsDirtyFn } from "./shared"
 import { spawnFailures } from "./team-spawn"
 import { getTeamResourceParts, mergeBranch, deleteBranch, preserveBranch, preservedBranchName, getOverlappingFiles, teamResourceSegment } from "./merge-helper"
-import type { MergeBranchFn, DeleteBranchFn, PreserveBranchFn, OverlapCheckFn } from "./merge-helper"
+import type { MergeBranchFn, DeleteBranchFn, OverlapCheckFn } from "./merge-helper"
 import { log } from "../log"
 import { runCommand } from "../process"
 
@@ -94,7 +94,7 @@ function resolvePurgeTargets(deps: ToolDeps, purge: string[]): PurgeTarget[] {
   if (active.length > 0) throw new Error(`Cannot purge active team: ${active.join(", ")}`)
 
   return rows
-    .map(row => row.teams[0]!)
+    .flatMap(row => row.teams.slice(0, 1))
     .sort((a, b) => b.time_updated - a.time_updated || a.name.localeCompare(b.name))
 }
 
@@ -156,7 +156,7 @@ function isPreservedBranch(resource: PurgeMemberResource): boolean {
   )
 }
 
-function isStaleEnsembleBranch(resource: PurgeMemberResource): boolean {
+function isStaleEnsembleBranch(resource: PurgeMemberResource): resource is PurgeMemberResource & { worktree_branch: string } {
   return resource.worktree_branch !== null && staleEnsembleBranchNames(resource).includes(resource.worktree_branch)
 }
 
@@ -201,7 +201,7 @@ function collectStaleEnsembleBranches(deps: ToolDeps, targets: PurgeTarget[]): s
   return [...new Set(
     getPurgeMemberResources(deps, targets)
       .filter(isStaleEnsembleBranch)
-      .map(resource => resource.worktree_branch!)
+      .map(resource => resource.worktree_branch)
   )]
 }
 
@@ -347,7 +347,7 @@ function formatCount(count: number, noun: string, plural = `${noun}s`): string {
 
 function buildPurgePreview(deps: ToolDeps, targets: PurgeTarget[], branchesByTeam: Map<string, string[]>): string {
   const rows = targets.map(target => {
-    const members = (deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ?").get(target.id) as { c: number }).c
+    const members = (deps.db.query("SELECT COUNT(*) as c FROM team_member WHERE team_id = ? AND member_kind = 'worker'").get(target.id) as { c: number }).c
     const tasks = (deps.db.query("SELECT COUNT(*) as c FROM team_task WHERE team_id = ?").get(target.id) as { c: number }).c
     const messages = (deps.db.query("SELECT COUNT(*) as c FROM team_message WHERE team_id = ?").get(target.id) as { c: number }).c
     const branches = branchesByTeam.get(target.id)?.length ?? 0
@@ -452,10 +452,10 @@ export async function executeTeamCleanup(
 
   const teamInfo = requireLead(deps, sessionId)
 
-  const members = deps.db.query("SELECT name, session_id, status, worktree_dir, worktree_branch, workspace_id FROM team_member WHERE team_id = ?")
-    .all(teamInfo.teamId) as Array<{ name: string; session_id: string; status: string; worktree_dir: string | null; worktree_branch: string | null; workspace_id: string | null }>
+  const members = deps.db.query("SELECT name, session_id, status, worktree_dir, worktree_branch, workspace_id, member_kind FROM team_member WHERE team_id = ?")
+    .all(teamInfo.teamId) as Array<{ name: string; session_id: string; status: string; worktree_dir: string | null; worktree_branch: string | null; workspace_id: string | null; member_kind: string }>
 
-  const active = members.filter(m => m.status !== "shutdown" && m.status !== "shutdown_requested" && m.status !== "error")
+  const active = members.filter(m => m.member_kind === "worker" && m.status !== "shutdown" && m.status !== "error")
 
   if (active.length > 0 && !args.force) {
     const names = active.map(m => m.name).join(", ")
@@ -496,21 +496,38 @@ export async function executeTeamCleanup(
           member.worktree_branch = safeBranch
         }
       }
+      deps.scheduler.terminateMember(teamInfo.teamId, member.name, "team cleanup")
       try {
         await deps.client.session.abort({ sessionID: member.session_id })
       } catch { /* best effort */ }
     }
   }
 
+  for (const internal of members.filter(member => member.member_kind !== "worker" && member.status !== "shutdown")) {
+    deps.scheduler.terminateMember(teamInfo.teamId, internal.name, "team cleanup")
+    try {
+      // Internal agents are always provisioned without a worktree or branch, so preservation is inapplicable.
+      await deps.client.session.abort({ sessionID: internal.session_id })
+    } catch { /* best effort */ }
+    deps.db.run(
+      "UPDATE team_member SET status = 'shutdown', execution_status = 'idle', time_updated = ? WHERE team_id = ? AND name = ?",
+      [Date.now(), teamInfo.teamId, internal.name],
+    )
+  }
+
+  members.forEach(member => {
+    deps.scheduler.terminateMember(teamInfo.teamId, member.name, "team archived")
+  })
+
   // Safety net: merge any remaining unmerged preserved branches
-  const unmerged = members.filter(m => m.worktree_branch !== null)
+  const unmerged = members.filter((m): m is typeof m & { worktree_branch: string } => m.worktree_branch !== null)
   const merged: string[] = []
   const conflicted: string[] = []
   const overlapWarnings: string[] = []
 
   if (unmerged.length > 0 && mergeOnCleanup) {
     for (const member of unmerged) {
-      const branch = member.worktree_branch!
+      const branch = member.worktree_branch
       // Warn (but don't block) if lead has local changes to overlapping files
       try {
         const overlap = await overlapCheck(branch, deps.directory)
@@ -563,6 +580,9 @@ export async function executeTeamCleanup(
   }
   if (overlapWarnings.length > 0) {
     parts.push(`Warning: safety-net merge overwrote local changes to overlapping files:\n${overlapWarnings.map(w => `  - ${w}`).join("\n")}\nReview with: git diff`)
+  }
+  if (!mergeOnCleanup && unmerged.length > 0) {
+    parts.push(`Auto-merge disabled. Merge preserved branches manually:\n${unmerged.map(member => `  git merge ${member.worktree_branch}`).join("\n")}`)
   }
   return parts.join("\n")
 }

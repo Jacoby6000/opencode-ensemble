@@ -1,12 +1,30 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test"
 import type { Database } from "../src/db"
 import { setupDb, insertTeam, insertMember, mockClient } from "./helpers"
-import { startDashboard, parseMessageParts } from "../src/dashboard"
+import { DASHBOARD_HOST, startDashboard as startDashboardServer, parseMessageParts } from "../src/dashboard"
+import type { DashboardOptions } from "../src/dashboard"
 import { ActivityBuffer } from "../src/activity"
+import { DEFAULT_CONFIG } from "../src/config"
+import { DurableScheduler } from "../src/scheduler-runtime"
 import type { PluginClient } from "../src/types"
+import { activateIdentity, markRunInjected, queueWake, tryAcquireRun, tryReserveIdentity } from "../src/scheduler"
+import { SUPERVISOR_AGENT, SUPERVISOR_MEMBER_NAME } from "../src/supervisor"
 
 function randomPort(): number {
   return 19000 + Math.floor(Math.random() * 10000)
+}
+
+const TEST_TOKEN = "dashboard-test-token"
+const nativeFetch = globalThis.fetch
+
+function startDashboard(db: Database, port: number, options: Omit<DashboardOptions, "token"> = {}) {
+  return startDashboardServer(db, port, { ...options, token: TEST_TOKEN })
+}
+
+function withDashboardAuth(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers)
+  headers.set("Authorization", `Bearer ${TEST_TOKEN}`)
+  return nativeFetch(input, { ...init, headers })
 }
 
 function insertTask(db: Database, teamId: string, id: string, content: string, status = "pending", priority = "medium", assignee: string | null = null, dependsOn: string | null = null) {
@@ -25,7 +43,7 @@ function insertMessage(db: Database, teamId: string, id: string, fromName: strin
 
 // biome-lint: use Record for JSON response shape
 interface HealthResponse { ensemble: boolean; pid: number }
-interface DashboardTeam { id: string; name: string; projectId: string; leadSessionId?: string; status: string; timeCreated: number; timeUpdated: number; members: Array<{ sessionId?: string } & Record<string, unknown>>; tasks: Array<Record<string, unknown>>; messages: Array<Record<string, unknown>> }
+interface DashboardTeam { id: string; name: string; projectId: string; leadSessionId?: string; status: string; timeCreated: number; timeUpdated: number; members: Array<{ sessionId?: string } & Record<string, unknown>>; tasks: Array<Record<string, unknown>>; groups?: Array<Record<string, unknown>>; messages: Array<Record<string, unknown>>; scheduler?: Record<string, unknown> }
 interface StateResponse { version: number; projects: Array<{ id: string; name: string; path: string; activeTeams: number; workingAgents: number; teams: DashboardTeam[] }>; teams: DashboardTeam[] }
 
 describe("dashboard", () => {
@@ -36,20 +54,51 @@ describe("dashboard", () => {
   beforeEach(() => {
     db = setupDb()
     port = randomPort()
+    globalThis.fetch = withDashboardAuth as typeof fetch
   })
 
   afterEach(() => {
     server?.stop(true)
     db.close()
+    globalThis.fetch = nativeFetch
   })
 
   describe("GET /api/health", () => {
+    test("rejects requests without the bearer token", async () => {
+      server = await startDashboard(db, port)
+      const res = await nativeFetch(`http://localhost:${port}/api/health`)
+      expect(res.status).toBe(401)
+      expect(res.headers.get("www-authenticate")).toBe("Bearer")
+    })
+
+    test("rejects an incorrect bearer token across every API family", async () => {
+      server = await startDashboard(db, port)
+      const paths = [
+        "/api/state",
+        "/api/teams/team/messages",
+        "/api/teams/team/members/member",
+        "/api/session/session/activity",
+      ]
+
+      for (const path of paths) {
+        const res = await nativeFetch(`http://localhost:${port}${path}`, {
+          headers: { Authorization: "Bearer wrong-token" },
+        })
+        expect(res.status).toBe(401)
+      }
+    })
+
     test("returns correct shape with ensemble: true", async () => {
       server = await startDashboard(db, port)
       const res = await fetch(`http://localhost:${port}/api/health`)
       expect(res.status).toBe(200)
       expect(res.headers.get("content-type")).toContain("application/json")
-      expect(res.headers.get("access-control-allow-origin")).toBe("*")
+      expect(res.headers.get("access-control-allow-origin")).toBeNull()
+      expect(res.headers.get("cache-control")).toBe("no-store")
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff")
+      expect(res.headers.get("x-frame-options")).toBe("DENY")
+      expect(res.headers.get("content-security-policy")).toContain("default-src 'none'")
+      expect(server?.host).toBe(DASHBOARD_HOST)
       const body = (await res.json()) as HealthResponse
       expect(body.ensemble).toBe(true)
       expect(typeof body.pid).toBe("number")
@@ -61,9 +110,9 @@ describe("dashboard", () => {
       server = await startDashboard(db, port)
       const res = await fetch(`http://localhost:${port}/api/state`)
       expect(res.status).toBe(200)
-      expect(res.headers.get("access-control-allow-origin")).toBe("*")
+      expect(res.headers.get("access-control-allow-origin")).toBeNull()
       const body = (await res.json()) as StateResponse
-      expect(body).toEqual({ version: 1, projects: [], teams: [] })
+      expect(body).toEqual({ version: 2, projects: [], teams: [] })
     })
 
     test("returns team with members, tasks, messages", async () => {
@@ -103,13 +152,94 @@ describe("dashboard", () => {
       expect(team.messages[0]!.id).toBe("msg-1")
       expect(team.messages[0]!.fromName).toBe("alice")
       expect(team.messages[0]!.toName).toBe("lead")
-      expect(team.messages[0]!.content).toBe("Done with auth fix")
+      expect(team.messages[0]!.preview).toBe("Done with auth fix")
+      expect(team.messages[0]!.contentLength).toBe("Done with auth fix".length)
+      expect(team.messages[0]!).not.toHaveProperty("content")
+      expect(team.members[0]!).not.toHaveProperty("prompt")
       expect(body.projects).toHaveLength(1)
       expect(body.projects[0]!.id).toBe("/tmp/test-project")
       expect(body.projects[0]!.path).toBe("/tmp/test-project")
       expect(body.projects[0]!.activeTeams).toBe(1)
       expect(body.projects[0]!.workingAgents).toBe(1)
       expect(body.projects[0]!.teams[0]!.id).toBe("t1")
+    })
+
+    test("exposes payload-free scheduler pressure and recent events", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      const reservation = tryReserveIdentity(db, {
+        teamId: "t1", memberName: "alice", agent: "build",
+        limits: { global: 2, perAgent: {} }, reservationTtlMs: 60_000,
+      })
+      if (!reservation.reserved) throw new Error("expected reservation")
+      insertMember(db, "t1", "alice", "sess-a")
+      activateIdentity(db, reservation.reservationId)
+      const wake = queueWake(db, {
+        teamId: "t1", memberName: "alice", sessionId: "sess-a", agent: "build",
+        reason: "message", coalesceKey: "alice", prompt: "secret scheduler prompt",
+      })
+      const acquired = tryAcquireRun(db, wake.wakeId, { global: 1, perAgent: {} }, 60_000)
+      if (!acquired.acquired) throw new Error("expected lease")
+      markRunInjected(db, acquired.leaseId)
+
+      server = await startDashboard(db, port)
+      const res = await fetch(`http://localhost:${port}/api/state`)
+      const body = (await res.json()) as StateResponse
+      const scheduler = body.teams[0]!.scheduler as {
+        activeIdentities: number; reservedIdentities: number; queuedWakes: number; leasedWakes: number
+        activeRuns: number; expiredRuns: number; recentEvents: Array<Record<string, unknown>>
+      }
+
+      expect(scheduler).toMatchObject({ activeIdentities: 1, reservedIdentities: 0, queuedWakes: 0, leasedWakes: 1, activeRuns: 1, expiredRuns: 0 })
+      expect(scheduler.recentEvents.length).toBeGreaterThan(0)
+      expect(JSON.stringify(scheduler)).not.toContain("secret scheduler prompt")
+      expect(scheduler.recentEvents[0]).not.toHaveProperty("detail")
+    })
+
+    test("excludes simultaneous hidden Supervisor identities, wakes, runs, and events", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      const workerReservation = tryReserveIdentity(db, {
+        teamId: "t1", memberName: "alice", agent: "build",
+        limits: { global: 4, perAgent: {} }, reservationTtlMs: 60_000,
+      })
+      if (!workerReservation.reserved) throw new Error("expected worker reservation")
+      insertMember(db, "t1", "alice", "sess-a")
+      activateIdentity(db, workerReservation.reservationId)
+      const workerWake = queueWake(db, {
+        teamId: "t1", memberName: "alice", sessionId: "sess-a", agent: "build",
+        reason: "message", coalesceKey: "alice",
+      })
+      const workerLease = tryAcquireRun(db, workerWake.wakeId, { global: 4, perAgent: {} }, 60_000)
+      if (!workerLease.acquired) throw new Error("expected worker lease")
+      markRunInjected(db, workerLease.leaseId)
+
+      const supervisorReservation = tryReserveIdentity(db, {
+        teamId: "t1", memberName: SUPERVISOR_MEMBER_NAME, agent: SUPERVISOR_AGENT,
+        limits: { global: 4, perAgent: {} }, reservationTtlMs: 60_000,
+      })
+      if (!supervisorReservation.reserved) throw new Error("expected Supervisor reservation")
+      insertMember(db, "t1", SUPERVISOR_MEMBER_NAME, "supervisor-session")
+      db.run("UPDATE team_member SET agent = ?, member_kind = 'supervisor' WHERE team_id = 't1' AND name = ?", [SUPERVISOR_AGENT, SUPERVISOR_MEMBER_NAME])
+      activateIdentity(db, supervisorReservation.reservationId)
+      const supervisorWake = queueWake(db, {
+        teamId: "t1", memberName: SUPERVISOR_MEMBER_NAME, sessionId: "supervisor-session", agent: SUPERVISOR_AGENT,
+        reason: "supervisor_review", coalesceKey: "supervisor:0",
+      })
+      const supervisorLease = tryAcquireRun(db, supervisorWake.wakeId, { global: 4, perAgent: {} }, 60_000)
+      if (!supervisorLease.acquired) throw new Error("expected Supervisor lease")
+      markRunInjected(db, supervisorLease.leaseId)
+
+      server = await startDashboard(db, port)
+      const body = (await (await fetch(`http://localhost:${port}/api/state`)).json()) as StateResponse
+      const team = body.teams[0]!
+      const scheduler = team.scheduler as {
+        activeIdentities: number; reservedIdentities: number; queuedWakes: number; leasedWakes: number
+        activeRuns: number; expiredRuns: number; recentEvents: Array<{ memberName: string | null }>
+      }
+
+      expect(team.members.map(member => member.name)).toEqual(["alice"])
+      expect(scheduler).toMatchObject({ activeIdentities: 1, reservedIdentities: 0, queuedWakes: 0, leasedWakes: 1, activeRuns: 1, expiredRuns: 0 })
+      expect(scheduler.recentEvents.length).toBeGreaterThan(0)
+      expect(scheduler.recentEvents.every(event => event.memberName !== SUPERVISOR_MEMBER_NAME)).toBe(true)
     })
 
     test("Fix 1: exposes last_nudged_at as an additive lastNudgedAt field", async () => {
@@ -243,6 +373,23 @@ describe("dashboard", () => {
       expect(body.teams).toHaveLength(2)
     })
 
+    test("adds group metadata and group message summaries without changing the state version", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      insertMember(db, "t1", "broadcast", "sess-broadcast")
+      db.run("INSERT INTO team_group (id, team_id, name, created_by, time_created) VALUES ('g1', 't1', 'broadcast-room', 'alice', 1)")
+      db.run("INSERT INTO team_group_participant (team_id, group_id, participant_name, time_created) VALUES ('t1', 'g1', 'alice', 1)")
+      db.run("INSERT INTO team_group_participant (team_id, group_id, participant_name, time_created) VALUES ('t1', 'g1', 'lead', 1)")
+      db.run("UPDATE team_group SET sealed = 1 WHERE id = 'g1'")
+      db.run("INSERT INTO team_message (id, team_id, from_name, to_name, group_id, content, delivered, time_created) VALUES ('gm1', 't1', 'alice', NULL, 'g1', 'group body', 0, 2)")
+      server = await startDashboard(db, port)
+
+      const body = await (await fetch(`http://localhost:${port}/api/state`)).json() as StateResponse
+      expect(body.version).toBe(2)
+      expect(body.teams[0]!.groups).toEqual([{ id: "g1", name: "broadcast-room", creator: "alice", participants: ["alice", "lead"], createdAt: 1, canSend: true }])
+      expect(body.teams[0]!.messages[0]).toMatchObject({ id: "gm1", groupId: "g1", groupName: "broadcast-room", toName: null })
+    })
+
     test("returns task dependencies as readable id arrays", async () => {
       insertTeam(db, "t1", "alpha", "lead-sess")
       insertTask(db, "t1", "task-1", "Prepare dashboard contracts", "completed", "high")
@@ -256,6 +403,196 @@ describe("dashboard", () => {
     })
   })
 
+  describe("GET /api/teams/:teamId/messages", () => {
+    test("returns full message bodies in bounded cursor pages", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMessage(db, "t1", "msg-1", "alice", "lead", "First body")
+      insertMessage(db, "t1", "msg-2", "alice", "lead", "Second body")
+      insertMessage(db, "t1", "msg-3", "alice", "lead", "Third body")
+      db.run("UPDATE team_message SET time_created = ? WHERE id = ?", [1, "msg-1"])
+      db.run("UPDATE team_message SET time_created = ? WHERE id = ?", [2, "msg-2"])
+      db.run("UPDATE team_message SET time_created = ? WHERE id = ?", [3, "msg-3"])
+
+      server = await startDashboard(db, port)
+      const firstRes = await fetch(`http://localhost:${port}/api/teams/t1/messages?limit=2`)
+      expect(firstRes.status).toBe(200)
+      const first = (await firstRes.json()) as { messages: Array<Record<string, unknown>>; nextCursor: string | null }
+      expect(first.messages.map(message => message.id)).toEqual(["msg-3", "msg-2"])
+      expect(first.messages.map(message => message.content)).toEqual(["Third body", "Second body"])
+      expect(typeof first.nextCursor).toBe("string")
+
+      const secondRes = await fetch(`http://localhost:${port}/api/teams/t1/messages?limit=2&cursor=${encodeURIComponent(first.nextCursor!)}`)
+      const second = (await secondRes.json()) as { messages: Array<Record<string, unknown>>; nextCursor: string | null }
+      expect(second.messages.map(message => message.id)).toEqual(["msg-1"])
+      expect(second.nextCursor).toBeNull()
+    })
+
+    test("rejects invalid pagination limits", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      server = await startDashboard(db, port)
+
+      const res = await fetch(`http://localhost:${port}/api/teams/t1/messages?limit=51`)
+      expect(res.status).toBe(400)
+    })
+
+    test("filters direct and broadcast conversation channels", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      insertMember(db, "t1", "broadcast", "sess-broadcast")
+      insertMessage(db, "t1", "msg-direct", "lead", "alice", "Direct body")
+      insertMessage(db, "t1", "msg-reply", "alice", "lead", "Reply body")
+      insertMessage(db, "t1", "msg-named-broadcast", "lead", "broadcast", "Direct to named member")
+      insertMessage(db, "t1", "msg-broadcast", "lead", null, "Broadcast body")
+      server = await startDashboard(db, port)
+
+      const direct = await (await fetch(`http://localhost:${port}/api/teams/t1/messages?channel=alice`)).json() as { messages: Array<{ id: string }> }
+      const namedBroadcast = await (await fetch(`http://localhost:${port}/api/teams/t1/messages?channel=broadcast`)).json() as { messages: Array<{ id: string }> }
+      const broadcast = await (await fetch(`http://localhost:${port}/api/teams/t1/messages?channelType=broadcast`)).json() as { messages: Array<{ id: string }> }
+
+      expect(direct.messages.map(message => message.id).sort()).toEqual(["msg-direct", "msg-reply"])
+      expect(namedBroadcast.messages.map(message => message.id)).toEqual(["msg-named-broadcast"])
+      expect(broadcast.messages.map(message => message.id)).toEqual(["msg-broadcast"])
+    })
+
+    test("returns authenticated group history without mutating message or scheduler state", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      insertMember(db, "t1", "bob", "sess-b")
+      db.run("INSERT INTO team_group (id, team_id, name, created_by, time_created) VALUES ('g1', 't1', 'architects', 'alice', 1)")
+      for (const name of ["alice", "bob"]) db.run("INSERT INTO team_group_participant (team_id, group_id, participant_name, time_created) VALUES ('t1', 'g1', ?, 1)", [name])
+      db.run("UPDATE team_group SET sealed = 1 WHERE id = 'g1'")
+      db.run("INSERT INTO team_message (id, team_id, from_name, to_name, group_id, content, delivered, read, delivery_state, time_created) VALUES ('gm1', 't1', 'alice', NULL, 'g1', 'group body', 0, 0, 'queued', 2)")
+      const before = db.query("SELECT delivered, read, delivery_state FROM team_message WHERE id = 'gm1'").get()
+      server = await startDashboard(db, port)
+
+      const result = await (await fetch(`http://localhost:${port}/api/teams/t1/messages?channelType=group&group=architects`)).json() as { messages: Array<Record<string, unknown>> }
+      expect(result.messages).toEqual([expect.objectContaining({ id: "gm1", groupId: "g1", groupName: "architects", content: "group body" })])
+      expect(db.query("SELECT delivered, read, delivery_state FROM team_message WHERE id = 'gm1'").get()).toEqual(before)
+    })
+  })
+
+  describe("POST /api/teams/:teamId/messages", () => {
+    test("queues a direct dashboard message durably for the selected team", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      server = await startDashboard(db, port)
+
+      const res = await fetch(`http://localhost:${port}/api/teams/t1/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: "alice", content: "Please inspect the failure." }),
+      })
+
+      expect(res.status).toBe(202)
+      const body = await res.json() as { message: { id: string; fromName: string; toName: string; content: string } }
+      expect(body.message).toMatchObject({ fromName: "lead", toName: "alice", content: "Please inspect the failure." })
+      expect(db.query("SELECT team_id, from_name, to_name, content FROM team_message WHERE id = ?").get(body.message.id)).toEqual({
+        team_id: "t1", from_name: "lead", to_name: "alice", content: "Please inspect the failure.",
+      })
+      expect(db.query("SELECT COUNT(*) AS count FROM scheduler_message_wake WHERE message_id = ?").get(body.message.id)).toEqual({ count: 1 })
+    })
+
+    test("queues one broadcast with independent recipient deliveries", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      insertMember(db, "t1", "bob", "sess-b")
+      server = await startDashboard(db, port)
+
+      const res = await fetch(`http://localhost:${port}/api/teams/t1/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: null, content: "Status check." }),
+      })
+
+      expect(res.status).toBe(202)
+      const body = await res.json() as { message: { id: string; toName: null }; recipientCount: number }
+      expect(body.recipientCount).toBe(2)
+      expect(body.message.toName).toBeNull()
+      expect(db.query("SELECT COUNT(*) AS count FROM scheduler_message_wake WHERE message_id = ?").get(body.message.id)).toEqual({ count: 2 })
+    })
+
+    test("rejects malformed, cross-team, and unschedulable recipients", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertTeam(db, "t2", "beta", "lead-other")
+      insertMember(db, "t2", "alice", "sess-other")
+      server = await startDashboard(db, port)
+
+      const wrongContentType = await fetch(`http://localhost:${port}/api/teams/t1/messages`, { method: "POST", body: "{}" })
+      expect(wrongContentType.status).toBe(415)
+      const crossTeam = await fetch(`http://localhost:${port}/api/teams/t1/messages`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to: "alice", content: "hello" }),
+      })
+      expect(crossTeam.status).toBe(404)
+      const empty = await fetch(`http://localhost:${port}/api/teams/t1/messages`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to: null, content: "" }),
+      })
+      expect(empty.status).toBe(400)
+    })
+
+    test("allows lead group posts only when lead is a participant", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      insertMember(db, "t1", "bob", "sess-b")
+      db.run("INSERT INTO team_group (id, team_id, name, created_by, time_created) VALUES ('g1', 't1', 'leaders', 'alice', 1), ('g2', 't1', 'workers', 'alice', 1)")
+      for (const name of ["lead", "alice"]) db.run("INSERT INTO team_group_participant (team_id, group_id, participant_name, time_created) VALUES ('t1', 'g1', ?, 1)", [name])
+      for (const name of ["alice", "bob"]) db.run("INSERT INTO team_group_participant (team_id, group_id, participant_name, time_created) VALUES ('t1', 'g2', ?, 1)", [name])
+      db.run("UPDATE team_group SET sealed = 1 WHERE id IN ('g1', 'g2')")
+      server = await startDashboard(db, port)
+
+      const accepted = await fetch(`http://localhost:${port}/api/teams/t1/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group: "leaders", content: "lead note" }) })
+      expect(accepted.status).toBe(202)
+      const denied = await fetch(`http://localhost:${port}/api/teams/t1/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group: "workers", content: "override" }) })
+      expect(denied.status).toBe(403)
+    })
+
+    test("immediately dispatches accepted lead group posts without awaiting promptAsync", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      insertMember(db, "t1", "bob", "sess-b")
+      db.run("INSERT INTO team_group (id, team_id, name, created_by, time_created) VALUES ('g1', 't1', 'leaders', 'alice', 1)")
+      for (const name of ["lead", "alice", "bob"]) db.run("INSERT INTO team_group_participant (team_id, group_id, participant_name, time_created) VALUES ('t1', 'g1', ?, 1)", [name])
+      db.run("UPDATE team_group SET sealed = 1 WHERE id = 'g1'")
+      const client = mockClient()
+      client.session.promptAsync = options => {
+        client.calls.push({ method: "session.promptAsync", args: [options] })
+        return new Promise(() => {})
+      }
+      const scheduler = new DurableScheduler(db, client, DEFAULT_CONFIG.scheduler, true, "/tmp/test-project")
+      const options = { scheduler }
+      server = await startDashboard(db, port, options)
+
+      const response = await Promise.race([
+        fetch(`http://localhost:${port}/api/teams/t1/messages`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ group: "leaders", content: "dispatch now" }),
+        }),
+        Bun.sleep(2_000).then(() => { throw new Error("dashboard POST awaited promptAsync") }),
+      ])
+      await Bun.sleep(0)
+
+      expect(response.status).toBe(202)
+      const body = await response.json() as { recipientCount: number }
+      expect(body.recipientCount).toBe(2)
+      const dispatches = client.calls.filter(call => call.method === "session.promptAsync")
+      expect(dispatches).toHaveLength(2)
+      expect(dispatches.map(call => (call.args[0] as { sessionID: string }).sessionID).sort()).toEqual(["sess-a", "sess-b"])
+    })
+  })
+
+  describe("GET /api/teams/:teamId/members/:memberName", () => {
+    test("returns the full prompt only through the authenticated detail route", async () => {
+      insertTeam(db, "t1", "alpha", "lead-sess")
+      insertMember(db, "t1", "alice", "sess-a")
+      db.run("UPDATE team_member SET prompt = ? WHERE team_id = ? AND name = ?", ["Sensitive implementation prompt", "t1", "alice"])
+
+      server = await startDashboard(db, port)
+      const res = await fetch(`http://localhost:${port}/api/teams/t1/members/alice`)
+      expect(res.status).toBe(200)
+      expect(await res.json()).toEqual({ prompt: "Sensitive implementation prompt" })
+    })
+  })
+
   describe("GET /", () => {
     test("returns HTML content-type", async () => {
       server = await startDashboard(db, port)
@@ -264,6 +601,8 @@ describe("dashboard", () => {
       expect(res.headers.get("content-type")).toContain("text/html")
       const text = await res.text()
       expect(text).toContain("<html")
+      expect(text).not.toContain('src="https://')
+      expect(text).not.toContain('href="https://')
       expect(text).toContain('id="attention"')
       expect(text).toContain('aria-label="Team attention"')
       expect(text).toContain('aria-label="Agent roster"')
@@ -280,6 +619,14 @@ describe("dashboard", () => {
       const res = await fetch(`http://localhost:${port}/nope`)
       expect(res.status).toBe(404)
     })
+
+    test("rejects unsupported methods", async () => {
+      server = await startDashboard(db, port)
+      const res = await fetch(`http://localhost:${port}/api/state`, { method: "POST" })
+      expect(res.status).toBe(405)
+      expect(res.headers.get("allow")).toBe("GET")
+      expect(res.headers.get("cache-control")).toBe("no-store")
+    })
   })
 
   describe("stop(force)", () => {
@@ -294,7 +641,7 @@ describe("dashboard", () => {
       const net = await import("node:net")
       const dangling = await new Promise<import("node:net").Socket>((resolve, reject) => {
         const sock = net.createConnection({ port, host: "127.0.0.1" }, () => {
-          sock.write("GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+          sock.write(`GET /api/health HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer ${TEST_TOKEN}\r\nConnection: keep-alive\r\n\r\n`)
         })
         sock.on("error", reject)
         sock.once("data", () => resolve(sock))
@@ -386,10 +733,9 @@ describe("dashboard", () => {
       server = await startDashboard(db, port, { client: mockPluginClient })
       const res = await fetch(`http://localhost:${port}/api/session/sess-x/activity`)
       expect(res.status).toBe(200)
-      const body = await res.json() as { activity: Array<Record<string, unknown>>; session: Record<string, unknown> | null }
+      const body = await res.json() as { activity: Array<Record<string, unknown>>; session?: unknown }
       expect(body.activity.length).toBeGreaterThan(0)
-      expect(body.session).toBeTruthy()
-      expect(body.session!.cost).toBe(0.05)
+      expect(body.session).toBeUndefined()
     })
 
     test("combines buffer entries with session.messages fallback", async () => {
@@ -417,7 +763,7 @@ describe("dashboard", () => {
       expect(body.activity[0]!.type).toBe("shell_command")
     })
 
-    test("parses reasoning parts from session messages", async () => {
+    test("does not expose reasoning or transcript text from session messages", async () => {
       const mockPluginClient: PluginClient = {
         ...mockClient(),
         session: {
@@ -442,13 +788,9 @@ describe("dashboard", () => {
       server = await startDashboard(db, port, { client: mockPluginClient })
       const res = await fetch(`http://localhost:${port}/api/session/sess-r/activity`)
       const body = await res.json() as { activity: Array<Record<string, unknown>> }
-      const reasoning = body.activity.find(a => a.type === "reasoning")
-      expect(reasoning).toBeTruthy()
-      expect(reasoning!.reasoning).toBe("I should check the file first.")
-      const text = body.activity.find(a => a.type === "text")
-      expect(text).toBeTruthy()
-      expect(text!.text).toBe("Let me look at the handler.")
-      expect(text!.role).toBe("assistant")
+      expect(body.activity).toEqual([])
+      expect(JSON.stringify(body)).not.toContain("I should check the file first.")
+      expect(JSON.stringify(body)).not.toContain("Let me look at the handler.")
     })
 
     test("parses file parts from session messages", async () => {
@@ -478,7 +820,7 @@ describe("dashboard", () => {
       const file = body.activity.find(a => a.type === "file")
       expect(file).toBeTruthy()
       expect(file!.filePath).toBe("src/handler.ts")
-      expect(file!.fileContent).toBe("export function handle() {}")
+      expect(file!.fileContent).toBeUndefined()
     })
 
     test("parses structured tool input/output from session messages", async () => {
@@ -508,8 +850,8 @@ describe("dashboard", () => {
       const tool = body.activity.find(a => a.type === "tool_result")
       expect(tool).toBeTruthy()
       expect(tool!.tool).toBe("bash")
-      expect(tool!.input).toBe(JSON.stringify({ command: "ls" }, null, 2))
-      expect(tool!.output).toBe(JSON.stringify({ stdout: "file.ts" }, null, 2))
+      expect(tool!.input).toBeUndefined()
+      expect(tool!.output).toBeUndefined()
     })
   })
 
@@ -550,7 +892,7 @@ describe("dashboard", () => {
 
       expect(typeof body.version).toBe("number")
       expect(Number.isInteger(body.version)).toBe(true)
-      expect(body.version).toBe(1)
+      expect(body.version).toBe(2)
     })
   })
 
@@ -634,7 +976,7 @@ describe("dashboard", () => {
             return {
               data: [{
                 info: { role: "assistant", time: new Date(1000).toISOString() },
-                parts: [{ type: "text", text: "hello" }],
+                parts: [{ type: "step-start", label: "Earlier step" }],
               }],
             }
           },
@@ -682,9 +1024,9 @@ describe("dashboard", () => {
       const res = await fetch(`http://localhost:${port}/api/session/sess-err/activity`)
       // The error is caught — returns what we have (empty activity)
       expect(res.status).toBe(200)
-      const body = await res.json() as { activity: unknown[]; session: unknown }
+      const body = await res.json() as { activity: unknown[]; session?: unknown }
       expect(body.activity).toEqual([])
-      expect(body.session).toBeNull()
+      expect(body.session).toBeUndefined()
     })
   })
 })

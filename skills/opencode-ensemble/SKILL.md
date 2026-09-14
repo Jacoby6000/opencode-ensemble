@@ -57,6 +57,10 @@ Spawn teammates only for independent, verifiable work. A good Ensemble team has 
 
 Start with two or three teammates. Add more only when the work has more independent slices than active teammates.
 
+## Teammate Coordination Tools
+
+Teammates have seven coordination tools: `team_message`, `team_broadcast`, `team_results`, `team_tasks_list`, `team_tasks_add`, `team_tasks_complete`, and `team_claim`. Use `team_broadcast` with `group` plus `members` to atomically create an immutable named group and send its first message, or with `group` alone to send as a participant. Use `team_results` to list or inspect any team group without changing delivery or read state.
+
 ## Load References As Needed
 
 - Need a team shape? Read `references/coordination-patterns.md`.

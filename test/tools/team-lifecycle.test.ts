@@ -84,6 +84,23 @@ describe("team_shutdown", () => {
     expect(row.status).toBe("shutdown_requested")
   })
 
+  test("graceful shutdown preserves the teammate's custom agent and model", async () => {
+    deps.db.run(
+      "UPDATE team_member SET agent = ?, model = ? WHERE team_id = ? AND name = ?",
+      ["cleanup-specialist", "openrouter/anthropic/claude-sonnet", "t1", "alice"],
+    )
+    deps.client.session.status = async () => ({ data: { "sess-alice": { type: "busy" } } })
+
+    await executeTeamShutdown(deps, { member: "alice" }, "lead-sess", undefined, noopPreserve)
+
+    const options = deps.client.calls.find(c => c.method === "session.promptAsync")!.args[0] as {
+      agent?: string
+      model?: { providerID: string; modelID: string }
+    }
+    expect(options.agent).toBe("cleanup-specialist")
+    expect(options.model).toEqual({ providerID: "openrouter", modelID: "anthropic/claude-sonnet" })
+  })
+
   test("idle member is aborted immediately, no promptAsync", async () => {
     deps.client.session.status = async () => {
       deps.client.calls.push({ method: "session.status", args: [] })
@@ -340,15 +357,11 @@ describe("team_cleanup", () => {
     expect(team.status).toBe("archived")
   })
 
-  test("treats shutdown_requested members as inactive (cleanup succeeds without force)", async () => {
+  test("treats shutdown_requested members as active until they stop", async () => {
     insertMember(deps.db, "t1", "alice", "sess-alice", "shutdown_requested", "idle")
     deps.registry.register("t1", "alice", "sess-alice")
 
-    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false)
-    expect(result).toContain("cleaned up")
-
-    const team = deps.db.query("SELECT status FROM team WHERE id = ?").get("t1") as Record<string, string>
-    expect(team.status).toBe("archived")
+    await expect(executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false)).rejects.toThrow(/still active/)
   })
 
   test("treats error members as inactive (cleanup succeeds without force)", async () => {
