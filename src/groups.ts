@@ -62,6 +62,14 @@ function requireOrdinaryCaller(db: Database, teamId: string, caller: string): vo
   if (!worker) throw new Error("Group inboxes are available only to the lead and active ordinary workers")
 }
 
+function requireHistoryObserver(db: Database, teamId: string, caller: string): void {
+  if (caller === "lead") return
+  const observer = db.query(
+    "SELECT 1 FROM team_member WHERE team_id = ? AND name = ? AND member_kind IN ('worker', 'annalist') AND status IN ('ready', 'busy')",
+  ).get(teamId, caller)
+  if (!observer) throw new Error("Group inboxes are available only to the lead, active workers, and the Annalist")
+}
+
 function loadGroup(db: Database, teamId: string, name: string, caller: string): TeamGroup | undefined {
   const row = db.query(
     "SELECT id, name, created_by, time_created FROM team_group WHERE team_id = ? AND name = ? AND sealed = 1",
@@ -76,7 +84,7 @@ function loadGroup(db: Database, teamId: string, name: string, caller: string): 
 
 /** List every group in a team without changing any mailbox or scheduler state. */
 export function listTeamGroups(db: Database, teamId: string, caller: string): TeamGroup[] {
-  requireOrdinaryCaller(db, teamId, caller)
+  requireHistoryObserver(db, teamId, caller)
   const names = db.query("SELECT name FROM team_group WHERE team_id = ? AND sealed = 1 ORDER BY time_created ASC, name ASC").all(teamId) as Array<{ name: string }>
   return names.flatMap(row => {
     const group = loadGroup(db, teamId, row.name, caller)
@@ -86,7 +94,7 @@ export function listTeamGroups(db: Database, teamId: string, caller: string): Te
 
 /** Read deterministic newest-first group history without changing delivery or read state. */
 export function inspectTeamGroup(db: Database, teamId: string, caller: string, name: string, limit = 20): { group: TeamGroup; messages: GroupMessage[] } {
-  requireOrdinaryCaller(db, teamId, caller)
+  requireHistoryObserver(db, teamId, caller)
   if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new Error("Group history limit must be an integer from 1 to 50")
   const group = loadGroup(db, teamId, name, caller)
   if (!group) throw new Error(`Group "${name}" not found`)

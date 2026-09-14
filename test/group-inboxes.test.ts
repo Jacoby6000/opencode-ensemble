@@ -209,7 +209,7 @@ describe("durable group inboxes", () => {
     )
     deps.registry.register("t1", "opencode-ensemble-supervisor", "supervisor-session")
     await expect(executeTeamBroadcast(deps, { text: "intrude", group: "architects" }, "supervisor-session")).rejects.toThrow(/Supervisor/)
-    await expect(executeTeamResults(deps, { list_groups: true }, "supervisor-session")).rejects.toThrow(/ordinary workers/)
+    await expect(executeTeamResults(deps, { list_groups: true }, "supervisor-session")).rejects.toThrow(/active workers/)
     expect(buildSupervisorReviewPrompt(deps.db, "t1", 1)).toContain("alice -> group:architects: first")
   })
 })

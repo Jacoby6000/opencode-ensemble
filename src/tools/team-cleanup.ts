@@ -503,15 +503,15 @@ export async function executeTeamCleanup(
     }
   }
 
-  for (const supervisor of members.filter(member => member.member_kind === "supervisor" && member.status !== "shutdown")) {
-    deps.scheduler.terminateMember(teamInfo.teamId, supervisor.name, "team cleanup")
+  for (const internal of members.filter(member => member.member_kind !== "worker" && member.status !== "shutdown")) {
+    deps.scheduler.terminateMember(teamInfo.teamId, internal.name, "team cleanup")
     try {
-      // Internal Supervisors are always provisioned without a worktree or branch, so preservation is inapplicable.
-      await deps.client.session.abort({ sessionID: supervisor.session_id })
+      // Internal agents are always provisioned without a worktree or branch, so preservation is inapplicable.
+      await deps.client.session.abort({ sessionID: internal.session_id })
     } catch { /* best effort */ }
     deps.db.run(
       "UPDATE team_member SET status = 'shutdown', execution_status = 'idle', time_updated = ? WHERE team_id = ? AND name = ?",
-      [Date.now(), teamInfo.teamId, supervisor.name],
+      [Date.now(), teamInfo.teamId, internal.name],
     )
   }
 

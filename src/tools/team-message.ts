@@ -7,6 +7,7 @@ import { log } from "../log"
 import { generateId } from "../util"
 import { queueMessageWake } from "../scheduler"
 import { requireCurrentSupervisorReview, SUPERVISOR_MEMBER_NAME } from "../supervisor"
+import { ANNALIST_MEMBER_NAME } from "../annalist"
 
 /**
  * Execute the team_message tool. Sends a direct message to a teammate or lead.
@@ -23,7 +24,7 @@ export async function executeTeamMessage(
   sessionId: string,
 ): Promise<string> {
   const teamInfo = requireTeamMember(deps, sessionId)
-  if (args.to === SUPERVISOR_MEMBER_NAME) throw new Error(`Teammate "${args.to}" not found in team "${teamInfo.teamName}".`)
+  if (args.to === SUPERVISOR_MEMBER_NAME || args.to === ANNALIST_MEMBER_NAME) throw new Error(`Teammate "${args.to}" not found in team "${teamInfo.teamName}".`)
   if (teamInfo.memberName === SUPERVISOR_MEMBER_NAME) {
     if (args.to !== "lead") throw new Error("Supervisor can only message the lead with a lead-only blocker.")
     requireCurrentSupervisorReview(deps.db, sessionId)

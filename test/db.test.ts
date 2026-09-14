@@ -52,6 +52,28 @@ describe("schema migrations", () => {
     expect(() => db.run("UPDATE team_member SET member_kind = 'other' WHERE name = 'alice'")).toThrow()
   })
 
+  test("migration 16 adds durable Annalist members and task annal events without breaking scheduler references", () => {
+    for (let i = 0; i < 15; i++) {
+      const migration = MIGRATIONS[i]
+      if (migration) db.exec(migration)
+      db.exec(`PRAGMA user_version = ${i + 1}`)
+    }
+    db.run("INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated) VALUES ('t1', 'team', 'default', 'lead', 'active', 0, 0, 0)")
+    db.run("INSERT INTO team_member (team_id, name, session_id, agent, time_created, time_updated) VALUES ('t1', 'alice', 's1', 'build', 0, 0)")
+    db.run("INSERT INTO scheduler_wake (id, team_id, member_name, session_id, agent, reason, coalesce_key, state, not_before, time_created, time_updated) VALUES ('wake-1', 't1', 'alice', 's1', 'build', 'test', 'alice', 'queued', 0, 0, 0)")
+
+    applyMigrations(db)
+
+    db.run("INSERT INTO team_member (team_id, name, session_id, agent, member_kind, time_created, time_updated) VALUES ('t1', '__ensemble-annalist', 'annalist-session', 'Annalist', 'annalist', 0, 0)")
+    db.run("INSERT INTO team_task (id, team_id, content, status, priority, assignee, time_created, time_updated) VALUES ('task-1', 't1', 'done', 'completed', 'medium', 'alice', 0, 1)")
+    db.run("INSERT INTO team_task_annal (task_id, team_id, completed_by, time_completed) VALUES ('task-1', 't1', 'alice', 1)")
+
+    expect(db.query("SELECT member_kind FROM team_member WHERE name = '__ensemble-annalist'").get()).toEqual({ member_kind: "annalist" })
+    expect(db.query("SELECT member_name FROM scheduler_wake WHERE id = 'wake-1'").get()).toEqual({ member_name: "alice" })
+    expect(db.query("PRAGMA foreign_key_check").all()).toEqual([])
+    expect(() => db.run("UPDATE team_member SET member_kind = 'other' WHERE name = 'alice'")).toThrow()
+  })
+
   test("creates project table", () => {
     applyMigrations(db)
     const row = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='project'").get()

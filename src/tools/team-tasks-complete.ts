@@ -3,10 +3,12 @@ import { requireTeamMember } from "./shared"
 import { log } from "../log"
 import { invalidateTeamSupervision } from "../supervision-state"
 import { armTeamSupervisionIfQuiescent } from "../supervisor"
+import { immediateTransaction } from "../scheduler"
+import { queuePendingTaskAnnals, recordTaskAnnalInTransaction } from "../annalist"
 
 /**
- * Execute the team_tasks_complete tool. Marks a task as completed
- * and unblocks any dependent tasks.
+ * Execute the team_tasks_complete tool. Marks a task as completed,
+ * records its durable Annalist invocation, and unblocks dependent tasks.
  *
  * Enforces task-board accuracy (issue #27):
  * - Rejects completing an already-completed or cancelled task.
@@ -33,40 +35,47 @@ export async function executeTeamTasksComplete(
   }
 
   const now = Date.now()
-  if (task.assignee) {
-    deps.db.run("UPDATE team_task SET status = 'completed', time_updated = ? WHERE id = ?", [now, args.task_id])
-  } else {
-    // Attribute an unclaimed task to the caller so the board reflects who did it.
-    const result = deps.db.run(
-      "UPDATE team_task SET status = 'completed', assignee = ?, time_updated = ? WHERE id = ? AND assignee IS NULL",
-      [caller, now, args.task_id]
-    )
-    if (result.changes === 0) {
-      throw new Error(`Task "${args.task_id}" was just completed by another teammate`)
+  const unblocked = immediateTransaction(deps.db, () => {
+    if (task.assignee) {
+      deps.db.run("UPDATE team_task SET status = 'completed', time_updated = ? WHERE id = ?", [now, args.task_id])
+    } else {
+      // Attribute an unclaimed task to the caller so the board reflects who did it.
+      const result = deps.db.run(
+        "UPDATE team_task SET status = 'completed', assignee = ?, time_updated = ? WHERE id = ? AND assignee IS NULL",
+        [caller, now, args.task_id]
+      )
+      if (result.changes === 0) {
+        throw new Error(`Task "${args.task_id}" was just completed by another teammate`)
+      }
     }
-  }
 
-  // Unblock dependent tasks
-  const allTasks = deps.db.query("SELECT id, depends_on, status FROM team_task WHERE team_id = ?")
-    .all(teamInfo.teamId) as Array<{ id: string; depends_on: string | null; status: string }>
+    const allTasks = deps.db.query("SELECT id, depends_on, status FROM team_task WHERE team_id = ?")
+      .all(teamInfo.teamId) as Array<{ id: string; depends_on: string | null; status: string }>
+    let unblockedCount = 0
+    for (const t of allTasks) {
+      if (t.status !== "blocked" || !t.depends_on) continue
+      const depIds: string[] = JSON.parse(t.depends_on)
+      if (!depIds.includes(args.task_id)) continue
 
-  let unblocked = 0
-  for (const t of allTasks) {
-    if (t.status !== "blocked" || !t.depends_on) continue
-    const depIds: string[] = JSON.parse(t.depends_on)
-    if (!depIds.includes(args.task_id)) continue
+      const allResolved = depIds.every(depId => {
+        if (depId === args.task_id) return true
+        const dep = allTasks.find(d => d.id === depId)
+        return dep && (dep.status === "completed" || dep.status === "cancelled")
+      })
 
-    const allResolved = depIds.every(depId => {
-      if (depId === args.task_id) return true
-      const dep = allTasks.find(d => d.id === depId)
-      return dep && (dep.status === "completed" || dep.status === "cancelled")
+      if (allResolved) {
+        deps.db.run("UPDATE team_task SET status = 'pending', time_updated = ? WHERE id = ?", [now, t.id])
+        unblockedCount++
+      }
+    }
+    recordTaskAnnalInTransaction(deps.db, {
+      taskId: args.task_id,
+      teamId: teamInfo.teamId,
+      completedBy: caller,
+      completedAt: now,
     })
-
-    if (allResolved) {
-      deps.db.run("UPDATE team_task SET status = 'pending', time_updated = ? WHERE id = ?", [now, t.id])
-      unblocked++
-    }
-  }
+    return unblockedCount
+  })
 
   // Fire progress toast so the lead has visibility
   const counts = deps.db.query(
@@ -87,6 +96,7 @@ export async function executeTeamTasksComplete(
   const unblockedMsg = unblocked > 0 ? ` Unblocked ${unblocked} dependent task${unblocked !== 1 ? "s" : ""}.` : ""
   invalidateTeamSupervision(deps.db, teamInfo.teamId, now)
   armTeamSupervisionIfQuiescent(deps.db, teamInfo.teamId, now)
+  queuePendingTaskAnnals(deps.db, teamInfo.teamId)
   deps.scheduler.kick()
   return `Completed task: ${task.content}${unblockedMsg}`
 }

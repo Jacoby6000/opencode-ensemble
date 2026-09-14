@@ -460,6 +460,119 @@ export const MIGRATIONS: string[] = [
          AND m.member_kind = 'worker' AND m.status IN ('ready', 'busy') AND m.reported_to_lead = 0
      ) THEN RAISE(ABORT, 'group worker recipient is not eligible') END;
    END;`,
+  // Migration 16: Add a hidden Annalist member kind and durable one-per-task annal events.
+  `DROP TRIGGER team_group_insert_guard;
+   DROP TRIGGER team_group_participant_insert_guard;
+   DROP TRIGGER team_group_message_recipient_insert_guard;
+   DROP TRIGGER team_member_group_name_insert_guard;
+   DROP TRIGGER team_member_group_name_update_guard;
+
+   CREATE TABLE team_member_m16 (
+     team_id          TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     name             TEXT NOT NULL,
+     session_id       TEXT NOT NULL,
+     agent            TEXT NOT NULL,
+     status           TEXT NOT NULL DEFAULT 'ready'
+                        CHECK(status IN ('ready', 'busy', 'shutdown_requested', 'shutdown', 'error')),
+     execution_status TEXT NOT NULL DEFAULT 'idle'
+                        CHECK(execution_status IN ('idle', 'starting', 'running',
+                          'cancel_requested', 'cancelling', 'cancelled',
+                          'completing', 'completed', 'failed', 'timed_out')),
+     model            TEXT,
+     prompt           TEXT,
+     time_created     INTEGER NOT NULL,
+     time_updated     INTEGER NOT NULL,
+     worktree_dir     TEXT,
+     worktree_branch  TEXT,
+     plan_approval    TEXT NOT NULL DEFAULT 'none'
+                        CHECK(plan_approval IN ('none', 'pending', 'approved', 'rejected')),
+     workspace_id     TEXT,
+     reported_to_lead INTEGER NOT NULL DEFAULT 0,
+     last_nudged_at   INTEGER,
+     retry_until      INTEGER,
+     retry_attempt    INTEGER,
+     retry_provider   TEXT,
+     retry_message    TEXT,
+     member_kind      TEXT NOT NULL DEFAULT 'worker'
+                        CHECK(member_kind IN ('worker', 'supervisor', 'annalist')),
+     PRIMARY KEY (team_id, name)
+   );
+   INSERT INTO team_member_m16
+     (team_id, name, session_id, agent, status, execution_status, model, prompt,
+      time_created, time_updated, worktree_dir, worktree_branch, plan_approval,
+      workspace_id, reported_to_lead, last_nudged_at, retry_until, retry_attempt,
+      retry_provider, retry_message, member_kind)
+     SELECT team_id, name, session_id, agent, status, execution_status, model, prompt,
+      time_created, time_updated, worktree_dir, worktree_branch, plan_approval,
+      workspace_id, reported_to_lead, last_nudged_at, retry_until, retry_attempt,
+      retry_provider, retry_message, member_kind FROM team_member;
+   DROP TABLE team_member;
+   ALTER TABLE team_member_m16 RENAME TO team_member;
+
+   CREATE INDEX team_member_session_idx ON team_member(session_id);
+   CREATE INDEX team_member_status_idx ON team_member(team_id, status);
+   CREATE UNIQUE INDEX team_member_one_supervisor_idx ON team_member(team_id) WHERE member_kind = 'supervisor';
+   CREATE UNIQUE INDEX team_member_one_annalist_idx ON team_member(team_id) WHERE member_kind = 'annalist';
+
+   CREATE TRIGGER team_member_group_name_insert_guard
+   BEFORE INSERT ON team_member WHEN NEW.member_kind = 'worker' BEGIN
+     SELECT CASE WHEN EXISTS (
+       SELECT 1 FROM team_group WHERE team_id = NEW.team_id AND name = NEW.name
+     ) THEN RAISE(ABORT, 'worker name collides with group') END;
+   END;
+   CREATE TRIGGER team_member_group_name_update_guard
+   BEFORE UPDATE OF name, member_kind ON team_member WHEN NEW.member_kind = 'worker' BEGIN
+     SELECT CASE WHEN EXISTS (
+       SELECT 1 FROM team_group WHERE team_id = NEW.team_id AND name = NEW.name
+     ) THEN RAISE(ABORT, 'worker name collides with group') END;
+   END;
+
+   CREATE TRIGGER team_group_insert_guard
+   BEFORE INSERT ON team_group BEGIN
+     SELECT CASE WHEN length(NEW.name) < 1 OR length(NEW.name) > 64
+       OR NEW.name GLOB '*[^a-z0-9-]*' OR substr(NEW.name, 1, 1) = '-'
+       OR substr(NEW.name, -1, 1) = '-'
+       THEN RAISE(ABORT, 'invalid group name') END;
+     SELECT CASE WHEN NEW.name IN ('lead', 'broadcast', 'all', 'team')
+       THEN RAISE(ABORT, 'reserved group name') END;
+     SELECT CASE WHEN EXISTS (
+       SELECT 1 FROM team_member WHERE team_id = NEW.team_id AND name = NEW.name
+     ) THEN RAISE(ABORT, 'group name collides with worker') END;
+   END;
+   CREATE TRIGGER team_group_participant_insert_guard
+   BEFORE INSERT ON team_group_participant BEGIN
+     SELECT CASE WHEN NOT EXISTS (
+       SELECT 1 FROM team_group g WHERE g.team_id = NEW.team_id AND g.id = NEW.group_id AND g.sealed = 0
+     ) THEN RAISE(ABORT, 'group membership is immutable or belongs to another team') END;
+     SELECT CASE WHEN NEW.participant_name <> 'lead' AND NOT EXISTS (
+       SELECT 1 FROM team_member m WHERE m.team_id = NEW.team_id AND m.name = NEW.participant_name
+         AND m.member_kind = 'worker' AND m.status IN ('ready', 'busy')
+     ) THEN RAISE(ABORT, 'group participant is not an active worker') END;
+   END;
+   CREATE TRIGGER team_group_message_recipient_insert_guard
+   BEFORE INSERT ON team_group_message_recipient BEGIN
+     SELECT CASE WHEN NOT EXISTS (
+       SELECT 1 FROM team_message m
+       JOIN team_group_participant p ON p.team_id = m.team_id AND p.group_id = m.group_id
+       WHERE m.id = NEW.message_id AND m.team_id = NEW.team_id AND m.group_id IS NOT NULL
+         AND p.participant_name = NEW.recipient_name
+     ) THEN RAISE(ABORT, 'group recipient does not match message destination') END;
+     SELECT CASE WHEN (NEW.recipient_kind = 'lead') <> (NEW.recipient_name = 'lead')
+       THEN RAISE(ABORT, 'group recipient kind mismatch') END;
+     SELECT CASE WHEN NEW.recipient_kind = 'worker' AND NOT EXISTS (
+       SELECT 1 FROM team_member m WHERE m.team_id = NEW.team_id AND m.name = NEW.recipient_name
+         AND m.member_kind = 'worker' AND m.status IN ('ready', 'busy') AND m.reported_to_lead = 0
+     ) THEN RAISE(ABORT, 'group worker recipient is not eligible') END;
+   END;
+
+   CREATE TABLE team_task_annal (
+     task_id        TEXT PRIMARY KEY REFERENCES team_task(id) ON DELETE CASCADE,
+     team_id        TEXT NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+     completed_by   TEXT NOT NULL,
+     time_completed INTEGER NOT NULL,
+     wake_id        TEXT REFERENCES scheduler_wake(id) ON DELETE SET NULL
+   );
+   CREATE INDEX team_task_annal_pending_idx ON team_task_annal(team_id, wake_id, time_completed);`,
 ]
 
 /**

@@ -176,7 +176,7 @@ describe("implicit Supervisor", () => {
     await expect(executeTeamCreate(deps, { name: "mandatory" }, "new-lead", {}, async teamId => {
       const result = await provisionSupervisorForTeam(db, deps.client, deps.registry, teamId, DEFAULT_CONFIG.scheduler)
       if (result.status === "capacity_denied") throw new Error(result.reason)
-    })).rejects.toThrow("mandatory Supervisor")
+    })).rejects.toThrow("mandatory internal agents")
     expect(db.query("SELECT COUNT(*) AS count FROM team WHERE name = 'mandatory'").get()).toEqual({ count: 0 })
     expect(db.query("SELECT COUNT(*) AS count FROM scheduler_identity WHERE state IN ('reserved', 'active') AND member_name = ?").get(SUPERVISOR_MEMBER_NAME)).toEqual({ count: 0 })
   })
@@ -195,7 +195,7 @@ describe("implicit Supervisor", () => {
     await expect(executeTeamCreate(deps, { name: "capacity-denied" }, "new-lead", {}, async teamId => {
       const result = await provisionSupervisorForTeam(db, deps.client, deps.registry, teamId, config)
       if (result.status === "capacity_denied") throw new Error(result.reason)
-    })).rejects.toThrow("mandatory Supervisor")
+    })).rejects.toThrow("mandatory internal agents")
     expect(db.query("SELECT COUNT(*) AS count FROM team WHERE name = 'capacity-denied'").get()).toEqual({ count: 0 })
   })
 

@@ -120,7 +120,7 @@ team_merge({ member: "qa" })
 team_spawn({ name: "reviewer", agent: "explore", worktree: false, claim_task: "task_jkl012", prompt: "Review the merged diff for correctness, missed tests, and risky behavior. Do not edit files." })
 ```
 
-The lead runs the repository verification commands, summarizes the result, and only then cleans up the team. All merged teammate changes remain in your working directory as unstaged changes for review with `git diff`.
+The lead runs the repository verification commands, summarizes the result, and only then cleans up the team. All merged teammate changes remain in your working directory as unstaged changes for review with `git diff`. Whenever a shared task is marked complete, Ensemble also invokes a hidden Annalist to preserve durable decisions and outcomes in the repository's `annals/` history.
 
 ## Agent Skill
 
@@ -266,7 +266,7 @@ Archived-team purge is intentionally two-step. First call `team_cleanup` with `p
 |------|-------------|
 | `team_message` | Send a direct message to a teammate or the lead. Also handles plan approval/rejection. |
 | `team_broadcast` | Message everyone, atomically create a named group with immutable participants and its first message, or send to an existing group as a participant. |
-| `team_results` | Retrieve unread ordinary messages, list all team groups, or inspect any group history without changing delivery/read state. |
+| `team_results` | Retrieve unread ordinary messages, list all team groups, or inspect any group history without changing delivery/read state. The hidden Annalist can also inspect any direct or broadcast mailbox non-destructively. |
 
 Named group inboxes are team-scoped routing controls, not private archives. Only participants can send and only active participants receive proactive delivery, while every active ordinary teammate and the lead can inspect group history. The dashboard shows group channels to authenticated users and keeps the composer read-only when the lead is not a participant.
 
@@ -276,7 +276,7 @@ Named group inboxes are team-scoped routing controls, not private archives. Only
 |------|-------------|
 | `team_tasks_list` | See all tasks with status and assignee. |
 | `team_tasks_add` | Add tasks to the shared board. |
-| `team_tasks_complete` | Mark a task done. Unblocks dependents. |
+| `team_tasks_complete` | Mark a task done, unblock dependents, and durably queue its Annalist record. |
 | `team_claim` | Claim a pending task. Atomic, prevents double-claims. |
 
 ## What you see in the TUI
@@ -303,6 +303,7 @@ Teammate messages arrive in the lead's session as `[Team message from alice]: ..
 - **Shell environment**: teammate shells get `ENSEMBLE_TEAM`, `ENSEMBLE_MEMBER`, `ENSEMBLE_ROLE`, and `ENSEMBLE_BRANCH` variables
 - **Sub-agent isolation**: teammates' sub-agents can't use team tools (parent chain tracking, max depth 10)
 - **Crash recovery**: stale busy members marked as errored on restart, orphaned sessions aborted, orphaned worktrees cleaned up, undelivered messages redelivered
+- **Automatic decision history**: one hidden Annalist invocation is durably queued for every completed task. It can inspect all direct, broadcast, and group mailbox history before updating repository annals.
 - **Spawn rollback**: if the initial prompt fails, the member, session, and worktree are all cleaned up
 - **Timeout watchdog**: teammates stuck busy beyond the TTL are automatically timed out and aborted
 - **Stall detection**: detects teammates making no progress (low output tokens or no communication) and escalates to the lead
@@ -418,7 +419,7 @@ All fields are optional. Missing fields use defaults.
 | `timeoutMs` | `1800000` (30 min) | Hard timeout for busy teammates. `0` disables. |
 | `rateLimitCapacity` | `10` | Token bucket capacity for team tool calls. `0` disables. |
 | `dashboard.port` | `4747` | Dashboard server port. `0` disables. The legacy `dashboardPort` alias remains accepted. |
-| `scheduler.identityLimits.global` | `32` | Maximum reserved or active teammate identities across teams. Lead sessions are not counted. |
+| `scheduler.identityLimits.global` | `32` | Maximum reserved or active worker and hidden internal-agent identities across teams. Lead sessions are not counted. |
 | `scheduler.identityLimits.perAgent` | `{}` | Optional per-agent identity limits, for example `{"build": 8}`. |
 | `scheduler.runLimits.global` | `4` | Maximum concurrent teammate runs across teams. |
 | `scheduler.runLimits.perAgent` | `{}` | Optional per-agent concurrent run limits. |

@@ -71,6 +71,7 @@ when running on Bun, `node:sqlite` when running on Node/Electron. Core tables:
 - team — team config (name, lead session, status, delegate mode)
 - team_member — member registry (name, session ID, agent, status)
 - team_task — shared task board (content, status, priority, assignee, deps)
+- team_task_annal — one durable Annalist invocation record per completed task
 - team_message — message log (from, to, content, delivered flag)
 - team_group / team_group_participant — immutable named inboxes and membership
 - scheduler_identity — reserved and active teammate identity capacity
@@ -275,6 +276,12 @@ await deps.client.session.promptAsync({ ... })
 Messages and wakes are persisted atomically before dispatch. If delivery fails,
 the scheduler releases the run lease and requeues the wake with backoff.
 Broadcast delivery is tracked independently per recipient.
+
+## Automatic Annalist
+
+Every team has one hidden `Annalist` session rooted in the active project directory. A successful `team_tasks_complete` transition records a `team_task_annal` row in the same transaction as the task update, then queues a distinct `task_annal` scheduler wake. Pending annal events are re-queued after Annalist provisioning or recovery, so temporary capacity or session loss does not discard a completion.
+
+The Annalist may use only `team_results` among the team tools. It can non-destructively inspect every named group and any direct or broadcast mailbox, including mailboxes it does not own, so repository annals can include cross-agent decision context. It must not mutate team state or send coordination messages. Annalist sessions do not use worktrees because their output belongs directly in the active repository's `annals/` history.
 
 ## Lessons from Anthropic (Applied)
 

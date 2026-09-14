@@ -66,7 +66,7 @@ export async function executeTeamCreate(
       deps.db.run("DELETE FROM team WHERE id = ?", [id])
       deps.registry.unregisterTeam(id)
       const detail = error instanceof Error ? error.message : String(error)
-      throw new Error(`Team "${args.name}" was not created because its mandatory Supervisor could not be provisioned: ${detail}`)
+      throw new Error(`Team "${args.name}" was not created because its mandatory internal agents could not be provisioned: ${detail}`)
     }
   }
 

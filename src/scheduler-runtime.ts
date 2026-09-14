@@ -6,6 +6,7 @@ import { getLeadPromptOptions, getMemberPromptOptions } from "./member-model"
 import { expireStaleRuns, findRunBySession, finishRun, getWakePayload, listReadyWakes, markRunInjected, reconcileExpiredRun, renewRunLease, requeueRun, terminateMemberScheduling, tryAcquireRun } from "./scheduler"
 import type { PluginClient } from "./types"
 import { armTeamSupervisionIfQuiescent, reconcileTeamSupervision, SUPERVISOR_MEMBER_NAME } from "./supervisor"
+import { ANNALIST_MEMBER_NAME } from "./annalist"
 
 type BoundedResult<T> = { state: "fulfilled"; value: T } | { state: "rejected"; error: unknown } | { state: "timed_out" }
 
@@ -54,7 +55,7 @@ export class DurableScheduler implements SchedulerController {
     private readonly config: ResolvedEnsembleConfig["scheduler"],
     private readonly dispatchEnabled = true,
     private readonly projectId?: string,
-    private readonly recoverSupervisors?: () => Promise<void>,
+    private readonly recoverInternalMembers?: () => Promise<void>,
   ) {}
 
   kick(): void {
@@ -94,7 +95,7 @@ export class DurableScheduler implements SchedulerController {
     if (this.maintenanceRunning) return
     this.maintenanceRunning = true
     try {
-      await this.recoverSupervisors?.()
+      await this.recoverInternalMembers?.()
       expireStaleRuns(this.db, Date.now(), this.projectId)
       const sessions = (this.projectId
         ? this.db.query(
@@ -208,16 +209,21 @@ export class DurableScheduler implements SchedulerController {
             team_broadcast: true,
             team_tasks_list: true,
           },
+        } : wake.memberName === ANNALIST_MEMBER_NAME ? {
+          tools: {
+            team_results: true,
+          },
         } : {}),
       }).then(() => {
         markRunInjected(this.db, acquired.leaseId)
       }).catch(err => {
         const message = err instanceof Error ? err.message : String(err)
         log(`scheduler:dispatch:failed wake=${wake.id} member=${wake.memberName} err=${message}`)
-        if (wake.memberName === SUPERVISOR_MEMBER_NAME && isNotFound(err)) {
+        if ((wake.memberName === SUPERVISOR_MEMBER_NAME || wake.memberName === ANNALIST_MEMBER_NAME) && isNotFound(err)) {
+          const memberKind = wake.memberName === SUPERVISOR_MEMBER_NAME ? "supervisor" : "annalist"
           const current = this.db.query(
-            "SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND member_kind = 'supervisor'",
-          ).get(wake.teamId, wake.memberName) as { session_id: string } | undefined
+            "SELECT session_id FROM team_member WHERE team_id = ? AND name = ? AND member_kind = ?",
+          ).get(wake.teamId, wake.memberName, memberKind) as { session_id: string } | undefined
           if (current?.session_id === wake.sessionId) {
             this.db.run(
               "UPDATE team_member SET status = 'error', execution_status = 'failed', time_updated = ? WHERE team_id = ? AND name = ? AND session_id = ?",

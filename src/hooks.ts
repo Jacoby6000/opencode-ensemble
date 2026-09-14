@@ -6,9 +6,20 @@ import { releaseMemberTasks } from "./tasks"
 import { findTeamBySession } from "./types"
 import { SUPERVISOR_MEMBER_NAME } from "./supervisor"
 import { invalidateTeamSupervision } from "./supervision-state"
+import { ANNALIST_MEMBER_NAME } from "./annalist"
 
 const TEAM_TOOL_PREFIX = "team_"
 const SUPERVISOR_TEAM_TOOLS = new Set(["team_status", "team_tasks_list", "team_message", "team_broadcast"])
+const ANNALIST_TEAM_TOOLS = new Set(["team_results"])
+
+function requireInternalToolPermission(memberName: string, toolName: string): void {
+  if (memberName === SUPERVISOR_MEMBER_NAME && !SUPERVISOR_TEAM_TOOLS.has(toolName)) {
+    throw new Error(`Supervisor cannot use ${toolName}; it is restricted to read-only coordination.`)
+  }
+  if (memberName === ANNALIST_MEMBER_NAME && !ANNALIST_TEAM_TOOLS.has(toolName)) {
+    throw new Error(`Annalist cannot use ${toolName}; it is restricted to coordination history inspection.`)
+  }
+}
 
 /**
  * Retry-specific payload carried by a `session.status` event when
@@ -204,18 +215,14 @@ export function checkToolIsolation(
 
   const registered = registry.getBySession(sessionId)
   if (registered) {
-    if (registered.memberName !== SUPERVISOR_MEMBER_NAME) return
-    if (!SUPERVISOR_TEAM_TOOLS.has(toolName)) {
-      throw new Error(`Supervisor cannot use ${toolName}; it is restricted to read-only coordination.`)
-    }
+    requireInternalToolPermission(registered.memberName, toolName)
     return
   }
 
   if (db) {
     const member = db.query("SELECT member_kind FROM team_member WHERE session_id = ?").get(sessionId) as { member_kind: string } | null
-    if (member?.member_kind === "supervisor" && !SUPERVISOR_TEAM_TOOLS.has(toolName)) {
-      throw new Error(`Supervisor cannot use ${toolName}; it is restricted to read-only coordination.`)
-    }
+    if (member?.member_kind === "supervisor") requireInternalToolPermission(SUPERVISOR_MEMBER_NAME, toolName)
+    if (member?.member_kind === "annalist") requireInternalToolPermission(ANNALIST_MEMBER_NAME, toolName)
   }
 
   // Fast path: registry hit on the caller — skip SQL altogether.
@@ -287,7 +294,7 @@ export function handleSessionErrorEvent(
   // scenario — see findTeamBySession in src/types.ts).
   const teamInfo = findTeamBySession(db, registry, sessionId)
   if (!teamInfo || teamInfo.role !== "member" || !teamInfo.memberName) return
-  if (teamInfo.memberName === SUPERVISOR_MEMBER_NAME) return
+  if (teamInfo.memberName === SUPERVISOR_MEMBER_NAME || teamInfo.memberName === ANNALIST_MEMBER_NAME) return
 
   const errMsg = error?.data?.message ?? error?.name ?? "unknown error"
   notifyLead(

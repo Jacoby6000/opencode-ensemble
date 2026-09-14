@@ -42,6 +42,7 @@ import { DurableScheduler } from "./scheduler-runtime"
 import { getLeadPromptOptions } from "./member-model"
 import type { MemberPromptOptions } from "./member-model"
 import { provisionSupervisorForTeam, reconcileSupervisors, recordWorkerQuiescenceEvent, SUPERVISOR_AGENT, SUPERVISOR_MEMBER_NAME } from "./supervisor"
+import { ANNALIST_AGENT, ANNALIST_MEMBER_NAME, provisionAnnalistForTeam, reconcileAnnalists } from "./annalist"
 
 const DEFAULT_RATE_LIMIT_REFILL = 2
 const DEFAULT_RATE_LIMIT_INTERVAL_MS = 1000
@@ -111,10 +112,11 @@ const plugin: Plugin = async (input) => {
   initLog(rawClient)
   const client = wrapThrowingClient(rawClient)
   const mainInstance = !isWorktreeInstance(input.directory)
-  let supervisorRecoveryEnabled = false
+  let internalRecoveryEnabled = false
   const scheduler = new DurableScheduler(db, client, config.scheduler, mainInstance, input.directory, async () => {
-    if (!supervisorRecoveryEnabled) return
+    if (!internalRecoveryEnabled) return
     await reconcileSupervisors(db, client, registry, input.directory, config.scheduler)
+    await reconcileAnnalists(db, client, registry, input.directory, config.scheduler)
   })
   const deps: ToolDeps = { db, registry, tracker, purgeApprovals, client, directory: input.directory, config, progressTracker, scheduler }
 
@@ -149,13 +151,17 @@ const plugin: Plugin = async (input) => {
     }).catch((err) => {
       log(`init:recover-orphaned-teams:failed err=${err instanceof Error ? err.message : String(err)}`)
     }).then(() => {
-      supervisorRecoveryEnabled = true
-      return reconcileSupervisors(db, client, registry, input.directory, config.scheduler)
-    }).then(count => {
-      if (count > 0) log(`init:supervisors:provisioned=${count}`)
+      internalRecoveryEnabled = true
+      return Promise.all([
+        reconcileSupervisors(db, client, registry, input.directory, config.scheduler),
+        reconcileAnnalists(db, client, registry, input.directory, config.scheduler),
+      ])
+    }).then(([supervisors, annalists]) => {
+      if (supervisors > 0) log(`init:supervisors:provisioned=${supervisors}`)
+      if (annalists > 0) log(`init:annalists:provisioned=${annalists}`)
       scheduler.kick()
     }).catch(err => {
-      log(`init:supervisors:failed err=${err instanceof Error ? err.message : String(err)}`)
+      log(`init:internal-agents:failed err=${err instanceof Error ? err.message : String(err)}`)
     })
 
     scheduler.recover().then(() => recoverStaleMembers(db, client, input.directory)).then((recovery) => {
@@ -224,6 +230,12 @@ const plugin: Plugin = async (input) => {
         description: "Internal read-only Ensemble team supervisor",
         prompt: "Review immutable team snapshots only. Never mutate tasks or use lifecycle tools. Broadcast at most once when specific ownership assignments are needed; otherwise remain silent.",
         permission: SUPERVISOR_AGENT_PERMISSION,
+      }
+      config.agent[ANNALIST_AGENT] ??= {
+        mode: "subagent",
+        hidden: true,
+        description: "Internal Ensemble task decision historian",
+        prompt: "Preserve dated, Git-pinned decision history for each completed task. Inspect relevant team mailbox and group history before writing repository annals. Never mutate team coordination state.",
       }
     },
 
@@ -462,6 +474,8 @@ const plugin: Plugin = async (input) => {
         ? buildLeadSystemPrompt(db, teamInfo.teamId, config)
         : teamInfo.memberName === SUPERVISOR_MEMBER_NAME
           ? "You are the hidden read-only Supervisor. Follow only the current generation-fenced review prompt; do not mutate tasks or use lifecycle tools."
+          : teamInfo.memberName === ANNALIST_MEMBER_NAME
+            ? "You are the hidden Annalist. For each task-completion prompt, inspect relevant direct and group mailbox history with team_results, then preserve durable repository decision history. Do not mutate team state."
           : buildTeammateSystemPrompt(db, teamInfo.teamId, teamInfo.memberName ?? "unknown")
       log(`system-prompt:injected role=${teamInfo.role} len=${prompt.length}`)
       output.system.push(prompt)
@@ -473,7 +487,9 @@ const plugin: Plugin = async (input) => {
       if (!teamInfo) return
       const context = teamInfo.memberName === SUPERVISOR_MEMBER_NAME
         ? "[Supervisor Context] Remain read-only. Follow only the current generation-fenced review and broadcast at most once."
-        : buildTeamCompactionContext(db, teamInfo.teamId, teamInfo.role, teamInfo.memberName)
+        : teamInfo.memberName === ANNALIST_MEMBER_NAME
+          ? "[Annalist Context] Inspect relevant mailbox history with team_results and preserve the current completed task's durable decision record in repository annals. Never mutate team state."
+          : buildTeamCompactionContext(db, teamInfo.teamId, teamInfo.role, teamInfo.memberName)
       output.context.push(context)
     },
 
@@ -513,6 +529,21 @@ const plugin: Plugin = async (input) => {
             const provisioned = await provisionSupervisorForTeam(db, client, registry, teamId, config.scheduler)
             if (provisioned.status === "capacity_denied") {
               throw new Error(`identity capacity denied (${provisioned.reason})`)
+            }
+            try {
+              const annalist = await provisionAnnalistForTeam(db, client, registry, teamId, config.scheduler)
+              if (annalist.status === "capacity_denied") {
+                throw new Error(`Annalist identity capacity denied (${annalist.reason})`)
+              }
+            } catch (error) {
+              const supervisor = db.query(
+                "SELECT name, session_id FROM team_member WHERE team_id = ? AND member_kind = 'supervisor' AND status NOT IN ('shutdown', 'error')",
+              ).get(teamId) as { name: string; session_id: string } | undefined
+              if (supervisor) {
+                scheduler.terminateMember(teamId, supervisor.name, "team provisioning rollback")
+                await client.session.abort({ sessionID: supervisor.session_id }).catch(() => {})
+              }
+              throw error
             }
           })
           scheduler.kick()
@@ -639,12 +670,13 @@ const plugin: Plugin = async (input) => {
       }),
 
       team_results: tool({
-        description: "Retrieve unread ordinary messages, list all group inboxes, or inspect group history without changing group delivery/read state.",
+        description: "Retrieve unread ordinary messages, list all group inboxes, or inspect history without changing group delivery/read state. The hidden Annalist may inspect any direct mailbox.",
         args: {
           from: tool.schema.string().optional().describe("Filter messages by sender name (optional, returns all if omitted)"),
           list_groups: tool.schema.boolean().optional().describe("List every group inbox in the team"),
           group: tool.schema.string().optional().describe("Inspect newest-first history for one group as a participant or observer"),
-          limit: tool.schema.number().int().min(1).max(50).optional().describe("Group history limit (default 20, maximum 50)"),
+          mailbox: tool.schema.string().optional().describe("Annalist only: inspect newest-first direct history involving this mailbox, or 'broadcast'"),
+          limit: tool.schema.number().int().min(1).max(50).optional().describe("Group or mailbox history limit (default 20, maximum 50)"),
         },
         async execute(args, ctx) {
           const result = await executeTeamResults(deps, args, ctx.sessionID)
