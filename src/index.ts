@@ -172,7 +172,7 @@ const plugin: Plugin = async (input) => {
     }).catch((err) => {
       log(`init:scheduler-recovery:failed err=${err instanceof Error ? err.message : String(err)}`)
     })
-    recoverOrphanedWorktrees(db, client).catch((err) => {
+    recoverOrphanedWorktrees(db, client, input.directory).catch((err) => {
       log(`init:recover-worktrees:failed err=${err instanceof Error ? err.message : String(err)}`)
     })
     recoverOrphanedBranches(db, input.directory).catch((err) => {
@@ -338,20 +338,28 @@ const plugin: Plugin = async (input) => {
             // Branch should already be preserved by the graceful shutdown path,
             // but verify and re-preserve if needed
             const member = deps.db.query(
-              "SELECT worktree_branch, name, team_id FROM team_member WHERE session_id = ?"
-            ).get(sessionID) as { worktree_branch: string | null; name: string; team_id: string } | null
-            if (member?.worktree_branch && !member.worktree_branch.startsWith("ensemble/preserved/")) {
+              "SELECT worktree_branch, worktree_dir, name, team_id FROM team_member WHERE session_id = ?"
+            ).get(sessionID) as { worktree_branch: string | null; worktree_dir: string | null; name: string; team_id: string } | null
+            let progressPreserved = !member?.worktree_branch && !member?.worktree_dir
+            if (member && (member.worktree_branch || member.worktree_dir)) {
               const { getTeamResourceParts, preserveBranch: preserve, preservedBranchName: branchName } = await import("./tools/merge-helper")
               const resource = getTeamResourceParts(deps.db, member.team_id)
-              const safeBranch = branchName(resource.projectName, resource.teamName, resource.teamId, member.name)
-              const ok = await preserve(member.worktree_branch, safeBranch, deps.directory)
+              const safeBranch = member.worktree_branch?.startsWith("ensemble/preserved/")
+                ? member.worktree_branch
+                : branchName(resource.projectName, resource.teamName, resource.teamId, member.name)
+              const ok = await preserve(member.worktree_branch ?? "HEAD", safeBranch, deps.directory, member.worktree_dir)
               if (ok) {
                 deps.db.run("UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
                   [safeBranch, member.team_id, member.name])
                 log(`busy_while_shutdown:branch:preserved src=${member.worktree_branch} target=${safeBranch}`)
+                progressPreserved = true
               }
             }
             try {
+              if (!progressPreserved) {
+                log(`busy_while_shutdown:abort-skipped session=${sessionID} reason=progress-preservation-failed`)
+                return
+              }
               scheduler.terminateMember(member?.team_id ?? transition.teamId, member?.name ?? transition.memberName, "shutdown re-abort")
               await client.session.abort({ sessionID })
             } catch { /* best effort */ }

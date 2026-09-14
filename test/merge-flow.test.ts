@@ -12,6 +12,7 @@ import { spawnFailures } from "../src/tools/team-spawn"
 type Deps = ReturnType<typeof setupDeps>
 
 const noopPreserve: PreserveBranchFn = async () => true
+const cleanWorktree = async () => false
 const noopMerge: MergeBranchFn = async () => ({ ok: true })
 const noopDelete: DeleteBranchFn = async () => true
 const noopOverlap: OverlapCheckFn = async () => []
@@ -73,20 +74,20 @@ describe("branch preservation", () => {
     expect(after.status).toBe("shutdown")
   })
 
-  test("shutdown still completes if preserve fails", async () => {
+  test("shutdown fails closed if preserve fails", async () => {
     await executeTeamCreate(deps, { name: "fail-preserve" }, lead)
     await executeTeamSpawn(deps, { name: "bob", agent: "build", prompt: "task" }, lead)
 
     const failPreserve: PreserveBranchFn = async () => false
 
-    // Should not throw — preserve failure is logged but shutdown continues
-    const result = await executeTeamShutdown(deps, { member: "bob" }, lead, undefined, failPreserve)
-    expect(result).toContain("shut down")
+    await expect(executeTeamShutdown(deps, { member: "bob" }, lead, undefined, failPreserve))
+      .rejects.toThrow("failed to durably preserve")
 
-    // Member is shutdown but branch was NOT updated (preserve failed)
+    // The destructive shutdown is not allowed to proceed without a durable copy.
     const after = deps.db.query("SELECT status FROM team_member WHERE name = 'bob'")
       .get() as { status: string }
-    expect(after.status).toBe("shutdown")
+    expect(after.status).toBe("ready")
+    expect(deps.client.calls.filter(call => call.method === "session.abort")).toHaveLength(0)
   })
 
   test("shutdown without worktree branch skips preservation", async () => {
@@ -443,7 +444,7 @@ describe("cleanup safety net for unmerged branches", () => {
       return { ok: true }
     }
 
-    const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, trackMerge, noopDelete, true, noopOverlap)
+    const result = await executeTeamCleanup(deps, { force: false }, lead, cleanWorktree, trackMerge, noopDelete, true, noopOverlap, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("Safety-net merged")
     expect(mergedBranches).toHaveLength(1)
     expect(mergedBranches[0]).toBe(preservedFor(deps, "safety-net", "alice"))
@@ -464,7 +465,7 @@ describe("cleanup safety net for unmerged branches", () => {
       return { ok: true }
     }
 
-    const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, trackMerge, noopDelete, true, noopOverlap)
+    const result = await executeTeamCleanup(deps, { force: false }, lead, cleanWorktree, trackMerge, noopDelete, true, noopOverlap, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("cleaned up")
     expect(result).not.toContain("Safety-net")
     expect(mergeCalled).toBe(false)
@@ -475,7 +476,7 @@ describe("cleanup safety net for unmerged branches", () => {
     await executeTeamSpawn(deps, { name: "alice", agent: "build", prompt: "task" }, lead)
     await executeTeamShutdown(deps, { member: "alice" }, lead, undefined, noopPreserve)
 
-    const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, failMerge, noopDelete, true, noopOverlap)
+    const result = await executeTeamCleanup(deps, { force: false }, lead, cleanWorktree, failMerge, noopDelete, true, noopOverlap, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("Could not auto-merge")
   })
 
@@ -490,7 +491,7 @@ describe("cleanup safety net for unmerged branches", () => {
       return { ok: true }
     }
 
-    await executeTeamCleanup(deps, { force: false }, lead, undefined, trackMerge, noopDelete, false, noopOverlap)
+    await executeTeamCleanup(deps, { force: false }, lead, cleanWorktree, trackMerge, noopDelete, false, noopOverlap, undefined, undefined, undefined, noopPreserve)
     expect(mergeCalled).toBe(false)
   })
 
@@ -510,7 +511,7 @@ describe("cleanup safety net for unmerged branches", () => {
       return { ok: true }
     }
 
-    const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, trackMerge, noopDelete, true, noopOverlap)
+    const result = await executeTeamCleanup(deps, { force: false }, lead, cleanWorktree, trackMerge, noopDelete, true, noopOverlap, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("Safety-net merged 1 unmerged branch")
     expect(mergedBranches).toHaveLength(1)
     expect(mergedBranches[0]).toBe(preservedFor(deps, "mixed-merge", "bob"))
@@ -523,7 +524,7 @@ describe("cleanup safety net for unmerged branches", () => {
 
     const overlapFiles: OverlapCheckFn = async () => ["config.py", "conftest.py"]
 
-    const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, noopMerge, noopDelete, true, overlapFiles)
+    const result = await executeTeamCleanup(deps, { force: false }, lead, cleanWorktree, noopMerge, noopDelete, true, overlapFiles, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("config.py")
     expect(result).toContain("overlap")
   })
@@ -577,7 +578,7 @@ describe("full merge lifecycle", () => {
       return { ok: true }
     }
 
-    const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, trackMerge, noopDelete, true, noopOverlap)
+    const result = await executeTeamCleanup(deps, { force: false }, lead, cleanWorktree, trackMerge, noopDelete, true, noopOverlap, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("cleaned up")
     expect(result).not.toContain("Safety-net")
     expect(mergeCalled).toBe(false)

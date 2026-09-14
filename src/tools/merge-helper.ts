@@ -1,6 +1,9 @@
 import type { Database } from "../db"
 import { log } from "../log"
 import { runCommand } from "../process"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 
 /** Result of merging a single branch. */
 export interface MergeResult {
@@ -15,7 +18,7 @@ export type MergeBranchFn = (branch: string, cwd: string) => Promise<MergeResult
 export type OverlapCheckFn = (branch: string, cwd: string) => Promise<string[]>
 
 /** Injectable function for preserving a branch before worktree deletion. */
-export type PreserveBranchFn = (sourceBranch: string, targetBranch: string, cwd: string) => Promise<boolean>
+export type PreserveBranchFn = (sourceBranch: string, targetBranch: string, cwd: string, worktreeDir?: string | null) => Promise<boolean>
 
 /** Injectable function for deleting a branch. */
 export type DeleteBranchFn = (branch: string, cwd: string) => Promise<boolean>
@@ -64,17 +67,83 @@ export function teamWorktreeName(projectName: string, teamName: string, teamId: 
 }
 
 /**
- * Copy a git branch to a new ref. Used to preserve worktree branches
- * before session.abort() which may delete the worktree and its branch.
- * Returns true if the branch was successfully copied.
+ * Snapshot a worktree to a standalone ref before destructive cleanup.
+ * Dirty snapshots include staged, unstaged, and non-ignored untracked content.
+ * Existing preserved refs are refreshed rather than treated as success.
  */
-export async function preserveBranch(sourceBranch: string, targetBranch: string, cwd: string): Promise<boolean> {
-  const result = await runCommand(["git", "branch", targetBranch, sourceBranch], { cwd })
-  if (result.exitCode !== 0) {
-    log(`merge-helper:preserve:failed src=${sourceBranch} target=${targetBranch} err=${result.stderr.trim()}`)
+export async function preserveBranch(sourceBranch: string, targetBranch: string, cwd: string, worktreeDir?: string | null): Promise<boolean> {
+  let temporaryDirectory: string | undefined
+  try {
+    const source = worktreeDir
+      ? await runCommand(["git", "-C", worktreeDir, "rev-parse", "HEAD^{commit}"], { cwd })
+      : await runCommand(["git", "rev-parse", `${sourceBranch}^{commit}`], { cwd })
+    if (source.exitCode !== 0) throw new Error(source.stderr.trim() || "source commit is unavailable")
+    const sourceCommit = source.stdout.trim()
+    let preservedCommit = sourceCommit
+
+    if (worktreeDir) {
+      const status = await runCommand(["git", "-C", worktreeDir, "status", "--porcelain=v1", "--untracked-files=all"], { cwd })
+      if (status.exitCode !== 0) throw new Error(status.stderr.trim() || "worktree status failed")
+      if (status.stdout.trim()) {
+        const sourceTree = await runCommand(["git", "rev-parse", `${sourceCommit}^{tree}`], { cwd })
+        if (sourceTree.exitCode !== 0) throw new Error(sourceTree.stderr.trim() || "source tree lookup failed")
+        const stagedTree = await runCommand(["git", "-C", worktreeDir, "write-tree"], { cwd })
+        if (stagedTree.exitCode !== 0) throw new Error(stagedTree.stderr.trim() || "staged tree snapshot failed")
+        if (stagedTree.stdout.trim() !== sourceTree.stdout.trim()) {
+          const stagedCommit = await createSnapshotCommit(worktreeDir, stagedTree.stdout.trim(), sourceCommit, `${targetBranch} staged state`, cwd)
+          preservedCommit = stagedCommit
+        }
+
+        temporaryDirectory = await mkdtemp(path.join(tmpdir(), "ensemble-preserve-"))
+        const env = { ...process.env, GIT_INDEX_FILE: path.join(temporaryDirectory, "index") }
+        const readTree = await runCommand(["git", "-C", worktreeDir, "read-tree", preservedCommit], { cwd, env })
+        if (readTree.exitCode !== 0) throw new Error(readTree.stderr.trim() || "temporary index initialization failed")
+        const add = await runCommand(["git", "-C", worktreeDir, "add", "-A", "--", "."], { cwd, env })
+        if (add.exitCode !== 0) throw new Error(add.stderr.trim() || "worktree snapshot staging failed")
+        const tree = await runCommand(["git", "-C", worktreeDir, "write-tree"], { cwd, env })
+        if (tree.exitCode !== 0) throw new Error(tree.stderr.trim() || "worktree snapshot tree failed")
+        if (tree.stdout.trim() !== stagedTree.stdout.trim()) {
+          preservedCommit = await createSnapshotCommit(worktreeDir, tree.stdout.trim(), preservedCommit, `${targetBranch} worktree state`, cwd, env)
+        }
+      }
+    }
+
+    const update = await runCommand(["git", "update-ref", `refs/heads/${targetBranch}`, preservedCommit], { cwd })
+    if (update.exitCode !== 0) throw new Error(update.stderr.trim() || "preserved ref update failed")
+    const verify = await runCommand(["git", "rev-parse", `${targetBranch}^{commit}`], { cwd })
+    if (verify.exitCode !== 0 || verify.stdout.trim() !== preservedCommit) throw new Error("preserved ref verification failed")
+    return true
+  } catch (error) {
+    log(`merge-helper:preserve:failed src=${sourceBranch} target=${targetBranch} err=${error instanceof Error ? error.message : String(error)}`)
     return false
+  } finally {
+    if (temporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true })
   }
-  return true
+}
+
+async function createSnapshotCommit(
+  worktreeDir: string,
+  tree: string,
+  parent: string,
+  description: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  const commit = await runCommand(
+    ["git", "-C", worktreeDir, "commit-tree", tree, "-p", parent, "-m", `Preserve ${description}`],
+    {
+      cwd,
+      env: {
+        ...env,
+        GIT_AUTHOR_NAME: "OpenCode Ensemble",
+        GIT_AUTHOR_EMAIL: "ensemble@localhost",
+        GIT_COMMITTER_NAME: "OpenCode Ensemble",
+        GIT_COMMITTER_EMAIL: "ensemble@localhost",
+      },
+    },
+  )
+  if (commit.exitCode !== 0) throw new Error(commit.stderr.trim() || "worktree snapshot commit failed")
+  return commit.stdout.trim()
 }
 
 /**

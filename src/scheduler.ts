@@ -108,6 +108,7 @@ export interface SchedulerRun {
   sessionId: string
   state: "active" | "expired"
   injectedAt: number | null
+  startedAt: number | null
   expiresAt: number
 }
 
@@ -133,11 +134,11 @@ export function getWakePayload(_db: Database, _wakeId: string): WakePayload | un
 export function findRunBySession(_db: Database, _sessionId: string, projectId?: string): SchedulerRun | undefined {
   const run = (projectId
     ? _db.query(
-      "SELECT l.id, l.wake_id, l.team_id, l.member_name, l.session_id, l.state, l.injected_at, l.expires_at FROM scheduler_run_lease l JOIN team t ON t.id = l.team_id WHERE l.session_id = ? AND t.project_id = ? AND l.state IN ('active', 'expired') ORDER BY l.acquired_at DESC LIMIT 1",
+      "SELECT l.id, l.wake_id, l.team_id, l.member_name, l.session_id, l.state, l.injected_at, l.started_at, l.expires_at FROM scheduler_run_lease l JOIN team t ON t.id = l.team_id WHERE l.session_id = ? AND t.project_id = ? AND l.state IN ('active', 'expired') ORDER BY l.acquired_at DESC LIMIT 1",
     ).get(_sessionId, projectId)
     : _db.query(
-      "SELECT id, wake_id, team_id, member_name, session_id, state, injected_at, expires_at FROM scheduler_run_lease WHERE session_id = ? AND state IN ('active', 'expired') ORDER BY acquired_at DESC LIMIT 1",
-    ).get(_sessionId)) as { id: string; wake_id: string; team_id: string; member_name: string; session_id: string; state: "active" | "expired"; injected_at: number | null; expires_at: number } | undefined
+      "SELECT id, wake_id, team_id, member_name, session_id, state, injected_at, started_at, expires_at FROM scheduler_run_lease WHERE session_id = ? AND state IN ('active', 'expired') ORDER BY acquired_at DESC LIMIT 1",
+    ).get(_sessionId)) as { id: string; wake_id: string; team_id: string; member_name: string; session_id: string; state: "active" | "expired"; injected_at: number | null; started_at: number | null; expires_at: number } | undefined
   if (!run) return undefined
   return {
     leaseId: run.id,
@@ -147,6 +148,7 @@ export function findRunBySession(_db: Database, _sessionId: string, projectId?: 
     sessionId: run.session_id,
     state: run.state,
     injectedAt: run.injected_at,
+    startedAt: run.started_at,
     expiresAt: run.expires_at,
   }
 }
@@ -243,6 +245,23 @@ export function markRunInjected(db: Database, leaseId: string, now = Date.now())
     db.run("UPDATE scheduler_run_lease SET injected_at = COALESCE(injected_at, ?) WHERE id = ? AND state = 'active'", [now, leaseId])
     setWakeMessageState(db, lease.wake_id, "injected")
     recordEvent(db, { teamId: lease.team_id, memberName: lease.member_name, wakeId: lease.wake_id, leaseId, type: "run_injected", now })
+    return true
+  })
+}
+
+/** Persist external evidence that the injected run actually began executing. */
+export function markRunStarted(db: Database, leaseId: string, now = Date.now()): boolean {
+  return immediateTransaction(db, () => {
+    const lease = db.query(
+      "SELECT wake_id, team_id, member_name FROM scheduler_run_lease WHERE id = ? AND state = 'active' AND expires_at > ?",
+    ).get(leaseId, now) as { wake_id: string; team_id: string; member_name: string } | undefined
+    if (!lease) return false
+    db.run(
+      "UPDATE scheduler_run_lease SET injected_at = COALESCE(injected_at, ?), started_at = COALESCE(started_at, ?) WHERE id = ? AND state = 'active'",
+      [now, now, leaseId],
+    )
+    setWakeMessageState(db, lease.wake_id, "injected")
+    recordEvent(db, { teamId: lease.team_id, memberName: lease.member_name, wakeId: lease.wake_id, leaseId, type: "run_started", now })
     return true
   })
 }

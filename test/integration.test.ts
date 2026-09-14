@@ -5,13 +5,14 @@ import { executeTeamSpawn } from "../src/tools/team-spawn"
 import { executeTeamMessage } from "../src/tools/team-message"
 import { executeTeamShutdown } from "../src/tools/team-shutdown"
 import { executeTeamCleanup } from "../src/tools/team-cleanup"
-import type { MergeBranchFn, DeleteBranchFn } from "../src/tools/merge-helper"
+import type { MergeBranchFn, DeleteBranchFn, PreserveBranchFn } from "../src/tools/merge-helper"
 import { buildLeadSystemPrompt } from "../src/system-prompt"
 import { recoverStaleMembers } from "../src/recovery"
 import { isWorktreeInstance } from "../src/util"
 import type { ToolDeps } from "../src/types"
 
 type Deps = ReturnType<typeof setupDeps>
+const noopPreserve: PreserveBranchFn = async () => true
 
 describe("integration: full team lifecycle", () => {
   let deps: Deps
@@ -83,7 +84,7 @@ describe("integration: full team lifecycle", () => {
     }
     const noopMerge: MergeBranchFn = async () => ({ ok: true })
     const noopDelete: DeleteBranchFn = async () => true
-    const cleanupResult = await executeTeamCleanup(deps, { force: false }, leadSession, undefined, noopMerge, noopDelete, false)
+    const cleanupResult = await executeTeamCleanup(deps, { force: false }, leadSession, undefined, noopMerge, noopDelete, false, undefined, undefined, undefined, undefined, noopPreserve)
     expect(cleanupResult).toContain("cleaned up")
 
     // Verify: team archived, no active members

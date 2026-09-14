@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { applyMigrations } from "../src/schema"
-import { recoverStaleMembers, recoverUndeliveredMessages, rehydrateRegistry, recoverOrphanedTeams, isSessionAlive } from "../src/recovery"
+import { recoverStaleMembers, recoverUndeliveredMessages, rehydrateRegistry, recoverOrphanedTeams, recoverOrphanedWorktrees, isSessionAlive } from "../src/recovery"
 import type { PluginClient } from "../src/types"
 import { MemberRegistry } from "../src/state"
 import { sendMessage, broadcastMessage } from "../src/messaging"
@@ -618,7 +618,7 @@ describe("recoverOrphanedWorktrees", () => {
     }
 
     const { recoverOrphanedWorktrees } = await import("../src/recovery")
-    const result = await recoverOrphanedWorktrees(db, client)
+    const result = await recoverOrphanedWorktrees(db, client, "/tmp/test-project", async () => true)
     expect(result.removed).toBe(1)
 
     const removeCalls = client.calls.filter(c => c.method === "worktree.remove")
@@ -637,7 +637,7 @@ describe("recoverOrphanedWorktrees", () => {
     }
 
     const { recoverOrphanedWorktrees } = await import("../src/recovery")
-    const result = await recoverOrphanedWorktrees(db, client)
+    const result = await recoverOrphanedWorktrees(db, client, "/tmp/test-project", async () => true)
     expect(result.removed).toBe(0)
   })
 
@@ -650,7 +650,7 @@ describe("recoverOrphanedWorktrees", () => {
     }
 
     const { recoverOrphanedWorktrees } = await import("../src/recovery")
-    const result = await recoverOrphanedWorktrees(db, client)
+    const result = await recoverOrphanedWorktrees(db, client, "/tmp/test-project", async () => true)
     expect(result.removed).toBe(0)
   })
 
@@ -678,8 +678,39 @@ describe("recoverOrphanedWorktrees", () => {
     }
 
     const { recoverOrphanedWorktrees } = await import("../src/recovery")
-    const result = await recoverOrphanedWorktrees(db, client)
+    const result = await recoverOrphanedWorktrees(db, client, "/tmp/test-project", async () => true)
     expect(result.removed).toBe(1) // second one succeeded
+  })
+
+  test("snapshots a dirty orphaned worktree before requesting removal", async () => {
+    const repo = await mkdtemp(path.join(tmpdir(), "ensemble-orphan-worktree-"))
+    const worktree = path.join(repo, "worker")
+    try {
+      await git(repo, ["init"])
+      await git(repo, ["config", "user.email", "test@example.com"])
+      await git(repo, ["config", "user.name", "Test User"])
+      await Bun.write(path.join(repo, "base.txt"), "base\n")
+      await git(repo, ["add", "base.txt"])
+      await git(repo, ["commit", "-m", "base"])
+      await git(repo, ["worktree", "add", "-b", "ensemble-orphan", worktree])
+      await Bun.write(path.join(worktree, "progress.txt"), "preserved\n")
+      client.worktree.list = async () => ({ data: [{ name: "ensemble-orphan", branch: "ensemble-orphan", directory: worktree }] })
+
+      const result = await recoverOrphanedWorktrees(db, client, repo)
+
+      expect(result.removed).toBe(1)
+      expect(await git(repo, ["show", "ensemble/preserved/recovered/ensemble-orphan:progress.txt"])).toBe("preserved\n")
+      expect(client.calls.filter(call => call.method === "worktree.remove")).toHaveLength(1)
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  test("does not remove an orphaned worktree when durable preservation fails", async () => {
+    client.worktree.list = async () => ({ data: [{ name: "ensemble-orphan", branch: "ensemble-orphan", directory: "/tmp/missing" }] })
+
+    expect(await recoverOrphanedWorktrees(db, client, "/tmp/test-project", async () => false)).toEqual({ removed: 0 })
+    expect(client.calls.filter(call => call.method === "worktree.remove")).toHaveLength(0)
   })
 })
 

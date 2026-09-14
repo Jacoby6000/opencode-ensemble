@@ -573,6 +573,8 @@ export const MIGRATIONS: string[] = [
      wake_id        TEXT REFERENCES scheduler_wake(id) ON DELETE SET NULL
    );
    CREATE INDEX team_task_annal_pending_idx ON team_task_annal(team_id, wake_id, time_completed);`,
+  // Migration 17: Distinguish accepted prompt injection from observed execution.
+  `ALTER TABLE scheduler_run_lease ADD COLUMN started_at INTEGER;`,
 ]
 
 /**

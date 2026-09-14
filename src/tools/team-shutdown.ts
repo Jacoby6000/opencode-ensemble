@@ -32,7 +32,7 @@ export async function executeTeamShutdown(
 
   // Second call on an already-requested member → force abort
   if (member.status === "shutdown_requested") {
-    await preserveAndAbort(deps, teamInfo.teamId, args.member, member.session_id, member.worktree_branch, preserve)
+    await preserveAndAbort(deps, teamInfo.teamId, args.member, member.session_id, member.worktree_branch, member.worktree_dir, preserve)
     const status = await getBranchStatus(deps, teamInfo.teamId, args.member, member.worktree_dir, isDirty, commitCount)
     return `Force shut down "${args.member}".${status}`
   }
@@ -48,7 +48,7 @@ export async function executeTeamShutdown(
   }
 
   if (isIdle || force) {
-    await preserveAndAbort(deps, teamInfo.teamId, args.member, member.session_id, member.worktree_branch, preserve)
+    await preserveAndAbort(deps, teamInfo.teamId, args.member, member.session_id, member.worktree_branch, member.worktree_dir, preserve)
     const status = await getBranchStatus(deps, teamInfo.teamId, args.member, member.worktree_dir, isDirty, commitCount)
     return `Teammate "${args.member}" has been shut down.${status}`
   }
@@ -56,18 +56,7 @@ export async function executeTeamShutdown(
   // Busy + not force → graceful: preserve branch first, then send shutdown message
   // Branch must be preserved NOW — if the session crashes during shutdown_requested,
   // the worktree and branch could be lost before force-abort ever runs.
-  if (member.worktree_branch) {
-    const resource = getTeamResourceParts(deps.db, teamInfo.teamId)
-    const safeBranch = preservedBranchName(resource.projectName, resource.teamName, resource.teamId, args.member)
-    const ok = await preserve(member.worktree_branch, safeBranch, deps.directory)
-    if (ok) {
-      deps.db.run(
-        "UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
-        [safeBranch, teamInfo.teamId, args.member],
-      )
-      log(`shutdown:branch:preserved-graceful src=${member.worktree_branch} target=${safeBranch}`)
-    }
-  }
+  await preserveMemberProgress(deps, teamInfo.teamId, args.member, member.worktree_branch, member.worktree_dir, preserve, "graceful")
 
   try {
     deps.client.session.promptAsync({
@@ -101,23 +90,10 @@ async function preserveAndAbort(
   memberName: string,
   sessionId: string,
   worktreeBranch: string | null,
+  worktreeDir: string | null,
   preserve: PreserveBranchFn,
 ): Promise<void> {
-  // Preserve the branch BEFORE aborting — session.abort() may delete the worktree + branch
-  if (worktreeBranch && !worktreeBranch.startsWith("ensemble/preserved/")) {
-    const resource = getTeamResourceParts(deps.db, teamId)
-    const safeBranch = preservedBranchName(resource.projectName, resource.teamName, resource.teamId, memberName)
-    const ok = await preserve(worktreeBranch, safeBranch, deps.directory)
-    if (ok) {
-      deps.db.run(
-        "UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
-        [safeBranch, teamId, memberName],
-      )
-      log(`shutdown:branch:preserved src=${worktreeBranch} target=${safeBranch}`)
-    } else {
-      log(`shutdown:branch:preserve-failed src=${worktreeBranch} target=${safeBranch}`)
-    }
-  }
+  await preserveMemberProgress(deps, teamId, memberName, worktreeBranch, worktreeDir, preserve, "abort")
 
   // Now safe to abort — the branch is preserved
   deps.scheduler.terminateMember(teamId, memberName, "shutdown")
@@ -136,6 +112,29 @@ async function preserveAndAbort(
   // in_progress work must return to the pool for another teammate (issue #27).
   const released = releaseMemberTasks(deps.db, teamId, memberName)
   if (released > 0) log(`shutdown:tasks:released name=${memberName} count=${released}`)
+}
+
+async function preserveMemberProgress(
+  deps: ToolDeps,
+  teamId: string,
+  memberName: string,
+  worktreeBranch: string | null,
+  worktreeDir: string | null,
+  preserve: PreserveBranchFn,
+  phase: string,
+): Promise<void> {
+  if (!worktreeBranch && !worktreeDir) return
+  const resource = getTeamResourceParts(deps.db, teamId)
+  const safeBranch = worktreeBranch?.startsWith("ensemble/preserved/")
+    ? worktreeBranch
+    : preservedBranchName(resource.projectName, resource.teamName, resource.teamId, memberName)
+  const ok = await preserve(worktreeBranch ?? "HEAD", safeBranch, deps.directory, worktreeDir)
+  if (!ok) throw new Error(`Cannot shut down "${memberName}": failed to durably preserve worktree progress.`)
+  deps.db.run(
+    "UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
+    [safeBranch, teamId, memberName],
+  )
+  log(`shutdown:branch:preserved-${phase} src=${worktreeBranch ?? "HEAD"} target=${safeBranch}`)
 }
 
 /** Build a status line describing the teammate's work: commit count, dirty state, next step. */

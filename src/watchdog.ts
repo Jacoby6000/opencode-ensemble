@@ -3,6 +3,7 @@ import type { PluginClient } from "./types"
 import type { MemberRegistry } from "./state"
 import type { ProgressTracker } from "./progress"
 import { preserveBranch, preservedBranchName } from "./tools/merge-helper"
+import type { PreserveBranchFn } from "./tools/merge-helper"
 import { releaseMemberTasks } from "./tasks"
 import { hasReportedCompletion } from "./messaging"
 import { getMemberPromptOptions } from "./member-model"
@@ -33,6 +34,8 @@ interface WatchdogOpts {
   /** Time window for peer message rate limiting in ms. */
   peerMessageWindowMs?: number
   scheduler?: SchedulerController
+  /** Durable worktree snapshot implementation. */
+  preserve?: PreserveBranchFn
 }
 
 /**
@@ -53,6 +56,7 @@ export class Watchdog {
   private readonly peerMessageLimit: number
   private readonly peerMessageWindowMs: number
   private readonly scheduler?: SchedulerController
+  private readonly preserve: PreserveBranchFn
   private timer: ReturnType<typeof setInterval> | undefined
 
   constructor(opts: WatchdogOpts) {
@@ -69,6 +73,7 @@ export class Watchdog {
     this.peerMessageLimit = opts.peerMessageLimit ?? 0
     this.peerMessageWindowMs = opts.peerMessageWindowMs ?? 300_000
     this.scheduler = opts.scheduler
+    this.preserve = opts.preserve ?? preserveBranch
   }
 
   private static STALE_THRESHOLD_MS = Number(process.env.STALE_WORKTREE_THRESHOLD_MS) || 300_000
@@ -77,24 +82,38 @@ export class Watchdog {
   async cleanupStaleWorktrees(): Promise<void> {
     const cutoff = Date.now() - Watchdog.STALE_THRESHOLD_MS
     const stale = this.db.query(
-      `SELECT tm.team_id, tm.name, tm.worktree_dir, tm.workspace_id
+      `SELECT tm.team_id, tm.name, tm.worktree_dir, tm.worktree_branch, tm.workspace_id,
+          t.name AS team_name, p.name AS project_name
        FROM team_member tm
        JOIN team t ON tm.team_id = t.id
+       JOIN project p ON t.project_id = p.id
        WHERE t.status = 'active'
          AND tm.status IN ('shutdown', 'error')
          AND tm.worktree_dir IS NOT NULL
          AND tm.time_updated < ?`
-    ).all(cutoff) as Array<{ team_id: string; name: string; worktree_dir: string; workspace_id: string | null }>
+    ).all(cutoff) as Array<{ team_id: string; name: string; worktree_dir: string; worktree_branch: string | null; workspace_id: string | null; team_name: string; project_name: string }>
 
     for (const m of stale) {
+      if (!this.cwd) {
+        log(`watchdog:worktree:preserve-skipped name=${m.name} reason=repository-directory-unavailable`)
+        continue
+      }
+      const safeBranch = m.worktree_branch?.startsWith("ensemble/preserved/")
+        ? m.worktree_branch
+        : preservedBranchName(m.project_name, m.team_name, m.team_id, m.name)
+      const preserved = await this.preserve(m.worktree_branch ?? "HEAD", safeBranch, this.cwd, m.worktree_dir)
+      if (!preserved) {
+        log(`watchdog:worktree:preserve-failed name=${m.name}`)
+        continue
+      }
       try {
         if (m.workspace_id) {
           await this.client.workspace.remove({ id: m.workspace_id })
         }
         await this.client.worktree.remove({ worktreeRemoveInput: { directory: m.worktree_dir } })
         this.db.run(
-          "UPDATE team_member SET worktree_dir = NULL, worktree_branch = NULL, workspace_id = NULL WHERE team_id = ? AND name = ?",
-          [m.team_id, m.name]
+          "UPDATE team_member SET worktree_dir = NULL, worktree_branch = ?, workspace_id = NULL WHERE team_id = ? AND name = ?",
+          [safeBranch, m.team_id, m.name]
         )
       } catch { /* best effort */ }
     }
@@ -247,7 +266,7 @@ export class Watchdog {
 
     const cutoff = Date.now() - this.ttlMs
     const stale = this.db.query(
-      `SELECT tm.team_id, tm.name, tm.session_id, tm.worktree_branch, t.name as team_name, p.name as project_name
+      `SELECT tm.team_id, tm.name, tm.session_id, tm.worktree_dir, tm.worktree_branch, t.name as team_name, p.name as project_name
        FROM team_member tm
        JOIN team t ON tm.team_id = t.id
        JOIN project p ON t.project_id = p.id
@@ -255,18 +274,25 @@ export class Watchdog {
           AND tm.member_kind = 'worker'
           AND tm.status = 'busy'
          AND tm.time_updated < ?`
-    ).all(cutoff) as Array<{ team_id: string; name: string; session_id: string; worktree_branch: string | null; team_name: string; project_name: string }>
+    ).all(cutoff) as Array<{ team_id: string; name: string; session_id: string; worktree_dir: string | null; worktree_branch: string | null; team_name: string; project_name: string }>
 
     for (const member of stale) {
-      // Preserve branch BEFORE abort — session.abort() may destroy the worktree + branch
-      if (this.cwd && member.worktree_branch && !member.worktree_branch.startsWith("ensemble/preserved/")) {
-        const safeBranch = preservedBranchName(member.project_name, member.team_name, member.team_id, member.name)
-        const ok = await preserveBranch(member.worktree_branch, safeBranch, this.cwd)
-        if (ok) {
-          this.db.run("UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
-            [safeBranch, member.team_id, member.name])
-          log(`watchdog:branch:preserved src=${member.worktree_branch} target=${safeBranch}`)
+      if (member.worktree_branch || member.worktree_dir) {
+        if (!this.cwd) {
+          log(`watchdog:timeout:preserve-skipped name=${member.name} reason=repository-directory-unavailable`)
+          continue
         }
+        const safeBranch = member.worktree_branch?.startsWith("ensemble/preserved/")
+          ? member.worktree_branch
+          : preservedBranchName(member.project_name, member.team_name, member.team_id, member.name)
+        const ok = await this.preserve(member.worktree_branch ?? "HEAD", safeBranch, this.cwd, member.worktree_dir)
+        if (!ok) {
+          log(`watchdog:timeout:preserve-failed name=${member.name}`)
+          continue
+        }
+        this.db.run("UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
+          [safeBranch, member.team_id, member.name])
+        log(`watchdog:branch:preserved src=${member.worktree_branch ?? "HEAD"} target=${safeBranch}`)
       }
 
       // Mark as timed out

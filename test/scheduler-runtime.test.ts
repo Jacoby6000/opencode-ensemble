@@ -1,9 +1,19 @@
 import { beforeEach, describe, expect, test } from "bun:test"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import { DEFAULT_CONFIG } from "../src/config"
 import type { Database } from "../src/db"
 import { DurableScheduler } from "../src/scheduler-runtime"
 import { findRunBySession, markRunInjected, queueWake, tryAcquireRun } from "../src/scheduler"
 import { insertMember, insertTeam, mockClient, setupDb } from "./helpers"
+
+async function git(cwd: string, args: string[]): Promise<string> {
+  const process = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" })
+  const [stdout, stderr, exitCode] = await Promise.all([new Response(process.stdout).text(), new Response(process.stderr).text(), process.exited])
+  if (exitCode !== 0) throw new Error(stderr.trim() || `git ${args.join(" ")} failed`)
+  return stdout.trim()
+}
 
 describe("durable scheduler runtime", () => {
   let db: Database
@@ -33,7 +43,7 @@ describe("durable scheduler runtime", () => {
     expect(findRunBySession(db, "session-a")?.state).toBe("active")
   })
 
-  test("marks accepted delivery injected and finishes it on idle", async () => {
+  test("keeps an accepted delivery recoverable when idle arrives without start evidence", async () => {
     const client = mockClient()
     const wake = queueWake(db, {
       teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
@@ -48,7 +58,29 @@ describe("durable scheduler runtime", () => {
 
     scheduler.onSessionStatus("session-a", "idle")
     expect(findRunBySession(db, "session-a")).toBeUndefined()
+    expect(db.query("SELECT state, last_error FROM scheduler_wake WHERE id = ?").get(wake.wakeId)).toEqual({
+      state: "queued",
+      last_error: "session became idle before execution started",
+    })
+  })
+
+  test("finishes a started delivery exactly once when busy is followed by idle", async () => {
+    const wake = queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
+      reason: "spawn", coalesceKey: "member", prompt: "initial context", now: Date.now(),
+    })
+    const scheduler = new DurableScheduler(db, mockClient(), DEFAULT_CONFIG.scheduler)
+
+    scheduler.kick()
+    await Bun.sleep(0)
+    await Bun.sleep(0)
+    scheduler.onSessionStatus("session-a", "busy")
+    scheduler.onSessionStatus("session-a", "idle")
+    scheduler.onSessionStatus("session-a", "idle")
+
+    expect(findRunBySession(db, "session-a")).toBeUndefined()
     expect(db.query("SELECT state FROM scheduler_wake WHERE id = ?").get(wake.wakeId)).toEqual({ state: "completed" })
+    expect(db.query("SELECT COUNT(*) AS count FROM scheduler_event WHERE wake_id = ? AND type = 'run_processed'").get(wake.wakeId)).toEqual({ count: 1 })
   })
 
   test("ignores idle evidence that predates injection acknowledgement", async () => {
@@ -131,6 +163,86 @@ describe("durable scheduler runtime", () => {
 
     expect(findRunBySession(db, "session-a")?.state).toBe("expired")
     expect(db.query("SELECT status FROM team_member WHERE name = 'alice'").get()).toEqual({ status: "ready" })
+  })
+
+  test("restart 404 preserves a worker for recovery and releases its assigned task", async () => {
+    const client = mockClient()
+    const missing = new Error("session not found") as Error & { status: number }
+    missing.status = 404
+    client.session.status = async () => ({ data: {} })
+    client.session.get = async () => { throw missing }
+    db.run(
+      "INSERT INTO team_task (id, team_id, content, status, priority, assignee, time_created, time_updated) VALUES ('task-a', 't1', 'work', 'in_progress', 'medium', 'alice', ?, ?)",
+      [Date.now(), Date.now()],
+    )
+    const wake = queueWake(db, {
+      teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build",
+      reason: "message", coalesceKey: "alice", now: Date.now() - 100,
+    })
+    const acquired = tryAcquireRun(db, wake.wakeId, DEFAULT_CONFIG.scheduler.runLimits, 1, Date.now() - 100)
+    if (!acquired.acquired) throw new Error("expected lease")
+    const scheduler = new DurableScheduler(db, client, { ...DEFAULT_CONFIG.scheduler, leaseTtlMs: 10 })
+
+    await scheduler.recover()
+
+    expect(db.query("SELECT status, execution_status FROM team_member WHERE name = 'alice'").get()).toEqual({ status: "error", execution_status: "failed" })
+    expect(db.query("SELECT status, assignee FROM team_task WHERE id = 'task-a'").get()).toEqual({ status: "pending", assignee: null })
+  })
+
+  test("restart 404 snapshots dirty worktree progress before terminalizing the worker", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "ensemble-restart-404-"))
+    const worktree = path.join(repository, "worker")
+    try {
+      await git(repository, ["init"])
+      await git(repository, ["config", "user.name", "Test User"])
+      await git(repository, ["config", "user.email", "test@example.com"])
+      await Bun.write(path.join(repository, "base.txt"), "base\n")
+      await git(repository, ["add", "base.txt"])
+      await git(repository, ["commit", "-m", "base"])
+      await git(repository, ["worktree", "add", "-b", "ensemble-worker", worktree])
+      await Bun.write(path.join(worktree, "progress.txt"), "restart-safe\n")
+      db.run("UPDATE project SET name = 'restart-project', path = ? WHERE id = (SELECT project_id FROM team WHERE id = 't1')", [repository])
+      db.run("UPDATE team_member SET worktree_dir = ?, worktree_branch = 'ensemble-worker' WHERE name = 'alice'", [worktree])
+
+      const client = mockClient()
+      const missing = new Error("session not found") as Error & { status: number }
+      missing.status = 404
+      client.session.status = async () => ({ data: {} })
+      client.session.get = async () => { throw missing }
+      const wake = queueWake(db, { teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build", reason: "message", coalesceKey: "alice", now: Date.now() - 100 })
+      const acquired = tryAcquireRun(db, wake.wakeId, DEFAULT_CONFIG.scheduler.runLimits, 1, Date.now() - 100)
+      if (!acquired.acquired) throw new Error("expected lease")
+
+      await new DurableScheduler(db, client, { ...DEFAULT_CONFIG.scheduler, leaseTtlMs: 10 }).recover()
+
+      const branch = (db.query("SELECT worktree_branch FROM team_member WHERE name = 'alice'").get() as { worktree_branch: string }).worktree_branch
+      expect(branch).toBe("ensemble/preserved/restart-project/alpha#t1/alice")
+      expect(await git(repository, ["show", `${branch}:progress.txt`])).toBe("restart-safe")
+    } finally {
+      await rm(repository, { recursive: true, force: true })
+    }
+  })
+
+  test("restart 404 fails closed when worktree progress cannot be preserved", async () => {
+    db.run("UPDATE team_member SET worktree_dir = '/tmp/missing-ensemble-worktree', worktree_branch = 'ensemble-worker' WHERE name = 'alice'")
+    db.run(
+      "INSERT INTO team_task (id, team_id, content, status, priority, assignee, time_created, time_updated) VALUES ('task-a', 't1', 'work', 'in_progress', 'medium', 'alice', ?, ?)",
+      [Date.now(), Date.now()],
+    )
+    const client = mockClient()
+    const missing = new Error("session not found") as Error & { status: number }
+    missing.status = 404
+    client.session.status = async () => ({ data: {} })
+    client.session.get = async () => { throw missing }
+    const wake = queueWake(db, { teamId: "t1", memberName: "alice", sessionId: "session-a", agent: "build", reason: "message", coalesceKey: "alice", now: Date.now() - 100 })
+    const acquired = tryAcquireRun(db, wake.wakeId, DEFAULT_CONFIG.scheduler.runLimits, 1, Date.now() - 100)
+    if (!acquired.acquired) throw new Error("expected lease")
+
+    await new DurableScheduler(db, client, { ...DEFAULT_CONFIG.scheduler, leaseTtlMs: 10 }).recover()
+
+    expect(db.query("SELECT status FROM team_member WHERE name = 'alice'").get()).toEqual({ status: "ready" })
+    expect(db.query("SELECT status, assignee FROM team_task WHERE id = 'task-a'").get()).toEqual({ status: "in_progress", assignee: "alice" })
+    expect(findRunBySession(db, "session-a")?.state).toBe("expired")
   })
 
   test("does not requeue an unexpired in-flight dispatch during maintenance", async () => {

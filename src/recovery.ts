@@ -3,6 +3,7 @@ import type { PluginClient } from "./types"
 import type { MemberRegistry } from "./state"
 import { releaseMemberTasks } from "./tasks"
 import { preserveBranch, preservedBranchName, teamResourceSegment } from "./tools/merge-helper"
+import type { PreserveBranchFn } from "./tools/merge-helper"
 import { log } from "./log"
 import { runCommand } from "./process"
 import { queueWake, terminateMemberScheduling } from "./scheduler"
@@ -106,7 +107,7 @@ export async function recoverOrphanedTeams(
 export async function recoverStaleMembers(db: Database, client?: PluginClient, cwd?: string, abortTimeoutMs = 5000): Promise<{ interrupted: number }> {
   // Find stale members with branch info so we can preserve before aborting
   const stale = db.query(
-    `SELECT tm.session_id, tm.worktree_branch, tm.name, tm.team_id, t.name as team_name, p.name as project_name
+    `SELECT tm.session_id, tm.worktree_dir, tm.worktree_branch, tm.name, tm.team_id, t.name as team_name, p.name as project_name
       FROM team_member tm
       JOIN team t ON tm.team_id = t.id
       JOIN project p ON t.project_id = p.id
@@ -116,40 +117,37 @@ export async function recoverStaleMembers(db: Database, client?: PluginClient, c
           WHERE l.team_id = tm.team_id AND l.member_name = tm.name AND l.state IN ('active', 'expired')
         )
         AND (? IS NULL OR t.project_id = ? OR t.project_id = 'default')`
-  ).all(cwd ?? null, cwd ?? null) as Array<{ session_id: string; worktree_branch: string | null; name: string; team_id: string; team_name: string; project_name: string }>
+  ).all(cwd ?? null, cwd ?? null) as Array<{ session_id: string; worktree_dir: string | null; worktree_branch: string | null; name: string; team_id: string; team_name: string; project_name: string }>
 
-  const result = db.run(
-    `UPDATE team_member SET status = 'error', execution_status = 'idle', time_updated = ?
-       WHERE member_kind = 'worker' AND status = 'busy'
-        AND NOT EXISTS (
-          SELECT 1 FROM scheduler_run_lease l
-          WHERE l.team_id = team_member.team_id AND l.member_name = team_member.name AND l.state IN ('active', 'expired')
-        )
-        AND team_id IN (SELECT id FROM team WHERE status = 'active' AND (? IS NULL OR project_id = ? OR project_id = 'default'))`,
-    [Date.now(), cwd ?? null, cwd ?? null]
-  )
-
-  // Release each stale member's in_progress tasks back to the pool so their
-  // unfinished work is reclaimable after a crash (issue #27).
+  let interrupted = 0
   for (const member of stale) {
+    if (member.worktree_branch || member.worktree_dir) {
+      if (!cwd) {
+        log(`recovery:branch:preserve-skipped name=${member.name} reason=repository-directory-unavailable`)
+        continue
+      }
+      const safeBranch = member.worktree_branch?.startsWith("ensemble/preserved/")
+        ? member.worktree_branch
+        : preservedBranchName(member.project_name, member.team_name, member.team_id, member.name)
+      const ok = await preserveBranch(member.worktree_branch ?? "HEAD", safeBranch, cwd, member.worktree_dir)
+      if (!ok) {
+        log(`recovery:branch:preserve-failed name=${member.name}`)
+        continue
+      }
+      db.run("UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?", [safeBranch, member.team_id, member.name])
+      log(`recovery:branch:preserved src=${member.worktree_branch ?? "HEAD"} target=${safeBranch}`)
+    }
+
+    db.run(
+      "UPDATE team_member SET status = 'error', execution_status = 'idle', time_updated = ? WHERE team_id = ? AND name = ? AND status = 'busy'",
+      [Date.now(), member.team_id, member.name],
+    )
     terminateMemberScheduling(db, member.team_id, member.name, "stale member recovery")
     const released = releaseMemberTasks(db, member.team_id, member.name)
     if (released > 0) log(`recovery:tasks:released name=${member.name} count=${released}`)
-  }
+    interrupted++
 
-  // Preserve branches then abort orphaned sessions
-  if (client) {
-    for (const member of stale) {
-      // Preserve branch BEFORE abort — session.abort() may destroy the worktree + branch
-      if (cwd && member.worktree_branch && !member.worktree_branch.startsWith("ensemble/preserved/")) {
-        const safeBranch = preservedBranchName(member.project_name, member.team_name, member.team_id, member.name)
-        const ok = await preserveBranch(member.worktree_branch, safeBranch, cwd)
-        if (ok) {
-          db.run("UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
-            [safeBranch, member.team_id, member.name])
-          log(`recovery:branch:preserved src=${member.worktree_branch} target=${safeBranch}`)
-        }
-      }
+    if (client) {
       try {
         await Promise.race([
           client.session.abort({ sessionID: member.session_id }),
@@ -164,14 +162,14 @@ export async function recoverStaleMembers(db: Database, client?: PluginClient, c
     }
   }
 
-  return { interrupted: result.changes }
+  return { interrupted }
 }
 
 /**
  * Clean up orphaned worktrees from archived teams or members that no longer exist.
  * Compares worktrees on disk (via client.worktree.list) against active team members.
  */
-export async function recoverOrphanedWorktrees(db: Database, client: PluginClient): Promise<{ removed: number }> {
+export async function recoverOrphanedWorktrees(db: Database, client: PluginClient, cwd?: string, preserve: PreserveBranchFn = preserveBranch): Promise<{ removed: number }> {
   let removed = 0
 
   try {
@@ -191,6 +189,17 @@ export async function recoverOrphanedWorktrees(db: Database, client: PluginClien
       // Only clean up worktrees created by ensemble (name starts with "ensemble-")
       if (!wt.name.startsWith("ensemble-")) continue
       if (activeWorktrees.has(wt.directory)) continue
+      if (!cwd) {
+        log(`recovery:worktree:preserve-skipped name=${wt.name} reason=repository-directory-unavailable`)
+        continue
+      }
+
+      const resourceName = wt.name.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "orphan"
+      const safeBranch = `ensemble/preserved/recovered/${resourceName}`
+      if (!await preserve(wt.branch || "HEAD", safeBranch, cwd, wt.directory)) {
+        log(`recovery:worktree:preserve-failed name=${wt.name}`)
+        continue
+      }
 
       try {
         await client.worktree.remove({ worktreeRemoveInput: { directory: wt.directory } })
@@ -300,6 +309,12 @@ export async function recoverOrphanedBranches(db: Database, cwd: string): Promis
 
   for (const branch of branches) {
     if (!archivedPrefixes.some(prefix => branch.startsWith(prefix))) continue
+
+    const merged = await runCommand(["git", "merge-base", "--is-ancestor", branch, "HEAD"], { cwd })
+    if (merged.exitCode !== 0) {
+      log(`recovery:branch:retained-unmerged branch=${branch}`)
+      continue
+    }
 
     try {
       const deleteResult = await runCommand(["git", "branch", "-D", branch], { cwd })
