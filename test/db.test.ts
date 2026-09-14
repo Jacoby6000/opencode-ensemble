@@ -74,6 +74,24 @@ describe("schema migrations", () => {
     expect(() => db.run("UPDATE team_member SET member_kind = 'other' WHERE name = 'alice'")).toThrow()
   })
 
+  test("migration 17 adds nullable execution-start evidence without changing existing leases", () => {
+    for (let i = 0; i < 16; i++) {
+      const migration = MIGRATIONS[i]
+      if (migration) db.exec(migration)
+      db.exec(`PRAGMA user_version = ${i + 1}`)
+    }
+    db.run("INSERT INTO team (id, name, project_id, lead_session_id, status, delegate, time_created, time_updated) VALUES ('t1', 'team', 'default', 'lead', 'active', 0, 0, 0)")
+    db.run("INSERT INTO team_member (team_id, name, session_id, agent, time_created, time_updated) VALUES ('t1', 'alice', 's1', 'build', 0, 0)")
+    db.run("INSERT INTO scheduler_wake (id, team_id, member_name, session_id, agent, reason, coalesce_key, state, not_before, time_created, time_updated) VALUES ('wake-1', 't1', 'alice', 's1', 'build', 'test', 'alice', 'leased', 0, 0, 0)")
+    db.run("INSERT INTO scheduler_run_lease (id, wake_id, team_id, member_name, session_id, agent, state, acquired_at, expires_at, injected_at) VALUES ('lease-1', 'wake-1', 't1', 'alice', 's1', 'build', 'active', 1, 100, 2)")
+
+    expect((db.query("PRAGMA table_info(scheduler_run_lease)").all() as Array<{ name: string }>).some(column => column.name === "started_at")).toBe(false)
+    applyMigrations(db)
+
+    expect(db.query("SELECT injected_at, started_at FROM scheduler_run_lease WHERE id = 'lease-1'").get()).toEqual({ injected_at: 2, started_at: null })
+    expect((db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(17)
+  })
+
   test("creates project table", () => {
     applyMigrations(db)
     const row = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='project'").get()

@@ -66,14 +66,31 @@ export function teamWorktreeName(projectName: string, teamName: string, teamId: 
   return `ensemble-${teamResourceSlug(projectName, teamName, teamId)}-${memberName}`
 }
 
-/**
- * Snapshot a worktree to a standalone ref before destructive cleanup.
- * Dirty snapshots include staged, unstaged, and non-ignored untracked content.
- * Existing preserved refs are refreshed rather than treated as success.
- */
-export async function preserveBranch(sourceBranch: string, targetBranch: string, cwd: string, worktreeDir?: string | null): Promise<boolean> {
+/** Serialize snapshots targeting the same repository ref in invocation order. */
+export function serializeBranchPreserver(snapshot: PreserveBranchFn): PreserveBranchFn {
+  const locks = new Map<string, Promise<void>>()
+  return async (sourceBranch, targetBranch, cwd, worktreeDir) => {
+    const key = `${path.resolve(cwd)}\0${targetBranch}`
+    const predecessor = locks.get(key) ?? Promise.resolve()
+    let release = () => {}
+    const current = new Promise<void>(resolve => { release = resolve })
+    locks.set(key, current)
+    await predecessor
+    try {
+      return await snapshot(sourceBranch, targetBranch, cwd, worktreeDir)
+    } finally {
+      release()
+      if (locks.get(key) === current) locks.delete(key)
+    }
+  }
+}
+
+/** Build and safely publish a verified snapshot of a worktree. */
+async function preserveBranchLocked(sourceBranch: string, targetBranch: string, cwd: string, worktreeDir?: string | null): Promise<boolean> {
   let temporaryDirectory: string | undefined
   try {
+    const targetRef = `refs/heads/${targetBranch}`
+    const existing = await readBranchRef(targetRef, cwd)
     const source = worktreeDir
       ? await runCommand(["git", "-C", worktreeDir, "rev-parse", "HEAD^{commit}"], { cwd })
       : await runCommand(["git", "rev-parse", `${sourceBranch}^{commit}`], { cwd })
@@ -108,7 +125,8 @@ export async function preserveBranch(sourceBranch: string, targetBranch: string,
       }
     }
 
-    const update = await runCommand(["git", "update-ref", `refs/heads/${targetBranch}`, preservedCommit], { cwd })
+    const expected = existing ?? "0".repeat(sourceCommit.length)
+    const update = await runCommand(["git", "update-ref", targetRef, preservedCommit, expected], { cwd })
     if (update.exitCode !== 0) throw new Error(update.stderr.trim() || "preserved ref update failed")
     const verify = await runCommand(["git", "rev-parse", `${targetBranch}^{commit}`], { cwd })
     if (verify.exitCode !== 0 || verify.stdout.trim() !== preservedCommit) throw new Error("preserved ref verification failed")
@@ -118,6 +136,29 @@ export async function preserveBranch(sourceBranch: string, targetBranch: string,
     return false
   } finally {
     if (temporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true })
+  }
+}
+
+async function readBranchRef(targetRef: string, cwd: string): Promise<string | null> {
+  const result = await runCommand(["git", "rev-parse", "--verify", "--quiet", `${targetRef}^{commit}`], { cwd })
+  if (result.exitCode === 1) return null
+  if (result.exitCode !== 0 || !result.stdout.trim()) throw new Error(result.stderr.trim() || "preserved ref inspection failed")
+  return result.stdout.trim()
+}
+
+/** Snapshot committed and dirty worktree state to a refreshable standalone ref. */
+export const preserveBranch: PreserveBranchFn = serializeBranchPreserver(preserveBranchLocked)
+
+/** Verify that an exact local branch ref resolves to a commit. */
+export async function verifyPreservedBranch(branch: string, cwd: string): Promise<boolean> {
+  const targetRef = `refs/heads/${branch}`
+  try {
+    const commit = await readBranchRef(targetRef, cwd)
+    if (!commit) return false
+    const verify = await runCommand(["git", "cat-file", "-e", `${commit}^{commit}`], { cwd })
+    return verify.exitCode === 0
+  } catch {
+    return false
   }
 }
 

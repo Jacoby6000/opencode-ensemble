@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { preserveBranch } from "../src/tools/merge-helper"
+import { preserveBranch, serializeBranchPreserver } from "../src/tools/merge-helper"
 
 const repositories: string[] = []
 
@@ -35,6 +35,35 @@ afterEach(async () => {
 })
 
 describe("preserveBranch", () => {
+  test("serializes concurrent snapshots so an older invocation cannot finish last", async () => {
+    let releaseOlder = () => {}
+    const olderBlocked = new Promise<void>(resolve => { releaseOlder = resolve })
+    let markOlderStarted = () => {}
+    const olderStarted = new Promise<void>(resolve => { markOlderStarted = resolve })
+    const completions: string[] = []
+    let currentSnapshot = ""
+    const preserve = serializeBranchPreserver(async source => {
+      if (source === "older") {
+        markOlderStarted()
+        await olderBlocked
+      }
+      completions.push(source)
+      currentSnapshot = source
+      return true
+    })
+
+    const older = preserve("older", "ensemble/preserved/test", "/repo")
+    await olderStarted
+    const newer = preserve("newer", "ensemble/preserved/test", "/repo")
+    await Bun.sleep(0)
+    expect(completions).toEqual([])
+
+    releaseOlder()
+    expect(await Promise.all([older, newer])).toEqual([true, true])
+    expect(completions).toEqual(["older", "newer"])
+    expect(currentSnapshot).toBe("newer")
+  })
+
   test("durably snapshots committed, staged, unstaged, and untracked work and refreshes a stale ref", async () => {
     const cwd = await repository()
     await Bun.write(path.join(cwd, "committed.txt"), "committed\n")

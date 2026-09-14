@@ -5,10 +5,11 @@ import { log } from "./log"
 import { getLeadPromptOptions, getMemberPromptOptions } from "./member-model"
 import { expireStaleRuns, findRunBySession, finishRun, getWakePayload, listReadyWakes, markRunInjected, markRunStarted, reconcileExpiredRun, renewRunLease, requeueRun, terminateMemberScheduling, tryAcquireRun } from "./scheduler"
 import { releaseMemberTasks } from "./tasks"
-import { preserveBranch, preservedBranchName } from "./tools/merge-helper"
+import { preserveBranch, preservedBranchName, verifyPreservedBranch } from "./tools/merge-helper"
 import type { PluginClient } from "./types"
 import { armTeamSupervisionIfQuiescent, reconcileTeamSupervision, SUPERVISOR_MEMBER_NAME } from "./supervisor"
 import { ANNALIST_MEMBER_NAME } from "./annalist"
+import { stat } from "node:fs/promises"
 
 type BoundedResult<T> = { state: "fulfilled"; value: T } | { state: "rejected"; error: unknown } | { state: "timed_out" }
 
@@ -278,9 +279,21 @@ export class DurableScheduler implements SchedulerController {
     const target = member.worktree_branch?.startsWith("ensemble/preserved/")
       ? member.worktree_branch
       : preservedBranchName(member.project_name, member.team_name, teamId, memberName)
+    if (member.worktree_branch === target && (!member.worktree_dir || await isMissing(member.worktree_dir))) {
+      return verifyPreservedBranch(target, member.project_path)
+    }
     const preserved = await preserveBranch(member.worktree_branch ?? "HEAD", target, member.project_path, member.worktree_dir)
     if (!preserved) return false
     this.db.run("UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?", [target, teamId, memberName])
     return true
+  }
+}
+
+async function isMissing(filePath: string): Promise<boolean> {
+  try {
+    await stat(filePath)
+    return false
+  } catch (error) {
+    return error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR")
   }
 }

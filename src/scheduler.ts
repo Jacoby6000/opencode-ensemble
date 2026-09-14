@@ -158,12 +158,11 @@ export function requeueRun(_db: Database, _leaseId: string, _error: string, _bac
   if (!Number.isSafeInteger(_backoffMs) || _backoffMs < 0) throw new Error("Run backoff must be a non-negative safe integer")
   return immediateTransaction(_db, () => {
     const lease = _db.query(
-      "SELECT wake_id, team_id, member_name FROM scheduler_run_lease WHERE id = ? AND state = 'active'",
-    ).get(_leaseId) as { wake_id: string; team_id: string; member_name: string } | undefined
+      "SELECT l.wake_id, l.team_id, l.member_name, w.coalesce_key FROM scheduler_run_lease l JOIN scheduler_wake w ON w.id = l.wake_id WHERE l.id = ? AND l.state = 'active'",
+    ).get(_leaseId) as { wake_id: string; team_id: string; member_name: string; coalesce_key: string } | undefined
     if (!lease) return false
     _db.run("UPDATE scheduler_run_lease SET state = 'released', released_at = ? WHERE id = ? AND state = 'active'", [_now, _leaseId])
-    _db.run("UPDATE scheduler_wake SET state = 'queued', not_before = ?, last_error = ?, time_updated = ? WHERE id = ? AND state = 'leased'", [_now + _backoffMs, _error, _now, lease.wake_id])
-    setWakeMessageState(_db, lease.wake_id, "wake_queued")
+    requeueLeasedWake(_db, lease, _error, _now + _backoffMs, _now)
     recordEvent(_db, { teamId: lease.team_id, memberName: lease.member_name, wakeId: lease.wake_id, leaseId: _leaseId, type: "run_requeued", detail: _error, now: _now })
     return true
   })
@@ -389,37 +388,51 @@ export function reconcileExpiredRun(
     if (!lease) return false
 
     const leaseState = outcome === "failed" ? "failed" : "released"
-    const messageState = outcome === "requeue" ? "wake_queued" : outcome
     db.run("UPDATE scheduler_run_lease SET state = ?, released_at = ? WHERE id = ? AND state = 'expired'", [leaseState, now, leaseId])
-    setWakeMessageState(db, lease.wake_id, messageState)
     if (outcome === "requeue") {
-      const successor = db.query(
-        "SELECT id FROM scheduler_wake WHERE team_id = ? AND member_name = ? AND coalesce_key = ? AND state = 'queued' AND id <> ? LIMIT 1",
-      ).get(lease.team_id, lease.member_name, lease.coalesce_key, lease.wake_id) as { id: string } | undefined
-      if (successor) {
-        db.run("INSERT OR IGNORE INTO scheduler_message_wake (message_id, wake_id, time_created) SELECT message_id, ?, ? FROM scheduler_message_wake WHERE wake_id = ?", [successor.id, now, lease.wake_id])
-        db.run(
-          `UPDATE scheduler_wake SET prompt = CASE
-             WHEN (SELECT prompt FROM scheduler_wake WHERE id = ?) IS NULL THEN prompt
-             WHEN prompt IS NULL THEN (SELECT prompt FROM scheduler_wake WHERE id = ?)
-             ELSE (SELECT prompt FROM scheduler_wake WHERE id = ?) || '\n\n' || prompt
-           END, time_updated = ? WHERE id = ?`,
-          [lease.wake_id, lease.wake_id, lease.wake_id, now, successor.id],
-        )
-        db.run("DELETE FROM scheduler_message_wake WHERE wake_id = ?", [lease.wake_id])
-        db.run("UPDATE scheduler_wake SET state = 'cancelled', time_updated = ? WHERE id = ? AND state = 'leased'", [now, lease.wake_id])
-        rearmTerminalSupervisorReview(db, lease.team_id)
-      } else {
-        db.run("UPDATE scheduler_wake SET state = 'queued', time_updated = ? WHERE id = ? AND state = 'leased'", [now, lease.wake_id])
-      }
+      requeueLeasedWake(db, lease, error, now, now)
     } else {
       const wakeState = outcome === "processed" ? "completed" : "failed"
       db.run("UPDATE scheduler_wake SET state = ?, last_error = ?, time_updated = ? WHERE id = ? AND state = 'leased'", [wakeState, error ?? null, now, lease.wake_id])
+      setWakeMessageState(db, lease.wake_id, outcome)
       if (outcome === "failed") rearmTerminalSupervisorReview(db, lease.team_id)
     }
     recordEvent(db, { teamId: lease.team_id, memberName: lease.member_name, wakeId: lease.wake_id, leaseId, type: `expired_run_${outcome}`, detail: error, now })
     return true
   })
+}
+
+function requeueLeasedWake(
+  db: Database,
+  wake: { wake_id: string; team_id: string; member_name: string; coalesce_key: string },
+  error: string | undefined,
+  notBefore: number,
+  now: number,
+): void {
+  setWakeMessageState(db, wake.wake_id, "wake_queued")
+  const successor = db.query(
+    "SELECT id FROM scheduler_wake WHERE team_id = ? AND member_name = ? AND coalesce_key = ? AND state = 'queued' AND id <> ? LIMIT 1",
+  ).get(wake.team_id, wake.member_name, wake.coalesce_key, wake.wake_id) as { id: string } | undefined
+  if (!successor) {
+    db.run(
+      "UPDATE scheduler_wake SET state = 'queued', not_before = ?, last_error = ?, time_updated = ? WHERE id = ? AND state = 'leased'",
+      [notBefore, error ?? null, now, wake.wake_id],
+    )
+    return
+  }
+
+  db.run("INSERT OR IGNORE INTO scheduler_message_wake (message_id, wake_id, time_created) SELECT message_id, ?, ? FROM scheduler_message_wake WHERE wake_id = ?", [successor.id, now, wake.wake_id])
+  db.run(
+    `UPDATE scheduler_wake SET prompt = CASE
+       WHEN (SELECT prompt FROM scheduler_wake WHERE id = ?) IS NULL THEN prompt
+       WHEN prompt IS NULL THEN (SELECT prompt FROM scheduler_wake WHERE id = ?)
+       ELSE (SELECT prompt FROM scheduler_wake WHERE id = ?) || '\n\n' || prompt
+     END, not_before = MAX(not_before, ?), last_error = ?, time_updated = ? WHERE id = ?`,
+    [wake.wake_id, wake.wake_id, wake.wake_id, notBefore, error ?? null, now, successor.id],
+  )
+  db.run("DELETE FROM scheduler_message_wake WHERE wake_id = ?", [wake.wake_id])
+  db.run("UPDATE scheduler_wake SET state = 'cancelled', last_error = ?, time_updated = ? WHERE id = ? AND state = 'leased'", [error ?? null, now, wake.wake_id])
+  rearmTerminalSupervisorReview(db, wake.team_id)
 }
 
 function expireStaleRunsInTransaction(db: Database, now: number, projectId?: string): number {
