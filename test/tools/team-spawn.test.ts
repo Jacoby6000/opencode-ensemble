@@ -259,6 +259,23 @@ describe("team_spawn", () => {
     expect(text).toContain("Mark it complete when done")
   })
 
+  test.each(["plan", "explore"])("rejects claim_task for read-only %s agents before provisioning", async agent => {
+    deps.db.run(
+      "INSERT INTO team_task (id, team_id, content, status, priority, time_created, time_updated) VALUES ('task-read', 't1', 'Research', 'pending', 'medium', ?, ?)",
+      [Date.now(), Date.now()],
+    )
+
+    await expect(executeTeamSpawn(deps, {
+      name: `readonly-${agent}`,
+      agent,
+      prompt: "Research",
+      claim_task: "task-read",
+    }, "lead-sess")).rejects.toThrow("cannot claim tasks")
+
+    expect(deps.client.calls.some(call => call.method === "session.create" || call.method === "worktree.create")).toBe(false)
+    expect(deps.db.query("SELECT status, assignee FROM team_task WHERE id = 'task-read'").get()).toEqual({ status: "pending", assignee: null })
+  })
+
   test("claim_task that cannot be claimed still spawns but does not inject assignment and warns", async () => {
     const result = await executeTeamSpawn(deps, {
       name: "alice",
@@ -758,7 +775,7 @@ describe("team_spawn", () => {
     expect(wsCalls).toHaveLength(0)
   })
 
-  test("rolls back workspace when session.create fails", async () => {
+  test("does not remove workspace or worktree when rollback preservation cannot be verified", async () => {
     deps.client.session.create = async () => { throw new Error("session failed") }
 
     await expect(executeTeamSpawn(deps, {
@@ -768,7 +785,8 @@ describe("team_spawn", () => {
     }, "lead-sess")).rejects.toThrow("session failed")
 
     const wsRemoveCalls = deps.client.calls.filter(c => c.method === "workspace.remove")
-    expect(wsRemoveCalls).toHaveLength(1)
+    expect(wsRemoveCalls).toHaveLength(0)
+    expect(deps.client.calls.filter(c => c.method === "worktree.remove")).toHaveLength(0)
   })
 
   test("retains workspace when scheduler retries prompt delivery", async () => {

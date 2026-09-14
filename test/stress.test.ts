@@ -6,7 +6,7 @@ import { spawnFailures } from "../src/tools/team-spawn"
 import { executeTeamMessage } from "../src/tools/team-message"
 import { executeTeamShutdown } from "../src/tools/team-shutdown"
 import { executeTeamCleanup } from "../src/tools/team-cleanup"
-import type { MergeBranchFn, DeleteBranchFn } from "../src/tools/merge-helper"
+import type { MergeBranchFn, DeleteBranchFn, PreserveBranchFn } from "../src/tools/merge-helper"
 import { executeTeamTasksAdd } from "../src/tools/team-tasks-add"
 import { executeTeamTasksComplete } from "../src/tools/team-tasks-complete"
 import { executeTeamClaim } from "../src/tools/team-claim"
@@ -22,6 +22,8 @@ import type { ToolDeps } from "../src/types"
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs"
 import path from "node:path"
 import os from "node:os"
+
+const noopPreserve: PreserveBranchFn = async () => true
 
 type Deps = ReturnType<typeof setupDeps>
 
@@ -121,7 +123,7 @@ describe("stress: auto-merge on cleanup", () => {
       return { ok: true }
     }
 
-    const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, trackMerge, noopDelete, true)
+    const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, trackMerge, noopDelete, true, undefined, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("Safety-net merged 2 unmerged branch")
     expect(mergedBranches).toHaveLength(2)
 
@@ -143,7 +145,7 @@ describe("stress: auto-merge on cleanup", () => {
       return mixedCallCount === 1 ? { ok: true } : { ok: false, error: "conflict" }
     }
 
-    const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, mixedMerge, noopDelete, true)
+    const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, mixedMerge, noopDelete, true, undefined, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("Safety-net merged 1 unmerged branch")
     expect(result).toContain("Could not auto-merge")
   })
@@ -154,7 +156,7 @@ describe("stress: auto-merge on cleanup", () => {
     await executeTeamSpawn(deps, { name: "x", agent: "build", prompt: "t" }, lead)
     deps.db.run("UPDATE team_member SET status = 'shutdown' WHERE team_id = ?", [teamId])
 
-    const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, failMerge, noopDelete, true)
+    const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, failMerge, noopDelete, true, undefined, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("Could not auto-merge")
     expect(result).not.toContain("Merged")
   })
@@ -165,7 +167,7 @@ describe("stress: auto-merge on cleanup", () => {
     await executeTeamSpawn(deps, { name: "y", agent: "build", prompt: "t" }, lead)
     deps.db.run("UPDATE team_member SET status = 'shutdown' WHERE team_id = ?", [teamId])
 
-    const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, noopMerge, noopDelete, false)
+    const result = await executeTeamCleanup(deps, { force: false }, lead, undefined, noopMerge, noopDelete, false, undefined, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("Auto-merge disabled")
     expect(result).toContain("git merge")
   })

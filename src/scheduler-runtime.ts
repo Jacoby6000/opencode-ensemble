@@ -3,10 +3,13 @@ import type { Database } from "./db"
 import { claimGroupLeadDeliveries, markGroupLeadDeliveryInjected, requeueGroupLeadDelivery } from "./groups"
 import { log } from "./log"
 import { getLeadPromptOptions, getMemberPromptOptions } from "./member-model"
-import { expireStaleRuns, findRunBySession, finishRun, getWakePayload, listReadyWakes, markRunInjected, reconcileExpiredRun, renewRunLease, requeueRun, terminateMemberScheduling, tryAcquireRun } from "./scheduler"
+import { expireStaleRuns, findRunBySession, finishRun, getWakePayload, listReadyWakes, markRunInjected, markRunStarted, reconcileExpiredRun, renewRunLease, requeueRun, terminateMemberScheduling, tryAcquireRun } from "./scheduler"
+import { releaseMemberTasks } from "./tasks"
+import { preserveBranch, preservedBranchName, verifyPreservedBranch } from "./tools/merge-helper"
 import type { PluginClient } from "./types"
 import { armTeamSupervisionIfQuiescent, reconcileTeamSupervision, SUPERVISOR_MEMBER_NAME } from "./supervisor"
 import { ANNALIST_MEMBER_NAME } from "./annalist"
+import { stat } from "node:fs/promises"
 
 type BoundedResult<T> = { state: "fulfilled"; value: T } | { state: "rejected"; error: unknown } | { state: "timed_out" }
 
@@ -74,19 +77,28 @@ export class DurableScheduler implements SchedulerController {
     const now = Date.now()
     if (status === "busy" || status === "retry") {
       if (run.state === "active") {
-        markRunInjected(this.db, run.leaseId, now)
+        markRunStarted(this.db, run.leaseId, now)
         const retryExtension = retryAt && retryAt > now ? retryAt - now + this.config.leaseTtlMs : this.config.leaseTtlMs
         renewRunLease(this.db, run.leaseId, retryExtension, now, this.projectId)
       }
       return
     }
     if (run.state === "expired") {
-      reconcileExpiredRun(this.db, run.leaseId, run.injectedAt === null ? "requeue" : "processed", undefined, now, this.projectId)
+      if (run.startedAt === null) {
+        reconcileExpiredRun(this.db, run.leaseId, "requeue", "session became idle before execution started", now, this.projectId)
+      } else {
+        reconcileExpiredRun(this.db, run.leaseId, "processed", undefined, now, this.projectId)
+      }
+      this.kick()
+      return
+    }
+    if (run.startedAt !== null) {
+      finishRun(this.db, run.leaseId, "processed", undefined, now, this.projectId)
       this.kick()
       return
     }
     if (run.injectedAt !== null) {
-      finishRun(this.db, run.leaseId, "processed", undefined, now, this.projectId)
+      requeueRun(this.db, run.leaseId, "session became idle before execution started", this.config.pumpIntervalMs, now)
       this.kick()
     }
   }
@@ -126,11 +138,9 @@ export class DurableScheduler implements SchedulerController {
         const getResult = await settleWithin(this.client.session.get({ sessionID: sessionId }), timeoutMs)
         if (getResult.state === "fulfilled") {
           if (run.state === "expired") {
-            reconcileExpiredRun(this.db, run.leaseId, run.injectedAt === null ? "requeue" : "processed", undefined, Date.now(), this.projectId)
-          } else if (run.injectedAt === null) {
-            requeueRun(this.db, run.leaseId, "recovered before injection", 0)
-          } else {
-            finishRun(this.db, run.leaseId, "processed", undefined, Date.now(), this.projectId)
+            if (run.startedAt === null) reconcileExpiredRun(this.db, run.leaseId, "requeue", "recovered before execution start", Date.now(), this.projectId)
+          } else if (run.startedAt === null) {
+            requeueRun(this.db, run.leaseId, "recovered before execution start", 0)
           }
           return
         }
@@ -140,8 +150,13 @@ export class DurableScheduler implements SchedulerController {
           return
         }
         const message = getResult.error instanceof Error ? getResult.error.message : "session not found"
+        if (!await this.preserveMissingSessionProgress(run.teamId, run.memberName)) {
+          log(`scheduler:reconcile:session-missing-preserve-failed session=${sessionId}`)
+          return
+        }
         this.db.run("UPDATE team_member SET status = 'error', execution_status = 'failed', time_updated = ? WHERE team_id = ? AND name = ?", [Date.now(), run.teamId, run.memberName])
         terminateMemberScheduling(this.db, run.teamId, run.memberName, message)
+        releaseMemberTasks(this.db, run.teamId, run.memberName)
       }))
     } finally {
       this.reconcileSupervision(Date.now(), true)
@@ -252,5 +267,33 @@ export class DurableScheduler implements SchedulerController {
         reconcileTeamSupervision(this.db, team.id, now)
       }
     })
+  }
+
+  private async preserveMissingSessionProgress(teamId: string, memberName: string): Promise<boolean> {
+    const member = this.db.query(
+      `SELECT tm.worktree_dir, tm.worktree_branch, t.name AS team_name, p.name AS project_name, p.path AS project_path
+       FROM team_member tm JOIN team t ON t.id = tm.team_id JOIN project p ON p.id = t.project_id
+       WHERE tm.team_id = ? AND tm.name = ?`,
+    ).get(teamId, memberName) as { worktree_dir: string | null; worktree_branch: string | null; team_name: string; project_name: string; project_path: string } | undefined
+    if (!member || (!member.worktree_dir && !member.worktree_branch)) return true
+    const target = member.worktree_branch?.startsWith("ensemble/preserved/")
+      ? member.worktree_branch
+      : preservedBranchName(member.project_name, member.team_name, teamId, memberName)
+    if (member.worktree_branch === target && (!member.worktree_dir || await isMissing(member.worktree_dir))) {
+      return verifyPreservedBranch(target, member.project_path)
+    }
+    const preserved = await preserveBranch(member.worktree_branch ?? "HEAD", target, member.project_path, member.worktree_dir)
+    if (!preserved) return false
+    this.db.run("UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?", [target, teamId, memberName])
+    return true
+  }
+}
+
+async function isMissing(filePath: string): Promise<boolean> {
+  try {
+    await stat(filePath)
+    return false
+  } catch (error) {
+    return error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR")
   }
 }

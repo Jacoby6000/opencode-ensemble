@@ -3,7 +3,7 @@ import { requireLead, requireCanPurgeArchivedTeams, checkWorktreeDirty } from ".
 import type { IsDirtyFn } from "./shared"
 import { spawnFailures } from "./team-spawn"
 import { getTeamResourceParts, mergeBranch, deleteBranch, preserveBranch, preservedBranchName, getOverlappingFiles, teamResourceSegment } from "./merge-helper"
-import type { MergeBranchFn, DeleteBranchFn, OverlapCheckFn } from "./merge-helper"
+import type { MergeBranchFn, DeleteBranchFn, OverlapCheckFn, PreserveBranchFn } from "./merge-helper"
 import { log } from "../log"
 import { runCommand } from "../process"
 
@@ -415,6 +415,7 @@ export async function executeTeamCleanup(
   _approvePurge?: PurgeApprovalFn,
   _listBranches?: ListBranchesFn,
   _branchExists?: BranchExistsFn,
+  preserve: PreserveBranchFn = preserveBranch,
 ): Promise<string> {
   if (args.purge && args.purge.length > 0) {
     requireCanPurgeArchivedTeams(deps, sessionId)
@@ -462,40 +463,46 @@ export async function executeTeamCleanup(
     throw new Error(`Cannot clean up team "${teamInfo.teamName}": ${active.length} member(s) still active: ${names}. Use team_shutdown on each member first, or call team_cleanup with force: true to abort them immediately.`)
   }
 
-  // Check for uncommitted changes BEFORE aborting sessions
-  if (!args.acknowledge_uncommitted) {
-    const dirty: Array<{ name: string; branch: string }> = []
-    for (const member of members) {
-      if (member.worktree_dir) {
-        try {
-          if (await isDirty(member.worktree_dir)) {
-            dirty.push({ name: member.name, branch: member.worktree_branch ?? "unknown" })
-          }
-        } catch {
-          log(`cleanup:dirty-check:failed name=${member.name}`)
-        }
+  // Check for uncommitted changes BEFORE aborting sessions. Retain the result so
+  // an already-merged, clean worktree is not preserved and merged a second time.
+  const worktreeDirty = new Map<string, boolean | undefined>()
+  const dirty: Array<{ name: string; branch: string }> = []
+  for (const member of members) {
+    if (member.worktree_dir) {
+      try {
+        const memberIsDirty = await isDirty(member.worktree_dir)
+        worktreeDirty.set(member.name, memberIsDirty)
+        if (memberIsDirty) dirty.push({ name: member.name, branch: member.worktree_branch ?? "unknown" })
+      } catch {
+        worktreeDirty.set(member.name, undefined)
+        log(`cleanup:dirty-check:failed name=${member.name}`)
       }
     }
+  }
+  if (!args.acknowledge_uncommitted) {
     if (dirty.length > 0) {
       const warnings = dirty.map(d => `  - ${d.name} (branch: ${d.branch})`).join("\n")
       return `Warning: ${dirty.length} teammate(s) have uncommitted changes in their worktrees:\n${warnings}\n\nCommit or merge their work first, then call team_cleanup with acknowledge_uncommitted: true to proceed.`
     }
   }
 
-  // Force-abort active members — preserve branches BEFORE aborting
+  // Snapshot every worktree before any abort, merge, workspace removal, or worktree removal.
+  for (const member of members.filter(member => member.member_kind === "worker" && (
+    member.worktree_branch || (member.worktree_dir && worktreeDirty.get(member.name) !== false)
+  ))) {
+    const resource = getTeamResourceParts(deps.db, teamInfo.teamId)
+    const safeBranch = member.worktree_branch?.startsWith("ensemble/preserved/")
+      ? member.worktree_branch
+      : preservedBranchName(resource.projectName, resource.teamName, resource.teamId, member.name)
+    const ok = await preserve(member.worktree_branch ?? "HEAD", safeBranch, deps.directory, member.worktree_dir)
+    if (!ok) throw new Error(`Cannot clean up team: failed to durably preserve worktree progress for ${member.name}.`)
+    deps.db.run("UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?", [safeBranch, teamInfo.teamId, member.name])
+    member.worktree_branch = safeBranch
+  }
+
+  // Force-abort active members only after preservation succeeds.
   if (args.force) {
     for (const member of active) {
-      // Preserve branch before abort — session.abort() may destroy the worktree + branch
-      if (member.worktree_branch && !member.worktree_branch.startsWith("ensemble/preserved/")) {
-        const resource = getTeamResourceParts(deps.db, teamInfo.teamId)
-        const safeBranch = preservedBranchName(resource.projectName, resource.teamName, resource.teamId, member.name)
-        const ok = await preserveBranch(member.worktree_branch, safeBranch, deps.directory)
-        if (ok) {
-          deps.db.run("UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?",
-            [safeBranch, teamInfo.teamId, member.name])
-          member.worktree_branch = safeBranch
-        }
-      }
       deps.scheduler.terminateMember(teamInfo.teamId, member.name, "team cleanup")
       try {
         await deps.client.session.abort({ sessionID: member.session_id })

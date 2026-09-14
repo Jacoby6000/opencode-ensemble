@@ -354,6 +354,7 @@ describe("implicit Supervisor", () => {
     markRunInjected(db, lease.leaseId, now)
     handleSessionStatusEvent(db, registry, "worker-session", "busy")
     const scheduler = new DurableScheduler(db, mockClient(), DEFAULT_CONFIG.scheduler, false)
+    scheduler.onSessionStatus("worker-session", "busy")
 
     const eventTime = now + 1
     const transition = handleSessionStatusEvent(db, registry, "worker-session", "idle")

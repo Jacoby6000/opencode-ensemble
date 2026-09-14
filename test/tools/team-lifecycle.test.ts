@@ -1,4 +1,7 @@
 import { describe, test, expect, beforeEach } from "bun:test"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import { setupDeps, insertTeam, insertMember } from "../helpers"
 import { executeTeamShutdown } from "../../src/tools/team-shutdown"
 import { executeTeamCleanup } from "../../src/tools/team-cleanup"
@@ -10,6 +13,13 @@ const noopDelete: DeleteBranchFn = async () => true
 const noopListBranches = async () => []
 /** Noop preserve fn for shutdown tests. */
 const noopPreserve = async () => true
+
+async function git(cwd: string, args: string[]): Promise<string> {
+  const process = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" })
+  const [stdout, stderr, exitCode] = await Promise.all([new Response(process.stdout).text(), new Response(process.stderr).text(), process.exited])
+  if (exitCode !== 0) throw new Error(stderr.trim() || `git ${args.join(" ")} failed`)
+  return stdout.trim()
+}
 
 function insertTask(db: ReturnType<typeof setupDeps>["db"], teamId: string, id: string) {
   db.run(
@@ -241,6 +251,41 @@ describe("team_shutdown", () => {
     expect(row.status).toBe("shutdown")
   })
 
+  test("force shutdown snapshots dirty worktree progress before aborting", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "ensemble-shutdown-"))
+    const worktree = path.join(repository, "worker")
+    try {
+      await git(repository, ["init"])
+      await git(repository, ["config", "user.name", "Test User"])
+      await git(repository, ["config", "user.email", "test@example.com"])
+      await Bun.write(path.join(repository, "base.txt"), "base\n")
+      await git(repository, ["add", "base.txt"])
+      await git(repository, ["commit", "-m", "base"])
+      await git(repository, ["worktree", "add", "-b", "ensemble-worker", worktree])
+      await Bun.write(path.join(worktree, "progress.txt"), "shutdown-safe\n")
+      deps.directory = repository
+      deps.db.run("UPDATE project SET name = 'shutdown-project', path = ? WHERE id = (SELECT project_id FROM team WHERE id = 't1')", [repository])
+      deps.db.run("UPDATE team_member SET worktree_dir = ?, worktree_branch = 'ensemble-worker' WHERE name = 'alice'", [worktree])
+
+      await executeTeamShutdown(deps, { member: "alice", force: true }, "lead-sess")
+
+      const branch = (deps.db.query("SELECT worktree_branch FROM team_member WHERE name = 'alice'").get() as { worktree_branch: string }).worktree_branch
+      expect(branch).toBe("ensemble/preserved/shutdown-project/my-team#t1/alice")
+      expect(await git(repository, ["show", `${branch}:progress.txt`])).toBe("shutdown-safe")
+      expect(deps.client.calls.filter(call => call.method === "session.abort")).toHaveLength(1)
+    } finally {
+      await rm(repository, { recursive: true, force: true })
+    }
+  })
+
+  test("shutdown fails closed without aborting when progress preservation fails", async () => {
+    deps.db.run("UPDATE team_member SET worktree_dir = '/tmp/missing', worktree_branch = 'ensemble-worker' WHERE name = 'alice'")
+
+    await expect(executeTeamShutdown(deps, { member: "alice", force: true }, "lead-sess", undefined, async () => false)).rejects.toThrow("durably preserve")
+    expect(deps.client.calls.filter(call => call.method === "session.abort")).toHaveLength(0)
+    expect(deps.db.query("SELECT status FROM team_member WHERE name = 'alice'").get()).toEqual({ status: "busy" })
+  })
+
   test("shutdown message content contains [Shutdown requested] and instructions", async () => {
     deps.client.session.status = async () => {
       deps.client.calls.push({ method: "session.status", args: [] })
@@ -302,7 +347,7 @@ describe("team_cleanup", () => {
     insertMember(deps.db, "t1", "alice", "sess-alice", "shutdown", "idle")
     deps.registry.register("t1", "alice", "sess-alice")
 
-    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false)
+    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false, undefined, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("cleaned up")
 
     const team = deps.db.query("SELECT status FROM team WHERE id = ?").get("t1") as Record<string, string>
@@ -345,7 +390,7 @@ describe("team_cleanup", () => {
   })
 
   test("works with no members", async () => {
-    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false)
+    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false, undefined, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("cleaned up")
   })
 
@@ -368,7 +413,7 @@ describe("team_cleanup", () => {
     insertMember(deps.db, "t1", "alice", "sess-alice", "error", "failed")
     deps.registry.register("t1", "alice", "sess-alice")
 
-    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false)
+    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false, undefined, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("cleaned up")
 
     const team = deps.db.query("SELECT status FROM team WHERE id = ?").get("t1") as Record<string, string>
@@ -383,7 +428,7 @@ describe("team_cleanup", () => {
       ["/tmp/worktree-alice", "ensemble-my-team-alice"])
     deps.registry.register("t1", "alice", "sess-alice")
 
-    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false)
+    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false, undefined, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("cleaned up")
 
     const removeCalls = deps.client.calls.filter(c => c.method === "worktree.remove")
@@ -398,7 +443,7 @@ describe("team_cleanup", () => {
 
     deps.client.worktree.remove = async () => { throw new Error("worktree gone") }
 
-    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false)
+    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false, undefined, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("cleaned up")
   })
 
@@ -416,7 +461,7 @@ describe("team_cleanup", () => {
       ["/tmp/worktree-alice", "ensemble-my-team-alice"])
     deps.registry.register("t1", "alice", "sess-alice")
 
-    await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false)
+    await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false, undefined, undefined, undefined, undefined, noopPreserve)
 
     const row = deps.db.query("SELECT worktree_dir FROM team_member WHERE name = 'alice'").get() as { worktree_dir: string | null }
     expect(row.worktree_dir).toBeNull()
@@ -428,7 +473,7 @@ describe("team_cleanup", () => {
       ["/tmp/worktree-alice", "ensemble-my-team-alice", "ws-alice-123"])
     deps.registry.register("t1", "alice", "sess-alice")
 
-    await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false)
+    await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false, undefined, undefined, undefined, undefined, noopPreserve)
 
     const wsRemoveCalls = deps.client.calls.filter(c => c.method === "workspace.remove")
     expect(wsRemoveCalls).toHaveLength(1)
@@ -441,7 +486,7 @@ describe("team_cleanup", () => {
       ["/tmp/worktree-alice", "ensemble-my-team-alice", "ws-alice-123"])
     deps.registry.register("t1", "alice", "sess-alice")
 
-    await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false)
+    await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false, undefined, undefined, undefined, undefined, noopPreserve)
 
     const row = deps.db.query("SELECT workspace_id FROM team_member WHERE name = 'alice'").get() as { workspace_id: string | null }
     expect(row.workspace_id).toBeNull()
@@ -455,7 +500,7 @@ describe("team_cleanup", () => {
 
     deps.client.workspace.remove = async () => { throw new Error("workspace gone") }
 
-    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false)
+    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false, undefined, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("cleaned up")
   })
 
@@ -469,7 +514,7 @@ describe("team_cleanup", () => {
     deps.registry.register("t1", "alice", "sess-alice")
     deps.registry.register("t1", "bob", "sess-bob")
 
-    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false)
+    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", undefined, noopMerge, noopDelete, false, undefined, undefined, undefined, undefined, noopPreserve)
     expect(result).toContain("cleaned up")
 
     const removeCalls = deps.client.calls.filter(c => c.method === "worktree.remove")
@@ -526,7 +571,7 @@ describe("team_cleanup", () => {
       ["/tmp/wt-alice", "ensemble-my-team-alice"])
     deps.registry.register("t1", "alice", "sess-alice")
 
-    const result = await executeTeamCleanup(deps, { force: false, acknowledge_uncommitted: true }, "lead-sess", async () => true, noopMerge, noopDelete, false)
+    const result = await executeTeamCleanup(deps, { force: false, acknowledge_uncommitted: true }, "lead-sess", async () => true, noopMerge, noopDelete, false, undefined, undefined, undefined, undefined, noopPreserve)
 
     expect(result).toContain("cleaned up")
 
@@ -543,7 +588,7 @@ describe("team_cleanup", () => {
       ["/tmp/wt-alice", "ensemble-my-team-alice"])
     deps.registry.register("t1", "alice", "sess-alice")
 
-    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", async () => false, noopMerge, noopDelete, false)
+    const result = await executeTeamCleanup(deps, { force: false }, "lead-sess", async () => false, noopMerge, noopDelete, false, undefined, undefined, undefined, undefined, noopPreserve)
 
     expect(result).toContain("cleaned up")
 

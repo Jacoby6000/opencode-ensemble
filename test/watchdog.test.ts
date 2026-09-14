@@ -1,7 +1,17 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import { setupDeps, insertTeam, insertMember } from "./helpers"
 import { Watchdog } from "../src/watchdog"
 import { ProgressTracker } from "../src/progress"
+
+async function git(cwd: string, args: string[]): Promise<string> {
+  const process = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" })
+  const [stdout, stderr, exitCode] = await Promise.all([new Response(process.stdout).text(), new Response(process.stderr).text(), process.exited])
+  if (exitCode !== 0) throw new Error(stderr.trim() || `git ${args.join(" ")} failed`)
+  return stdout.trim()
+}
 
 describe("Watchdog", () => {
   let deps: ReturnType<typeof setupDeps>
@@ -157,6 +167,48 @@ describe("Watchdog", () => {
     expect(bob.status).toBe("error")
   })
 
+  test("snapshots dirty worktree progress before timeout abort", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "ensemble-watchdog-"))
+    const worktree = path.join(repository, "worker")
+    try {
+      await git(repository, ["init"])
+      await git(repository, ["config", "user.name", "Test User"])
+      await git(repository, ["config", "user.email", "test@example.com"])
+      await Bun.write(path.join(repository, "base.txt"), "base\n")
+      await git(repository, ["add", "base.txt"])
+      await git(repository, ["commit", "-m", "base"])
+      await git(repository, ["worktree", "add", "-b", "ensemble-worker", worktree])
+      await Bun.write(path.join(worktree, "progress.txt"), "watchdog-safe\n")
+      deps.db.run("UPDATE project SET name = 'watchdog-project', path = ? WHERE id = (SELECT project_id FROM team WHERE id = 't1')", [repository])
+      const pastTime = Date.now() - 60_000
+      deps.db.run(
+        "INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, worktree_dir, worktree_branch, time_created, time_updated) VALUES ('t1', 'alice', 'sess-a', 'build', 'busy', 'running', ?, 'ensemble-worker', ?, ?)",
+        [worktree, pastTime, pastTime],
+      )
+
+      await new Watchdog({ db: deps.db, client: deps.client, registry: deps.registry, ttlMs: 30_000, cwd: repository }).check()
+
+      const branch = (deps.db.query("SELECT worktree_branch FROM team_member WHERE name = 'alice'").get() as { worktree_branch: string }).worktree_branch
+      expect(await git(repository, ["show", `${branch}:progress.txt`])).toBe("watchdog-safe")
+      expect(deps.client.calls.filter(call => call.method === "session.abort")).toHaveLength(1)
+    } finally {
+      await rm(repository, { recursive: true, force: true })
+    }
+  })
+
+  test("does not timeout or abort when progress preservation fails", async () => {
+    const pastTime = Date.now() - 60_000
+    deps.db.run(
+      "INSERT INTO team_member (team_id, name, session_id, agent, status, execution_status, worktree_dir, worktree_branch, time_created, time_updated) VALUES ('t1', 'alice', 'sess-a', 'build', 'busy', 'running', '/tmp/missing', 'ensemble-worker', ?, ?)",
+      [pastTime, pastTime],
+    )
+
+    await new Watchdog({ db: deps.db, client: deps.client, registry: deps.registry, ttlMs: 30_000, cwd: deps.directory, preserve: async () => false }).check()
+
+    expect(deps.db.query("SELECT status FROM team_member WHERE name = 'alice'").get()).toEqual({ status: "busy" })
+    expect(deps.client.calls.filter(call => call.method === "session.abort")).toHaveLength(0)
+  })
+
   test("start and stop control the interval", () => {
     const watchdog = new Watchdog({ db: deps.db, client: deps.client, registry: deps.registry, ttlMs: 30_000, checkIntervalMs: 60_000 })
     watchdog.start()
@@ -188,7 +240,7 @@ describe("Watchdog", () => {
         ["t1", "alice", "sess-a", pastTime, pastTime]
       )
 
-      const watchdog = new Watchdog({ db: deps.db, client: deps.client, registry: deps.registry, ttlMs: 30_000 })
+      const watchdog = new Watchdog({ db: deps.db, client: deps.client, registry: deps.registry, ttlMs: 30_000, cwd: deps.directory, preserve: async () => true })
       await watchdog.cleanupStaleWorktrees()
 
       // worktree.remove should have been called
@@ -199,7 +251,7 @@ describe("Watchdog", () => {
       // DB should have worktree_dir NULLed
       const row = deps.db.query("SELECT worktree_dir, worktree_branch, workspace_id FROM team_member WHERE name = 'alice'").get() as Record<string, unknown>
       expect(row.worktree_dir).toBeNull()
-      expect(row.worktree_branch).toBeNull()
+      expect(row.worktree_branch).toBe("ensemble/preserved/test-project/my-team#t1/alice")
     })
 
     test("does NOT clean up recently-updated shutdown members", async () => {
@@ -209,7 +261,7 @@ describe("Watchdog", () => {
         ["t1", "alice", "sess-a", now, now]
       )
 
-      const watchdog = new Watchdog({ db: deps.db, client: deps.client, registry: deps.registry, ttlMs: 30_000 })
+      const watchdog = new Watchdog({ db: deps.db, client: deps.client, registry: deps.registry, ttlMs: 30_000, cwd: deps.directory, preserve: async () => true })
       await watchdog.cleanupStaleWorktrees()
 
       const removeCalls = deps.client.calls.filter(c => c.method === "worktree.remove")
@@ -226,7 +278,7 @@ describe("Watchdog", () => {
         ["t1", "bob", "sess-b", pastTime, pastTime]
       )
 
-      const watchdog = new Watchdog({ db: deps.db, client: deps.client, registry: deps.registry, ttlMs: 30_000 })
+      const watchdog = new Watchdog({ db: deps.db, client: deps.client, registry: deps.registry, ttlMs: 30_000, cwd: deps.directory, preserve: async () => true })
       await watchdog.cleanupStaleWorktrees()
 
       // Both workspace.remove and worktree.remove should be called
@@ -240,7 +292,7 @@ describe("Watchdog", () => {
       // DB should have all three NULLed
       const row = deps.db.query("SELECT worktree_dir, worktree_branch, workspace_id FROM team_member WHERE name = 'bob'").get() as Record<string, unknown>
       expect(row.worktree_dir).toBeNull()
-      expect(row.worktree_branch).toBeNull()
+      expect(row.worktree_branch).toBe("ensemble/preserved/test-project/my-team#t1/bob")
       expect(row.workspace_id).toBeNull()
     })
 

@@ -10,6 +10,7 @@ export interface CommandResult {
 
 export interface CommandOptions {
   cwd?: string
+  env?: NodeJS.ProcessEnv
 }
 
 function collect(stream: Readable | null, chunks: Buffer[]): void {
@@ -35,6 +36,7 @@ export function runCommand(args: string[], options: CommandOptions = {}): Promis
 
     const child = spawn(command, commandArgs, {
       cwd: options.cwd,
+      env: options.env,
       stdio: ["ignore", "pipe", "pipe"],
     })
 

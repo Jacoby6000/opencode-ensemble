@@ -75,6 +75,10 @@ export async function executeTeamSpawn(
   if (nameError) throw new Error(nameError)
 
   const teamInfo = requireLead(deps, sessionId)
+  const isReadOnly = agent === "plan" || agent === "explore" || deps.config.readOnlyAgents.includes(agent)
+  if (args.claim_task && isReadOnly) {
+    throw new Error(`Read-only ${agent} teammates cannot claim tasks; omit claim_task or use a writable agent.`)
+  }
 
   // Circuit breaker — stop retrying after 3 consecutive failures
   const failures = spawnFailures.get(teamInfo.teamId)
@@ -107,7 +111,6 @@ export async function executeTeamSpawn(
   let memberPersisted = false
   try {
 
-  const isReadOnly = agent === "plan" || agent === "explore" || deps.config.readOnlyAgents.includes(agent)
   const useWorktree = args.worktree !== false && !isReadOnly && !isWorktreeDirectory(deps.directory)
   const usePlanApproval = args.plan_approval === true
 
@@ -222,23 +225,10 @@ export async function executeTeamSpawn(
     const errMsg = err instanceof Error ? err.message : String(err)
     const prev = spawnFailures.get(teamInfo.teamId)
     spawnFailures.set(teamInfo.teamId, { count: (prev?.count ?? 0) + 1, lastError: errMsg })
-    // Rollback workspace and worktree if session creation failed
-    if (workspaceId) {
-      try { await deps.client.workspace.remove({ id: workspaceId }) } catch { /* best effort */ }
-    }
-    if (worktreeDir) {
-      try { await deps.client.worktree.remove({ worktreeRemoveInput: { directory: worktreeDir } }) } catch { /* best effort */ }
-    }
     throw new Error(`Failed to create session for teammate "${args.name}": ${err instanceof Error ? err.message : String(err)}`)
   }
 
   if (!childSessionId) {
-    if (workspaceId) {
-      try { await deps.client.workspace.remove({ id: workspaceId }) } catch { /* best effort */ }
-    }
-    if (worktreeDir) {
-      try { await deps.client.worktree.remove({ worktreeRemoveInput: { directory: worktreeDir } }) } catch { /* best effort */ }
-    }
     throw new Error("Failed to create teammate session")
   }
   const spawnedSessionId = childSessionId
@@ -437,23 +427,34 @@ export async function executeTeamSpawn(
   } finally {
     if (!identityCommitted) {
       releaseIdentity(deps.db, reservation.reservationId)
+      let progressPreserved = !worktreeBranch && !worktreeDir
+      if (worktreeBranch || worktreeDir) {
+        const resource = getTeamResourceParts(deps.db, teamInfo.teamId)
+        const safeBranch = worktreeBranch?.startsWith("ensemble/preserved/")
+          ? worktreeBranch
+          : preservedBranchName(resource.projectName, resource.teamName, resource.teamId, args.name)
+        progressPreserved = await preserveBranch(worktreeBranch ?? "HEAD", safeBranch, deps.directory, worktreeDir)
+        if (progressPreserved && memberPersisted) {
+          deps.db.run("UPDATE team_member SET worktree_branch = ? WHERE team_id = ? AND name = ?", [safeBranch, teamInfo.teamId, args.name])
+        }
+      }
       if (memberPersisted) {
         releaseMemberTasks(deps.db, teamInfo.teamId, args.name)
-        deps.db.run("DELETE FROM team_member WHERE team_id = ? AND name = ?", [teamInfo.teamId, args.name])
-        if (childSessionId) deps.registry.unregister(childSessionId)
+        if (progressPreserved) {
+          deps.db.run("DELETE FROM team_member WHERE team_id = ? AND name = ?", [teamInfo.teamId, args.name])
+          if (childSessionId) deps.registry.unregister(childSessionId)
+        } else {
+          deps.db.run("UPDATE team_member SET status = 'error', execution_status = 'failed', time_updated = ? WHERE team_id = ? AND name = ?", [Date.now(), teamInfo.teamId, args.name])
+        }
       }
-      if (childSessionId) {
-        if (worktreeBranch && !worktreeBranch.startsWith("ensemble/preserved/")) {
-          const resource = getTeamResourceParts(deps.db, teamInfo.teamId)
-          await preserveBranch(worktreeBranch, preservedBranchName(resource.projectName, resource.teamName, resource.teamId, args.name), deps.directory)
-        }
+      if (childSessionId && progressPreserved) {
         try { await deps.client.session.abort({ sessionID: childSessionId }) } catch { /* best effort */ }
-        if (workspaceId) {
-          try { await deps.client.workspace.remove({ id: workspaceId }) } catch { /* best effort */ }
-        }
-        if (worktreeDir) {
-          try { await deps.client.worktree.remove({ worktreeRemoveInput: { directory: worktreeDir } }) } catch { /* best effort */ }
-        }
+      }
+      if (workspaceId && progressPreserved) {
+        try { await deps.client.workspace.remove({ id: workspaceId }) } catch { /* best effort */ }
+      }
+      if (worktreeDir && progressPreserved) {
+        try { await deps.client.worktree.remove({ worktreeRemoveInput: { directory: worktreeDir } }) } catch { /* best effort */ }
       }
     }
   }

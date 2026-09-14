@@ -120,6 +120,7 @@ describe("durable group lead delivery", () => {
 
     await executeTeamBroadcast(deps, { text: "mixed", group: "mixed", members: ["alice", "bob", "lead"] }, "sess-alice")
     await flush()
+    deps.scheduler.onSessionStatus("sess-bob", "busy")
     deps.scheduler.onSessionStatus("sess-bob", "idle")
 
     expect(deps.db.query("SELECT recipient_name, delivery_state FROM team_group_message_recipient ORDER BY recipient_name").all()).toEqual([
